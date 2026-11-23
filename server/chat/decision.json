@@ -1,0 +1,49 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "reply",
+        "delegate",
+        "progress",
+        "steer",
+        "cancel"
+      ]
+    },
+    "text": {
+      "type": "string"
+    },
+    "instanceId": {
+      "type": "string"
+    },
+    "taskId": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "doneWhen": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "action",
+    "text",
+    "instanceId",
+    "taskId",
+    "goal",
+    "constraints",
+    "doneWhen"
+  ],
+  "additionalProperties": false
+}
