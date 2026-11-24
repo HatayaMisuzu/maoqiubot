@@ -6,7 +6,7 @@ import type { PluginContext,ToolContext,ToolReference } from '../../contracts/pl
 import { fail } from '../../server/db/index.ts'
 import { networkAgent,networkUrl,readHttp } from '../../server/plugins/http.ts'
 
-type Config={provider?:'brave'|'searxng';endpoint?:string;keyEnv?:string;privateLan?:boolean;
+type Config={provider?:'brave'|'searxng';endpoint?:string;keyEnv?:string;privateLan?:boolean;proxy?:'direct'|'environment';proxyUrl?:string;
   language?:string;region?:string;timeoutMs?:number;maxResults?:number}
 const reference=(url:string,title:string,retrievedAt:string):ToolReference=>({
   id:'web-'+createHash('sha256').update(url).digest('hex').slice(0,16),url,title,retrievedAt})
@@ -16,10 +16,13 @@ function publicLink(value:unknown,base?:string){
   try{return networkUrl(new URL(value,base).href,'public').href}catch{}
 }
 const asString=(a:Record<string,unknown>,key:string)=>typeof a[key]==='string'?a[key] as string:undefined
+const proxyOptions=(config:Config)=>({proxy:config.proxy??'environment',proxyUrl:config.proxyUrl})
 
 export async function search(config:Config,a:Record<string,unknown>,ctx:ToolContext){
   const query=asString(a,'query')?.trim()
-  if(!query||!ctx.requestText?.includes(query))fail('公开检索词须摘自当前用户消息',403)
+  if(ctx.actor!=='user'||!query||!ctx.requestText?.trim())fail('公开搜索需要真实用户请求',403)
+  if(/-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{16,}|github_pat_[\w]{16,}|AKIA[A-Z0-9]{16})\b|(?:api[_ -]?key|access[_ -]?token|password|密码|密钥)\s*[:=]\s*\S+|https?:\/\/[^/\s]+:[^/\s]+@/i.test(query))
+    fail('公开检索词中疑似包含凭据，请删去后重试',403)
   const provider=config.provider
   if(!provider)fail('请在网页插件设置里配置 Brave Search 或 SearXNG',409)
   const brave=provider==='brave'
@@ -27,6 +30,7 @@ export async function search(config:Config,a:Record<string,unknown>,ctx:ToolCont
     networkUrl(config.endpoint??'',config.privateLan?'lan':'api')
   const key=brave?process.env[config.keyEnv??'MAOQIU_PLUGIN_KEY_BRAVE']:undefined
   if(brave&&!key)fail('Brave Search API 密钥未配置',409)
+  if(key&&query.includes(key))fail('公开检索词中包含凭据',403)
   const limit=Math.min(Number(a.limit??8),config.maxResults??20)
   const domains=Array.isArray(a.domains)?a.domains as string[]:[]
   url.searchParams.set('q',query+(domains.length?' ('+domains.map(d=>'site:'+d).join(' OR ')+')':''))
@@ -44,7 +48,8 @@ export async function search(config:Config,a:Record<string,unknown>,ctx:ToolCont
   }
   const started=Date.now()
   const res=await readHttp(url.href,{network:!brave&&config.privateLan?'lan':'api',signal:ctx.signal,
-    timeoutMs:config.timeoutMs,maxBytes:768*1024,headers:{accept:'application/json',...(key?{'x-subscription-token':key}:{})}})
+    ...proxyOptions(config),timeoutMs:config.timeoutMs,maxBytes:768*1024,
+    headers:{accept:'application/json',...(key?{'x-subscription-token':key}:{})}})
   if([401,403].includes(res.status))fail('搜索服务拒绝认证或未开放 JSON 搜索权限',502)
   if(res.status===402||res.status===429)fail('搜索服务报告额度不足或限流',502)
   if(res.status!==200)fail('搜索服务返回 HTTP '+res.status,502)
@@ -63,9 +68,10 @@ export async function search(config:Config,a:Record<string,unknown>,ctx:ToolCont
   return {query,provider,retrievedAt,elapsedMs:Date.now()-started,results,references:results.map(({id,url,title,retrievedAt})=>({id,url,title,retrievedAt}))}
 }
 
-async function checkRobots(url:URL,signal:AbortSignal){
+async function checkRobots(url:URL,signal:AbortSignal,config:Config){
   const robotUrl=new URL('/robots.txt',url)
-  const result=await readHttp(robotUrl.href,{network:'public',signal,maxBytes:512*1024,redirects:3,timeoutMs:4000})
+  const result=await readHttp(robotUrl.href,{network:'public',signal,...proxyOptions(config),
+    maxBytes:512*1024,redirects:3,timeoutMs:4000})
   if([404,410].includes(result.status))return
   if(result.status!==200)fail('无法核对网站的 robots.txt 访问规则',403)
   if(robots(robotUrl.href,result.bytes.toString('utf8')).isAllowed(url.href,networkAgent)===false)
@@ -87,12 +93,14 @@ export function extractHtml(html:string,url:string){
 }
 export async function readPage(config:Config,value:string,maxChars:number,ctx:ToolContext,explicit=false){
   const url=networkUrl(value,'public')
-  if(!explicit&&!ctx.authorizedDestinations.includes(url.href)&&!ctx.requestText?.includes(value))fail('只读取当前用户提供或本轮检索找到的网页',403)
+  if(!explicit&&!ctx.authorizedDestinations.includes(url.href)&&!ctx.requestText?.includes(value))
+    fail('只读取用户提供或当前研究已发现的公开网页',403)
   const started=Date.now()
   const signal=AbortSignal.any([ctx.signal,AbortSignal.timeout(config.timeoutMs??12000)])
-  await checkRobots(url,signal)
-  const res=await readHttp(url.href,{network:'public',signal,redirects:4,maxBytes:2*1024*1024,
-    beforeRedirect:checkRobots,headers:{accept:'text/html,text/plain,application/json;q=0.8'}})
+  await checkRobots(url,signal,config)
+  const res=await readHttp(url.href,{network:'public',signal,...proxyOptions(config),redirects:4,maxBytes:2*1024*1024,
+    beforeRedirect:(target,redirectSignal)=>checkRobots(target,redirectSignal,config),
+    headers:{accept:'text/html,text/plain,application/json;q=0.8'}})
   if(res.status!==200)fail('网页返回 HTTP '+res.status,502)
   const mime=res.type.split(';')[0].trim().toLowerCase()
   if(!['text/html','application/xhtml+xml','text/plain','application/json'].includes(mime))fail('读取工具仅支持公开的 HTML、纯文本和 JSON',415)
@@ -110,16 +118,16 @@ export function activate(ctx:PluginContext){
   const schema=(properties:object,required:string[])=>({type:'object',properties,required,additionalProperties:false})
   const url={type:'string',minLength:8,maxLength:3000}
   const maxChars={type:'integer',minimum:400,maximum:10000}
-  ctx.registerTool({name:'search',description:'搜索公开网页，query 从用户当前原话摘取。返回链接和摘要。',
+  ctx.registerTool({name:'search',description:'按用户公开搜索意图组织 query。可改写、译成来源语言并按证据缺口补搜。返回链接和摘要。',
     risk:'read',network:'network.public',parameters:schema({query:{type:'string',minLength:2,maxLength:400},
       limit:{type:'integer',minimum:1,maximum:20},language:{type:'string',pattern:'^[a-zA-Z-]{2,16}$'},
       region:{type:'string',pattern:'^[a-zA-Z]{2}$'},freshness:{enum:['pd','pw','pm','py']},
       domains:{type:'array',maxItems:5,items:{type:'string',pattern:'^[a-zA-Z0-9.-]{3,80}$'}}},['query']),
     execute:(args,context)=>search(config,args,context)})
-  ctx.registerTool({name:'read',description:'读取用户给出的公开 URL 或本轮检索找到的链接，提取正文和引用。',
+  ctx.registerTool({name:'read',description:'读取用户给出的公开 URL、搜索结果或已读网页发现的链接，提取正文、后续链接和引用。',
     risk:'read',network:'network.public',parameters:schema({url,maxChars},['url']),
     execute:(a,c)=>readPage(config,String(a.url),Number(a.maxChars??5000),c)})
-  ctx.registerTool({name:'read_many',description:'读取至多三个本轮已经授权的公开网页，各自返回结果。',
+  ctx.registerTool({name:'read_many',description:'并行读取至多三个已获准的公开网页，各自返回结果。',
     risk:'read',network:'network.public',parameters:schema({urls:{type:'array',minItems:1,maxItems:3,items:url},maxChars},['urls']),
     async execute(a,c){
       const results=await Promise.all((a.urls as string[]).map(async url=>{

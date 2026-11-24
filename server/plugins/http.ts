@@ -1,7 +1,9 @@
 import { lookup } from 'node:dns/promises'
-import type { LookupFunction } from 'node:net'
+import { isIP } from 'node:net'
+import type { LookupFunction, Socket } from 'node:net'
 import { request as http } from 'node:http'
 import { request as https } from 'node:https'
+import { connect as tls } from 'node:tls'
 import ipaddr from 'ipaddr.js'
 import { fail } from '../db/index.ts'
 
@@ -10,6 +12,8 @@ type Network='public'|'api'|'lan'
 type Options={
   network:Network; signal:AbortSignal; timeoutMs?:number; maxBytes?:number; redirects?:number;
   method?:string; headers?:Record<string,string>; body?:string;
+  proxy?:'direct'|'environment';
+  proxyUrl?:string;
   beforeRedirect?:(url:URL,signal:AbortSignal)=>Promise<void>
 }
 export const networkAgent='MaoqiuBot/1.0'
@@ -36,11 +40,58 @@ export function networkUrl(value:string,network:Network){
   return url
 }
 export async function checkedAddresses(url:URL,network:Network,resolve:typeof lookup=lookup){
+  return validateAddresses(await resolveAddresses(url,resolve),network)
+}
+async function resolveAddresses(url:URL,resolve:typeof lookup=lookup){
   const host=url.hostname.replace(/^\[|\]$/g,'')
-  const addresses:Address[]=ipaddr.isValid(host)?[{address:host,family:host.includes(':')?6:4}]:
-    await resolve(host,{all:true,verbatim:true})
+  return ipaddr.isValid(host)?[{address:host,family:host.includes(':')?6:4}]:await resolve(host,{all:true,verbatim:true})
+}
+function validateAddresses(addresses:Address[],network:Network){
   if(!addresses.length||addresses.some(a=>!addressAllowed(a.address,network)))fail('目标的 DNS 或 IP 包含不可访问的地址',403)
   return addresses
+}
+const port=(url:URL)=>url.port||(url.protocol==='https:'?'443':'80')
+const env=(key:string)=>process.env[key.toLowerCase()]||process.env[key]
+function configuredProxy(url:URL,explicit?:string){
+  const host=url.hostname.toLowerCase().replace(/\.$/,'')
+  if(env('NO_PROXY')?.split(/[\s,]+/).some(entry=>{
+    if(entry==='*')return true
+    const [,name='',entryPort]=/^((?:\[[^\]]+\]|[^:]+))(?::(\d+))?$/.exec(entry.toLowerCase())??[]
+    if(!name||entryPort&&entryPort!==port(url))return false
+    const suffix=name.replace(/^\*/,'').replace(/\.$/,'')
+    return host===suffix||suffix.startsWith('.')&&(host===suffix.slice(1)||host.endsWith(suffix))
+  }))return
+  const value=explicit||(url.protocol==='https:'?env('HTTPS_PROXY'):env('HTTP_PROXY'))||env('ALL_PROXY')
+  if(!value)return
+  const proxy=URL.parse(value.includes('://')?value:'http://'+value)
+  if(!proxy||!['http:','https:'].includes(proxy.protocol)||!proxy.hostname||proxy.pathname!=='/'||proxy.search||proxy.hash||
+    explicit&&(proxy.username||proxy.password))
+    fail('网页代理须使用 HTTP 或 HTTPS CONNECT 地址',502)
+  return proxy
+}
+function tunnel(url:URL,address:Address,proxy:URL,signal:AbortSignal){
+  return new Promise<Socket>((resolve,reject)=>{
+    const target=(address.family===6?'['+address.address+']':address.address)+':'+port(url)
+    const headers:Record<string,string>={host:target}
+    if(proxy.username||proxy.password){
+      const credentials=decodeURIComponent(proxy.username)+':'+decodeURIComponent(proxy.password)
+      headers['proxy-authorization']='Basic '+Buffer.from(credentials).toString('base64')
+    }
+    const request=(proxy.protocol==='https:'?https:http)({hostname:proxy.hostname.replace(/^\[|\]$/g,''),
+      port:port(proxy),method:'CONNECT',path:target,agent:false,headers,signal})
+    request.once('error',reject)
+    request.once('connect',(response,socket,head)=>{
+      if(response.statusCode!==200||signal.aborted){
+        socket.destroy()
+        reject(Object.assign(Error('网页代理未建立 CONNECT 隧道（HTTP '+response.statusCode+'）'),{status:502}))
+        return
+      }
+      if(head.length)socket.unshift(head)
+      const host=url.hostname.replace(/^\[|\]$/g,'')
+      resolve(url.protocol==='https:'?tls({socket,host,servername:isIP(host)?undefined:host}):socket)
+    })
+    request.end()
+  })
 }
 function pinnedLookup(addresses:Address[]):LookupFunction{
   return (_host,options,callback)=>{
@@ -52,11 +103,13 @@ function pinnedLookup(addresses:Address[]):LookupFunction{
     callback(null,entry.address,entry.family)
   }
 }
-function once(url:URL,addresses:Address[],options:Options,signal:AbortSignal){
-  return new Promise<{status:number;location?:string;type:string;bytes:Buffer}>((resolve,reject)=>{
+async function once(url:URL,addresses:Address[],options:Options,signal:AbortSignal,proxy?:URL){
+  const socket=proxy?await tunnel(url,addresses.find(a=>a.family===4)??addresses[0],proxy,signal):undefined
+  try{return await new Promise<{status:number;location?:string;type:string;bytes:Buffer}>((resolve,reject)=>{
     const transport=url.protocol==='https:'?https:http
-    const req=transport(url,{method:options.method??'GET',agent:false,lookup:pinnedLookup(addresses),signal,
-      headers:{'user-agent':networkAgent,'accept-encoding':'identity',...options.headers}},res=>{
+    const req=transport(url,{method:options.method??'GET',signal,
+      ...(socket?{createConnection:()=>socket}:{agent:false,lookup:pinnedLookup(addresses)}),
+      headers:{'user-agent':networkAgent,'accept-encoding':'identity',...(socket?{host:url.host}:{}),...options.headers}},res=>{
       const status=res.statusCode??502
       const location=res.headers.location,type=res.headers['content-type']??''
       if(status>=300&&status<400){
@@ -81,7 +134,33 @@ function once(url:URL,addresses:Address[],options:Options,signal:AbortSignal){
     })
     req.once('error',reject)
     req.end(options.body)
-  })
+  })}finally{socket?.destroy()}
+}
+async function proxyAddresses(url:URL,options:Options,signal:AbortSignal,proxy?:URL){
+  const addresses=await abortable(resolveAddresses(url),signal)
+  const fakeIp=({address}:Address)=>{
+    const bytes=ipaddr.process(address).toByteArray()
+    return bytes.length===4&&bytes[0]===198&&(bytes[1]===18||bytes[1]===19)
+  }
+  if(!proxy||!addresses.some(fakeIp)||!addresses.every(a=>fakeIp(a)||addressAllowed(a.address,options.network)))
+    return validateAddresses(addresses,options.network)
+  const host=url.hostname.replace(/\.$/,'')
+  if(!host.includes('.')||isIP(host))return validateAddresses(addresses,options.network)
+  // Fake-IP DNS answers are not routable destinations. Resolve them over the tunnel, then pin a public IP.
+  const dns=new URL('https://1.1.1.1/dns-query')
+  dns.searchParams.set('name',host)
+  const answers=await Promise.all([['A',1,4],['AAAA',28,6]].map(async ([name,type,family])=>{
+    const query=new URL(dns)
+    query.searchParams.set('type',String(name))
+    const result=await once(query,[{address:'1.1.1.1',family:4}],{network:'api',signal,maxBytes:32768,
+      headers:{accept:'application/dns-json'}},signal,proxy)
+    if(result.status!==200)fail('网页代理的公网 DNS 核对失败',502)
+    const body=JSON.parse(result.bytes.toString('utf8')) as {Status?:number;Answer?:{type:number;data:string}[]}
+    if(body.Status!==0)fail('网页代理的公网 DNS 未返回有效答案',502)
+    return (Array.isArray(body.Answer)?body.Answer:[]).filter(a=>a.type===type)
+      .map(a=>({address:String(a.data),family:Number(family)}))
+  }))
+  return validateAddresses(answers.flat(),options.network)
 }
 function abortable<T>(promise:Promise<T>,signal:AbortSignal){
   return new Promise<T>((resolve,reject)=>{
@@ -101,8 +180,9 @@ export async function readHttp(value:string,options:Options){
     let url=networkUrl(value,options.network)
     for(let hop=0;;hop++){
       signal.throwIfAborted()
-      const addresses=await abortable(checkedAddresses(url,options.network),signal)
-      const result=await once(url,addresses,options,signal)
+      const proxy=options.network!=='lan'&&options.proxy==='environment'?configuredProxy(url,options.proxyUrl):undefined
+      const addresses=await proxyAddresses(url,options,signal,proxy)
+      const result=await once(url,addresses,options,signal,proxy)
       if(![301,302,303,307,308].includes(result.status)||!result.location)return {...result,url:url.href}
       if(hop>=(options.redirects??0)||options.method&&options.method!=='GET'||options.headers?.authorization)
         fail('网络目标尝试重定向，请核对地址',502)

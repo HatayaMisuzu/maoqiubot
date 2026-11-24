@@ -55,3 +55,4 @@ export const codexChat:ChatProvider={
     }finally{rmSync(dir,{recursive:true,force:true})}
   }
 }
+export const webResearchInstruction=' 用户有公开检索意图时，可按意图改写关键词、用来源语言查询、顺着真实链接阅读并针对证据缺口再次检索。只有当前请求能启动或继续研究。仅发送公共查询词，保留公开背景，勿向搜索服务发送凭据、私人对话、身份信息、项目资料或附件。优先核对原始来源并区分已核实内容和待查项。'

@@ -409,6 +409,13 @@ export const chat = actions=>{
       }
       if(m.data?.usedMemories?.length)article.append(el('details','muted',el('summary','','引用记忆 · '+m.data.usedMemories.length),
         ...m.data.usedMemories.map(memory=>el('p','muted',(memory.projectId?'项目':'个人')+' · 版本 '+memory.revision+' · '+memory.id))));
+      const check=m.data?.deliveryCheck;
+      if(check)article.append(el('details','muted',el('summary','','查看交付核对依据'),
+        el('p','muted','运行 '+(check.runStatus||'无')+' · '+check.reportIds.length+' 条交付回执'),
+        ...check.files.map(f=>el('p','muted',(f.status==='readable'?'可读 · ':'待核对 · ')+f.path+
+          (f.bytes!==undefined?' · '+f.bytes+' 字节':''))),
+        ...check.materials.map(a=>el('p','muted',(a.status==='available'?'可访问 · ':'待核对 · ')+(a.title||a.id))),
+        ...check.criteria.map(criterion=>el('p','muted','验收条件 · '+criterion))));
       if(m.taskId&&m.taskId!==t?.taskId){const task=snap.linkedTasks?.[m.taskId],status=phase(task?.status||m.data?.status);
         article.append(btn('查看工作话题'+(status?' · '+status:''),()=>openTask(m.taskId),'task-card','task'))}
       if(m.kind==='tool'&&m.data.workThreadId)article.append(btn('打开工作话题',()=>actions.openThread(m.data.workThreadId),'task-card','task'));

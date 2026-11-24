@@ -14,6 +14,7 @@ import { proposeOperation } from './approval.ts'
 import type { Operation } from './approval.ts'
 import type { PluginHost } from '../plugins/host.ts'
 import { offerMemory } from './memory.ts'
+import { webResearchInstruction } from './provider.ts'
 
 const actions=['reply','delegate','progress','steer','cancel','tool'] as const
 type Decision={action:typeof actions[number],text:string,instanceId:string,taskId:string,goal:string,constraints:string[],doneWhen:string[],summary?:string,tool?:string,arguments?:string,nativeCall?:ToolCall,memoryCandidate?:unknown}
@@ -56,7 +57,8 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
   let busy=false
   let active:{id:number;abort:AbortController;check?:()=>void}|null=null
   for(const job of db.prepare(`SELECT j.* FROM chat_jobs j WHERE j.status='working' AND EXISTS
-    (SELECT 1 FROM messages m WHERE m.threadId=j.threadId AND m.kind='tool' AND json_extract(m.data,'$.replyTo')=j.messageId)`).all()){
+    (SELECT 1 FROM messages m WHERE m.threadId=j.threadId AND m.kind='tool' AND json_extract(m.data,'$.replyTo')=j.messageId
+      AND (j.operation IS NULL OR json_extract(m.data,'$.step')>=1+COALESCE(json_extract(j.operation,'$.continuation.steps'),0)))`).all()){
     db.prepare("UPDATE chat_jobs SET status='failed',operation=NULL WHERE id=?").run(job.id)
     message(db,String(job.threadId),'system','error','主聊在工具执行后中断，已保留工具记录。请检查实际结果后继续。',{replyTo:job.messageId})
   }
@@ -95,7 +97,7 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
       const {sequence,version:reset}=contextReset(db,thread.id)
       let authorizedContext=reset,streamText='',lastPreviewAt=0
       const configSnapshot=JSON.stringify(config), policySnapshot=JSON.stringify(policy), pluginRevision=plugins?.revision
-      const stamp=createHash('sha256').update(JSON.stringify([selected,configSnapshot,policySnapshot,reset,pluginRevision])).digest('hex')
+      const stamp=()=>createHash('sha256').update(JSON.stringify([selected,configSnapshot,policySnapshot,authorizedContext,pluginRevision])).digest('hex')
       const accessChanged='生成期间模型或资料授权发生变化，请重新发送。已提交的操作保留原回执。'
       const check=()=>{
         abort.signal.throwIfAborted()
@@ -126,14 +128,31 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
       const activeTasks=mayShareWork?tasks:[]
       const webSources=new Map<string,{url:string;title:string;retrievedAt:string;body?:string}>()
       const webDestinations=new Set<string>()
+      const recentWeb=new Map<string,string>()
       const core:Core={db,dir,thread,current,model,allowedInstances:mayShareWork?instances:[],materials,attachmentIds,signal:abort.signal,
         actor:'user',plugins,webSources,webDestinations,...services}
-      function captureWeb(result:any){
+      function captureWeb(result:any,keepSources=true){
+        for(const page of Array.isArray(result?.results)?result.results:[result]){
+          for(const link of Array.isArray(page?.links)?page.links:[]){
+            if(typeof link.url!=='string')continue
+            webDestinations.add(link.url)
+            if(!keepSources&&recentWeb.size<16&&!recentWeb.has(link.url))recentWeb.set(link.url,link.title)
+          }
+        }
         for(const ref of (Array.isArray(result?.references)?result.references:[])){
           if(typeof ref?.id!=='string'||typeof ref.url!=='string'||typeof ref.title!=='string'||typeof ref.retrievedAt!=='string')continue
           webDestinations.add(ref.url)
+          if(!keepSources&&recentWeb.size<16&&!recentWeb.has(ref.url))recentWeb.set(ref.url,ref.title)
           const content=result.id===ref.id?result:result.results?.find((item:any)=>item.id===ref.id)
-          if(!webSources.get(ref.id)?.body||typeof content?.body==='string')webSources.set(ref.id,{...ref,body:content?.body})
+          if(keepSources&&(!webSources.get(ref.id)?.body||typeof content?.body==='string'))webSources.set(ref.id,{...ref,body:content?.body})
+        }
+      }
+      if(mayShareHistory&&plugins?.tools.has('web__read')){
+        for(const receipt of db.prepare(`SELECT json_extract(m.data,'$.webResult') AS result FROM messages m
+          JOIN messages original ON original.id=json_extract(m.data,'$.replyTo') AND original.threadId=m.threadId
+          WHERE m.threadId=? AND m.kind='tool' AND original.rowid>? AND original.rowid<?
+          AND json_extract(m.data,'$.webResult') IS NOT NULL ORDER BY m.rowid DESC LIMIT 16`).all(thread.id,sequence,current.sequence)){
+          captureWeb(JSON.parse(String(receipt.result)),false)
         }
       }
       const enabledTools=toolsFor(core)
@@ -144,13 +163,16 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
         explicitMaterials:receiveFiles?materials.map(m=>({...m,text:String(m.text??'').slice(0,4000)})).slice(0,12):[],
         attachments:attachments.map(a=>({id:a.id,name:a.name,text:/^text\//.test(a.contentType)?Buffer.from(a.data,'base64').subarray(0,6000).toString('utf8'):undefined})),
         ...history,project,memory,tasks:activeTasks,instances:core.allowedInstances,availableTools:enabledTools,
+        recentWeb:[...recentWeb].map(([url,title])=>({url,title})),
         skills:!pluginModel?plugins?.skills(thread.projectId).filter(s=>!s.projectId||mayShareProject)
           .slice(0,20).map(({id,description})=>({id,description})):undefined,
         fileRoots:!model||model.shareAttachments?{read:policy.readRoots,write:policy.writeRoots}:undefined}
-      const toolResults:any[]=[]
+      const toolResults:unknown[]=[]
       const exchanges:ToolExchange[]=[]
       const seen=new Set<string>()
-      const maxSteps=5
+      const maxSteps=10
+      const fingerprint=(tool:string,args:string)=>createHash('sha256').update(tool+'\u0000'+args).digest('hex')
+      let steps=0
       let d:Decision
       let usedMemories:any[]=[]
       async function execute(tool:string,args:string,step:number,approval=false,nativeCall?:ToolCall){
@@ -159,7 +181,8 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
         try{
           const call=toolCall(core,tool,args)
           if(call.confirm&&!approval){
-            transaction(db,()=>proposeOperation(db,job,{id:id(),tool,args,stamp,expires:Date.now()+10*60_000,call:nativeCall}))
+            transaction(db,()=>proposeOperation(db,job,{id:id(),tool,args,stamp:stamp(),expires:Date.now()+10*60_000,
+              call:nativeCall,continuation:{steps:step-1,seen:[...seen],toolResults,exchanges}}))
             return null
           }
           const save=(result:any)=>{
@@ -181,9 +204,19 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
             return result
           })
           // A synchronous tool may revoke its own prior context as part of a committed change.
-          if(!call.async)authorizedContext=contextReset(db,thread.id).version
-          if(authorizedContext!==reset){toolResults.length=0;exchanges.length=0}
-          return {tool,ok:true,result:smallResult(result)}
+          const version=call.async?authorizedContext:contextReset(db,thread.id).version
+          if(version!==authorizedContext){
+            authorizedContext=version
+            toolResults.length=0
+            exchanges.length=0
+            webDestinations.clear()
+            webSources.clear()
+            Object.assign(meta,{previousSummary:'',recent:[],olderMessages:[],project:null,memory:[],explicitMaterials:[],attachments:[],recentWeb:[]})
+            attachments.length=0
+            core.materials=[]
+            core.attachmentIds=[]
+          }
+          return {tool,ok:true,result:smallResult(tool.startsWith('web__')?webModelResult(result):result)}
         }catch(e){
           if(!db.isOpen)return {tool,ok:false,error:'工作台已关闭'}
           const error=(e as {status?:number}).status?(e as Error).message:'工具未能执行'
@@ -191,34 +224,36 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
           return {tool,ok:false,error}
         }
       }
+      function remember(result:unknown,call:ToolCall|undefined,version:number){
+        if(call&&version===authorizedContext)exchanges.push({call,result})
+        else toolResults.push(result)
+      }
       if(job.operation){
         const approved=JSON.parse(job.operation) as Operation
-        if(!approved.approved||approved.expires<Date.now()||approved.stamp!==stamp)fail('该操作的授权已过期或改变，请重新发起',409)
-        if(approved.tool==='web_archive'){
-          for(const receipt of db.prepare(`SELECT json_extract(data,'$.webResult') AS result FROM messages WHERE threadId=?
-            AND kind='tool' AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.webResult') IS NOT NULL`).all(thread.id,current.id)){
-            captureWeb(JSON.parse(String(receipt.result)))
-          }
+        if(!approved.approved||approved.expires<Date.now()||approved.stamp!==stamp())fail('该操作的授权已过期或改变，请重新发起',409)
+        if(approved.continuation){
+          steps=approved.continuation.steps
+          for(const signature of approved.continuation.seen)seen.add(signature)
+          toolResults.push(...approved.continuation.toolResults)
+          exchanges.push(...approved.continuation.exchanges)
         }
-        const result=await execute(approved.tool,approved.args,1,true)
-        if(result){
-          if(approved.call&&authorizedContext===reset)exchanges.push({call:approved.call,result})
-          else toolResults.push(result)
+        for(const receipt of db.prepare(`SELECT json_extract(data,'$.webResult') AS result FROM messages WHERE threadId=?
+          AND rowid>? AND kind='tool' AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.webResult') IS NOT NULL
+          ORDER BY rowid`).all(thread.id,sequence,current.id)){
+          captureWeb(JSON.parse(String(receipt.result)))
         }
-        seen.add(approved.tool+'\u0000'+approved.args)
+        const version=authorizedContext
+        const result=await execute(approved.tool,approved.args,++steps,true,approved.call)
+        if(result)remember(result,approved.call,version)
+        seen.add(fingerprint(approved.tool,approved.args))
       }
-      for(let i=0;;i++){
+      for(;;){
         check()
-        // Owner changes made while a provider was running invalidate the old background before the next call.
-        if(i&&authorizedContext!==reset){
-          Object.assign(meta,{previousSummary:'',recent:[],olderMessages:[],project:null,memory:[],explicitMaterials:[],attachments:[]})
-          attachments.length=0
-        }
         const input=boundedContext({...meta,toolResults},budget)
         usedMemories=(input.memory??[]).map(({id,revision,projectId}:any)=>({id,revision,projectId}))
         let output:unknown
         streamText=''
-        const prompt=instruction+(policy.memory&&policy.memoryCandidates?
+        const prompt=instruction+webResearchInstruction+(policy.memory&&policy.memoryCandidates?
           '。普通回复中可附一个 memoryCandidate，body 必须来自当前用户原话，只提议稳定偏好、长期约定或项目规则。敏感内容和工具数据不能成为候选。':'')
         try{output=await provider.generate(prompt+'\n'+JSON.stringify(input),attachments,{signal:abort.signal,tools:enabledTools,exchanges,delta:delta=>{
           if(abort.signal.aborted)return
@@ -237,16 +272,16 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
         else if(d.action==='steer'||d.action==='cancel')d={...d,action:'tool',tool:'task_control',
           arguments:JSON.stringify({taskId:d.taskId,action:d.action,text:d.text})}
         if(d.action!=='tool')break
-        if(i>=maxSteps){d={...d,action:'reply',text:'已达到本轮工具调用上限。上方记录保留了每次操作的实际结果。'};break}
-        const signature=d.tool+'\u0000'+d.arguments
+        if(steps>=maxSteps){d={...d,action:'reply',text:'已达到本轮工具调用上限。上方记录保留了每次操作的实际结果。'};break}
+        const signature=fingerprint(d.tool!,d.arguments!)
         if(seen.has(signature))fail('模型重复请求同一操作，已保留此前工具记录')
         seen.add(signature)
         const {tool,args}={tool:d.tool!,args:d.arguments!}
-        const outcome=await execute(tool,args,i+(job.operation?2:1),false,d.nativeCall)
+        const version=authorizedContext
+        const outcome=await execute(tool,args,++steps,false,d.nativeCall)
         if(!outcome)return
         check()
-        if(d.nativeCall)exchanges.push({call:d.nativeCall,result:outcome})
-        else toolResults.push(outcome)
+        remember(outcome,d.nativeCall,version)
       }
       check()
       transaction(db,()=>{
@@ -280,6 +315,23 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
       try{active.check()}catch(e){active.abort.abort(e)}
     }}
 }
+function webModelResult(result:any){
+  if(JSON.stringify(result??null).length<=7500)return result
+  const page=(value:any,limit:number)=>{
+    const {body,links,references,...rest}=value
+    const linkSize=(links??[]).filter((link:any)=>link.url.length<350).slice(0,8)
+    return {...rest,links:linkSize,body:typeof body==='string'?body.slice(0,limit):undefined,
+      truncated:rest.truncated||typeof body==='string'&&body.length>limit}
+  }
+  if(Array.isArray(result?.results)){
+    if(result.query){
+      const {references,results,...rest}=result
+      return {...rest,results:results.slice(0,8).map(({snippet,...item}:any)=>({...item,snippet:snippet?.slice(0,200)}))}
+    }
+    return {results:result.results.map((item:any)=>page(item,1000))}
+  }
+  return result?.body?page(result,4000):result
+}
 function smallResult(value:unknown){
   const encoded=JSON.stringify(value??null)
   return encoded.length<=7500?value:{excerpt:encoded.slice(0,7500),truncated:true}
@@ -300,6 +352,7 @@ function boundedContext(context:any,limit:number){
   }
   add('availableTools',availableTools)
   add('toolResults',background.toolResults.slice(-5).reverse())
+  add('recentWeb',background.recentWeb)
   add('recent',background.recent,true)
   add('memory',background.memory)
   add('project',background.project)

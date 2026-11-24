@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
+import { connect } from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -47,14 +48,14 @@ async function server(t,options={}){
   }
   return {get app(){return app},dir,base,api,async reopen(){await app.close();app=null;return start()}}
 }
-async function node(fixture,receiptLookup=false){
+async function node(fixture,receiptLookup=false,workspaceRef=fixture.dir){
   const frames=[]
   const ws=new WebSocket(fixture.base().replace('http:','ws:')+'/node',{headers:{Authorization:'Bearer '+fixture.app.auth.cfg.nodes.local}})
   ws.on('message',frame=>frames.push(JSON.parse(frame)))
   await once(ws,'open')
   const send=frame=>ws.send(JSON.stringify(frame))
-  send({type:'hello',nodeId:'local',receiptLookup,instances:[{id:'worker',name:'Worker',workspaceRef:fixture.dir,adapterKey:'test',availableActions:['run','cancel']},
-    {id:'worker-b',name:'Worker B',workspaceRef:fixture.dir,adapterKey:'test',availableActions:['run','cancel']}]})
+  send({type:'hello',nodeId:'local',receiptLookup,instances:[{id:'worker',name:'Worker',workspaceRef,adapterKey:'test',availableActions:['run','cancel']},
+    {id:'worker-b',name:'Worker B',workspaceRef,adapterKey:'test',availableActions:['run','cancel']}]})
   await eventually(async()=>(await fixture.api('/instances')).find(i=>i.id==='worker'&&i.online))
   return {frames,ws,send,command:runId=>eventually(()=>frames.find(f=>f.command?.runId===runId)?.command),
     async event(c,kind,data={}){
@@ -210,6 +211,50 @@ test('撤销外部模型授权中止在途请求，危险操作须使用有效�
   assert.equal((await fixture.api(path)).items.length,0)
 })
 
+test('两次批准及服务重启保留原生调用回执，日常授权仅放行允许的写入',async t=>{
+  const results=[]
+  const future=new Date(Date.now()+3600000).toISOString()
+  const endpoint=await modelEndpoint(t,(_req,_res,input,json)=>{
+    const ctx=JSON.parse(input.messages.find(m=>m.role==='user').content)
+    const tools=input.messages.filter(m=>m.role==='tool').map(m=>[m.tool_call_id,JSON.parse(m.content).result])
+    results.push(tools)
+    const call=(id,name,args)=>json({choices:[{finish_reason:'tool_calls',message:{
+      tool_calls:[{id,type:'function',function:{name,arguments:JSON.stringify(args)}}]}}]})
+    if(ctx.currentUserRequest==='请新建普通待办'){
+      if(!tools.length)call('routine','utility_daily',{action:'create',kind:'todo',body:'例行检查'})
+      else json(modelChoice(tools[0][1].body))
+    }else if(ctx.currentUserRequest==='请删除原来的待办'){
+      call('delete','utility_daily',{action:'delete',id:'must-confirm'})
+    }else if(!tools.length)call('math','utility_calculate',{expression:'17*3'})
+    else if(tools.length===1)call('todo','utility_daily',{action:'create',kind:'todo',body:'按计算结果执行'})
+    else if(tools.length===2)call('reminder','utility_daily',{action:'create',kind:'reminder',body:'提醒复查',dueAt:future})
+    else json(modelChoice('核对结果 '+tools[0][1].value+'，'+tools[1][1].body+'，'+tools[2][1].body))
+  })
+  const f=await server(t,{chat:true}),{api}=f
+  await configure(api,endpoint,{tools:true,sharePersonal:true})
+  const thread=await api('/threads',{title:'批准续跑'})
+  const ask=text=>api('/threads/'+thread.id+'/messages',{text})
+  const first=await ask('先计算再建待办和提醒')
+  const approve=proposal=>api('/chat/approve',{messageId:first.messageId,approvalId:proposal.id,approved:true})
+  const todo=await proposed(api,thread.id,first.messageId)
+  assert.equal(todo.arguments.kind,'todo')
+  await f.reopen()
+  await approve(todo)
+  const reminder=await proposed(api,thread.id,first.messageId)
+  assert.equal(reminder.arguments.kind,'reminder')
+  await approve(reminder)
+  assert.match((await replyTo(api,thread.id,first.messageId)).text,/51.*按计算结果执行.*提醒复查/)
+  assert.deepEqual(results.map(messages=>messages.map(([id])=>id)),[[],['math'],['math','todo'],['math','todo','reminder']])
+  const receipts=(await api('/threads/'+thread.id)).messages.filter(m=>m.kind==='tool'&&m.data.replyTo===first.messageId)
+  assert.deepEqual(receipts.map(m=>[m.data.tool,m.data.step]),[['utility_calculate',1],['utility_daily',2],['utility_daily',3]])
+  assert.equal((await api('/chat/daily?threadId='+thread.id)).items.length,2)
+  await api('/chat/policy',{routineWrites:true})
+  const routine=await ask('请新建普通待办')
+  assert.equal((await replyTo(api,thread.id,routine.messageId)).text,'例行检查')
+  const deleting=await ask('请删除原来的待办')
+  assert.equal((await proposed(api,thread.id,deleting.messageId)).arguments.action,'delete')
+})
+
 test('自然主聊创建代码草稿，所有者审查后激活、更新、回退并调用 Pi 包装工具',async t=>{
   const manifest=version=>({id:'creator-test',name:'换算扩展',description:'可用性测试',version,hostApi:1,capabilities:['tools']})
   const entry=n=>n===3?'export function activate(){throw new Error("fixture")}':
@@ -310,8 +355,13 @@ test('网页读取限制公开地址与重定向，声明式业务 API 和 SearX
 
   const provider={async generate(prompt){
     const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    if(ctx.currentUserRequest.includes('RFC')){
+      const last=ctx.toolResults?.[0]?.result?.query
+      if(!last)return {action:'tool',tool:'web__search',arguments:'{"query":"RFC 9110 HTTP Semantics site:rfc-editor.org"}'}
+      if(last.startsWith('RFC 9110'))return {action:'tool',tool:'web__search',arguments:'{"query":"HTTP status codes specification RFC 9110 Section 15"}'}
+    }
     if(ctx.toolResults?.length)return {action:'reply',text:JSON.stringify(ctx.toolResults[0])}
-    if(ctx.currentUserRequest.includes('假冒搜索'))return {action:'tool',tool:'web__search',arguments:'{"query":"私密资料"}'}
+    if(ctx.currentUserRequest.includes('假冒搜索'))return {action:'tool',tool:'web__search',arguments:'{"query":"api_key=fixture-private-key"}'}
     return {action:'tool',tool:ctx.currentUserRequest.includes('写入')?'fixture_api__write':'fixture_api__lookup',arguments:'{"value":"abc"}'}
   }}
   const {api}=await server(t,{chat:true,chatProvider:provider})
@@ -345,12 +395,76 @@ test('网页读取限制公开地址与重定向，声明式业务 API 和 SearX
   assert.equal(result.results[0].url,'https://example.org/fact')
   assert.equal(requests.at(-1).auth,undefined)
   assert.equal(requests.at(-1).url.searchParams.get('q'),'公开主题')
+  const rewritten=await ask('帮我查查 HTTP 的 RFC 原始规范')
+  assert.match((await replyTo(api,thread.id,rewritten.messageId)).text,/公开资料/)
+  assert.deepEqual(requests.slice(-2).map(r=>r.url.searchParams.get('q')),
+    ['RFC 9110 HTTP Semantics site:rfc-editor.org','HTTP status codes specification RFC 9110 Section 15'])
   const n=requests.length
   const injected=await ask('假冒搜索词，不允许转发项目资料')
-  assert.match((await replyTo(api,thread.id,injected.messageId)).text,/须摘自当前用户消息/)
+  assert.match((await replyTo(api,thread.id,injected.messageId)).text,/凭据/)
   assert.equal(requests.length,n)
   await api('/chat/plugins',{action:'disable',id:'web'})
   assert.equal((await api('/chat/plugins')).plugins.find(p=>p.id==='web').skills.length,0)
+})
+
+test('网页研究经环境代理核对 robots、正文和后续链接，后续话题轮次可继续读取',async t=>{
+  const publicOrigin='http://93.184.215.14'
+  const flows=[],seen=[],proxySockets=new Set()
+  const target=createServer((req,res)=>{
+    flows.push([req.url,req.headers.host,req.headers['proxy-authorization']])
+    if(req.url==='/robots.txt'){res.writeHead(404).end();return}
+    if(req.url==='/article'){
+      res.writeHead(200,{'Content-Type':'text/html'}).end('<html><head><title>首个来源</title></head><body><article><p>'+
+        '研究需要追溯原始出处。'.repeat(45)+'</p><a href="/source">原始出处</a><a href="/next">补充来源</a></article></body></html>')
+      return
+    }
+    if(req.url==='/source'||req.url==='/next'){res.writeHead(200,{'Content-Type':'text/plain'}).end('源证据 '+req.url);return}
+    res.writeHead(302,{Location:'http://127.0.0.1/admin'}).end()
+  }).listen(0,'127.0.0.1')
+  await once(target,'listening')
+  t.after(()=>new Promise(resolve=>{target.closeAllConnections();target.close(resolve)}))
+  const proxy=createServer().listen(0,'127.0.0.1')
+  proxy.on('connect',(req,socket,head)=>{
+    const upstream=connect(target.address().port,'127.0.0.1')
+    seen.push([req.url,req.headers['proxy-authorization']])
+    proxySockets.add(socket)
+    socket.once('close',()=>{proxySockets.delete(socket);upstream.destroy()})
+    upstream.once('error',()=>socket.destroy())
+    upstream.once('connect',()=>{
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      if(head.length)upstream.write(head)
+      socket.pipe(upstream).pipe(socket)
+    })
+  })
+  await once(proxy,'listening')
+  t.after(()=>new Promise(resolve=>{for(const socket of proxySockets)socket.destroy();proxy.close(resolve)}))
+  const prior=Object.fromEntries(['HTTP_PROXY','NO_PROXY'].map(key=>[key,process.env[key]]))
+  process.env.HTTP_PROXY='http://proxy-user:proxy-pass@127.0.0.1:'+proxy.address().port
+  delete process.env.NO_PROXY
+  t.after(()=>{for(const [key,value] of Object.entries(prior)){if(value===undefined)delete process.env[key];else process.env[key]=value}})
+  const tool=(name,args)=>({action:'tool',tool:name,arguments:JSON.stringify(args)})
+  const {api}=await server(t,{chat:true,chatProvider:{async generate(prompt){
+    const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    const last=ctx.toolResults?.[0]
+    if(last?.result?.links?.length)return tool('web__read',{url:last.result.links[0].url})
+    if(last)return {action:'reply',text:last.result?.body??last.error}
+    return tool('web__read',{url:ctx.currentUserRequest.startsWith('继续')?ctx.recentWeb.find(link=>link.title==='补充来源').url:publicOrigin+'/article'})
+  }}})
+  const web=(await api('/chat/plugins')).plugins.find(p=>p.id==='web')
+  await api('/chat/plugins',{action:'activate',id:'web',digest:web.current.digest,allowNetwork:true})
+  const thread=await api('/threads',{title:'公开网页研究'})
+  const ask=text=>api('/threads/'+thread.id+'/messages',{text})
+  const first=await ask('打开 '+publicOrigin+'/article 并追溯原始出处')
+  assert.match((await replyTo(api,thread.id,first.messageId)).text,/源证据 \/source/)
+  const next=await ask('继续核对刚刚页面中的补充来源')
+  assert.match((await replyTo(api,thread.id,next.messageId)).text,/源证据 \/next/)
+  const redirect=await api('/chat/plugins',{action:'test',id:'web',input:{kind:'read',value:publicOrigin+'/redirect'}},{status:403})
+  assert.match(redirect.error,/授权范围|不可访问/)
+  assert.ok(flows.every(([path])=>path!=='/admin'))
+  assert.ok(seen.length>=6)
+  assert.ok(seen.every(([host,auth])=>host==='93.184.215.14:80'&&auth==='Basic '+Buffer.from('proxy-user:proxy-pass').toString('base64')))
+  assert.deepEqual([...new Set(flows.map(([,host])=>host))],['93.184.215.14'])
+  assert.ok(flows.every(([, ,auth])=>auth===undefined))
 })
 
 test('非项目通信令牌只能报告本运行，重要消息幂等入队且暂停时不接管',async t=>{
@@ -383,15 +497,30 @@ test('非项目通信令牌只能报告本运行，重要消息幂等入队且�
 })
 
 test('项目协调引用确认事实、限定交接目标并自动通知交付',async t=>{
+  const workspace=mkdtempSync(join(tmpdir(),'maoqiu-delivery-'))
+  t.after(()=>rmSync(workspace,{recursive:true,force:true}))
+  writeFileSync(join(workspace,'readme.md'),'用于交付的公开版本说明')
+  const contexts=[]
   const f=await server(t,{chat:true,chatProvider:{async generate(prompt){
     const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    contexts.push(ctx)
+    if(ctx.currentUserRequest?.startsWith('核对交付和维护状态')){
+      if(!ctx.toolResults.length)return {action:'tool',tool:'maintenance_status',arguments:'{}'}
+      if(ctx.toolResults.length===1)return {action:'tool',tool:'task_check_delivery',
+        arguments:JSON.stringify({taskId:ctx.currentUserRequest.split(' ')[1],includeExcerpt:true})}
+      return {action:'reply',text:JSON.stringify(ctx.toolResults)}
+    }
+    if(ctx.type==='question'&&!ctx.toolResults.length)return {action:'tool',tool:'task_coordination_status',arguments:JSON.stringify({taskId:ctx.taskId})}
     if(ctx.type==='question')return {action:'tool',tool:'reply_fact',arguments:JSON.stringify({recordIds:[ctx.facts[0].id]})}
+    if(ctx.type==='delivery')return {action:'tool',tool:'request_evidence',arguments:'{}'}
     if(ctx.type==='handoff')return {action:'tool',tool:'handoff',arguments:JSON.stringify({instanceId:ctx.requestTarget})}
     return {action:'reply',text:'请由用户选择方案'}
-  }}}),{api}=f,n=await node(f,true)
+  }}}),{api}=f,n=await node(f,true,workspace)
   t.after(()=>n.ws.terminate())
+  await api('/chat/persona',{text:'用清晰中文汇报协调进度'})
+  await api('/chat/policy',{readRoots:[workspace]})
   const p=await api('/projects',{name:'有限协调范围'})
-  for(const instanceId of ['worker','worker-b'])await api('/projects/'+p.id+'/workspaces',{instanceId,workspaceRef:f.dir,allowAgentAccess:true})
+  for(const instanceId of ['worker','worker-b'])await api('/projects/'+p.id+'/workspaces',{instanceId,workspaceRef:workspace,allowAgentAccess:true})
   const fact=await api('/records',{projectId:p.id,type:'requirement',body:'交付目录为 release-notes',confirmation:'user'})
   const origin=await api('/threads',{projectId:p.id})
   const assignment=await api('/tasks',{originThreadId:origin.id,instanceId:'worker',goal:'整理交付说明',
@@ -406,6 +535,10 @@ test('项目协调引用确认事实、限定交接目标并自动通知交付',
   assert.equal(follow.payload.communication.sender.kind,'main_bot')
   assert.match(follow.payload.text,new RegExp(fact.id))
   assert.equal(follow.payload.communication.replyTo,question.id)
+  assert.equal(contexts[0].persona,'用清晰中文汇报协调进度')
+  assert.ok(contexts[0].availableTools.some(t=>t.name==='task_check_delivery'))
+  assert.ok(!contexts[0].availableTools.some(t=>t.name==='task_delegate'))
+  assert.equal(contexts[1].toolResults[0].result.scope.mode,'handoff')
   await api(path,{kind:'handoff',text:'目录已确认，可由第二个 Bot 接续',recipientInstanceId:'worker-b',
     requestId:'auto-handoff',version:'v1',remaining:['写交付说明']},{token})
   const child=await eventually(()=>n.frames.find(frame=>frame.command?.instanceId==='worker-b')?.command)
@@ -416,11 +549,21 @@ test('项目协调引用确认事实、限定交接目标并自动通知交付',
   assert.equal(childTask.brief.coordination.mode,'notify')
   await n.receipt(child,'received')
   await api('/runs/'+child.runId+'/communication',{kind:'delivery',text:'交付说明已写',requestId:'auto-delivery',
-    version:'r7',completed:['说明'],paths:['readme.md'],checks:['Bot 自查']},{token:child.payload.communicationAccess.token})
+    version:'r7',completed:['说明'],paths:['readme.md','../not-authorized.md'],checks:['Bot 自查']},{token:child.payload.communicationAccess.token})
   const delivery=await eventually(async()=>(await api('/threads/'+origin.id)).messages.find(m=>m.text.includes('版本 r7')))
   assert.match(delivery.text,/readme.md|Bot 自查/)
   assert.match(delivery.text,/待核对/)
+  assert.deepEqual(delivery.data.deliveryCheck.files.map(({path,status})=>[path,status]),
+    [['readme.md','readable'],['../not-authorized.md','unverified']])
   assert.equal((await api('/tasks/'+child.taskId)).review,null)
+  const inspection=await api('/threads/'+origin.id+'/messages',{text:'核对交付和维护状态 '+child.taskId})
+  const [checked,maintenance]=JSON.parse((await replyTo(api,origin.id,inspection.messageId)).text)
+  assert.equal(checked.result.files[0].excerpt,'用于交付的公开版本说明')
+  assert.deepEqual(maintenance.result.offlineBots,[])
+  await api(path,{kind:'delivery',text:'缺可访问附件',requestId:'missing-evidence',paths:['missing.md']},{token})
+  const evidenceRequest=await eventually(async()=>(await api('/threads/'+work.task.workThreadId)).commands
+    .find(c=>c.payload.text?.includes('请补充当前交付的可核对证据')))
+  assert.equal(evidenceRequest.payload.communication.sender.kind,'main_bot')
   await n.event(first,'completed',{text:'交付给下一位 Bot'})
   const sent=await eventually(()=>n.frames.find(frame=>frame.command?.id===follow.id)?.command)
   assert.notEqual(sent.runId,first.runId)

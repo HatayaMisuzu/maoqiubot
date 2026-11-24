@@ -13,7 +13,8 @@ const permissions={
   personalInProject:'项目聊天可使用相关个人记忆',
   pluginCreator:'允许主聊生成待审查扩展',
   desktop:'允许主聊提出桌面操作',
-  memoryCandidates:'从用户原话提议长期记忆，保存前人工审阅'
+  memoryCandidates:'从用户原话提议长期记忆，保存前人工审阅',
+  routineWrites:'免逐次确认日常写入（新增或完成待办、新增普通笔记或集合条目）'
 };
 const protocolOptions=[
   ['openai-compatible','OpenAI Chat Completions'],['openai-responses','OpenAI Responses'],

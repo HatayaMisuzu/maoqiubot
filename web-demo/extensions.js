@@ -103,6 +103,8 @@ function configure(p){
     {key:'endpoint',label:'SearXNG JSON 搜索端点',value:p.config.endpoint,placeholder:'https://example.org/search'},
     {key:'keyEnv',label:'Brave 密钥的环境变量名',value:p.config.keyEnv,placeholder:'MAOQIU_PLUGIN_KEY_BRAVE'},
     {key:'privateLan',label:'允许连接指定局域网 SearXNG',options:[{id:'off',name:'关闭'},{id:'on',name:'开启（HTTP 为明文）'}],value:p.config.privateLan?'on':'off'},
+    {key:'proxy',label:'公开网页代理',options:[{id:'environment',name:'使用代理设置或环境变量'},{id:'direct',name:'始终直连'}],value:p.config.proxy||'environment'},
+    {key:'proxyUrl',label:'HTTP CONNECT 代理地址（可选）',value:p.config.proxyUrl,placeholder:'http://127.0.0.1:7890'},
     {key:'language',label:'默认语言',value:p.config.language},{key:'region',label:'默认地区',value:p.config.region},
     {key:'maxResults',label:'结果数上限',type:'number',value:p.config.maxResults},{key:'timeoutMs',label:'超时（毫秒）',type:'number',value:p.config.timeoutMs}
   ]:[{key:'json',label:'配置 JSON（密钥填写环境变量引用）',type:'textarea',value:JSON.stringify(p.config,null,2)}];

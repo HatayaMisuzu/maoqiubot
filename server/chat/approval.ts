@@ -1,9 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { changed,fail,must,required,transaction } from '../db/index.ts'
 import { message } from '../tasks/index.ts'
-import type { ToolCall } from './provider.ts'
+import type { ToolCall, ToolExchange } from './provider.ts'
 
-export type Operation={id:string;tool:string;args:string;stamp:string;expires:number;approved?:boolean;call?:ToolCall}
+export type Operation={id:string;tool:string;args:string;stamp:string;expires:number;approved?:boolean;call?:ToolCall;
+  continuation?:{steps:number;seen:string[];toolResults:unknown[];exchanges:ToolExchange[]}}
 
 export function proposeOperation(db:DatabaseSync,job:any,operation:Operation){
   db.prepare("UPDATE chat_jobs SET operation=?,status='awaiting_approval' WHERE id=?").run(JSON.stringify(operation),job.id)

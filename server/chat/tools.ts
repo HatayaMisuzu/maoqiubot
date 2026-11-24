@@ -17,6 +17,7 @@ import { calculate,dailyAction } from './daily.ts'
 import { projectWorkspaces } from '../tasks/workspaces.ts'
 import { basename } from 'node:path'
 import { offerMemory,saveUserMemory } from './memory.ts'
+import { checkDelivery } from './delivery.ts'
 
 export type DesktopBridge={
   status():unknown; restart():Promise<unknown>; save(settings:unknown):unknown;
@@ -25,14 +26,14 @@ export type DesktopBridge={
 export type ToolServices={desktop?:DesktopBridge;listSessions?(inst:any,cursor:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>}
 
 type Policy={task:boolean;memory:boolean;homeContent:boolean;homeSpace:boolean;personalInProject:boolean;readRoots:string[];writeRoots:string[];
-  pluginCreator?:boolean;desktop?:boolean;memoryCandidates?:boolean}
+  pluginCreator?:boolean;desktop?:boolean;memoryCandidates?:boolean;routineWrites?:boolean}
 const policyFile='chat-policy.json'
 export const chatPolicy=(dir:string)=>readLocal<Policy>(dir,policyFile,{
   task:true,memory:true,homeContent:false,homeSpace:false,personalInProject:false,readRoots:[],writeRoots:[]
 })
 export function saveChatPolicy(dir:string,b:any){
   const p=chatPolicy(dir)
-  for(const key of ['task','memory','homeContent','homeSpace','personalInProject','pluginCreator','desktop','memoryCandidates'] as const){
+  for(const key of ['task','memory','homeContent','homeSpace','personalInProject','pluginCreator','desktop','memoryCandidates','routineWrites'] as const){
     if(b[key]===undefined)continue
     if(typeof b[key]!=='boolean')fail('工具授权须为布尔值')
     p[key]=b[key]
@@ -47,6 +48,7 @@ export function saveChatPolicy(dir:string,b:any){
 }
 export type Core={db:DatabaseSync;dir:string;thread:any;current:any;model?:Pick<ModelConfig,'shareProject'|'sharePersonal'|'shareAttachments'>;
   allowedInstances:any[];materials:any[];attachmentIds:string[];signal:AbortSignal;actor:'user'|'work_bot'|'system';
+  coordination?:{taskId:string;runId:string};
   plugins?:PluginHost;webDestinations?:Set<string>;webSources?:Map<string,{url:string;title:string;retrievedAt:string;body?:string}>}
   & ToolServices
 type Shape='string'|'integer'|'array'|'boolean'|'object'
@@ -70,6 +72,7 @@ function home(c:Core,method:string,path:string,body:object={},query:Record<strin
 }
 const trail=(c:Core)=>({threadId:c.thread.id,messageId:c.current.id})
 function scopedTask(c:Core,id:string){
+  if(c.coordination&&c.coordination.taskId!==id)fail('协调只允许检查当前任务',403)
   const task=getTask(c.db,id)
   if(task.projectId!==c.thread.projectId||!task.projectId&&task.originThreadId!==c.thread.id)fail('任务不在当前话题或项目范围内',403)
   return task
@@ -136,6 +139,32 @@ const tools=[
   define('task_progress','读取某个任务的真实运行、动作回执、最近消息与验收',{taskId:'string'},['taskId'],{execute:(c,a)=>progress(c,a.taskId)}),
   define('task_communications','读取当前任务的澄清、回复、交接和交付消息',{taskId:'string'},['taskId'],
     {execute:(c,a)=>{scopedTask(c,a.taskId);return taskCommunications(c.db,a.taskId)}}),
+  define('task_check_delivery','检查当前任务的实际运行回执、交付引用及获准读取的本机成果，列出待核对项。',
+    {taskId:'string',includeExcerpt:'boolean'},['taskId'],{execute:(c,a)=>{
+      const task=scopedTask(c,a.taskId)
+      const mayRead=!c.model||c.model.shareAttachments
+      return checkDelivery(c.db,c.dir,task,c.coordination?.runId,mayRead?chatPolicy(c.dir).readRoots:[],mayRead&&a.includeExcerpt===true)
+    }}),
+  define('task_coordination_status','检查任务协调方式、暂停状态、获准转交对象和近期协调结果。',{taskId:'string'},['taskId'],{execute:(c,a)=>{
+    const task=scopedTask(c,a.taskId)
+    return {taskId:task.id,scope:task.brief.coordination??null,events:c.db.prepare(`SELECT j.status,m.id,m.kind,m.createdAt,
+      json_extract(m.data,'$.type') AS type FROM chat_jobs j JOIN messages m ON m.id=j.messageId
+      WHERE j.kind='coordination' AND m.taskId=? ORDER BY j.id DESC LIMIT 12`).all(task.id)}
+  }}),
+  define('maintenance_status','检查当前范围内工作 Bot 掉线、运行待恢复、协调积压及扩展状态。',{},[],{
+    allowed:c=>c.actor==='user',execute:c=>{
+      const tasks=c.db.prepare(`SELECT t.id,t.instanceId,t.status,r.id AS runId,r.status AS runStatus,
+        EXISTS(SELECT 1 FROM commands WHERE taskId=t.id AND status='held') AS held
+        FROM tasks t LEFT JOIN runs r ON r.id=(SELECT id FROM runs WHERE threadId=t.workThreadId ORDER BY rowid DESC LIMIT 1)
+        WHERE t.projectId IS ? AND (? IS NOT NULL OR t.originThreadId=?)
+          AND (r.status IN ('uncertain','waiting_input') OR held=1) ORDER BY t.rowid DESC LIMIT 20`)
+        .all(c.thread.projectId,c.thread.projectId,c.thread.id)
+      const coordination=c.db.prepare(`SELECT status,COUNT(*) AS count FROM chat_jobs
+        WHERE threadId=? AND kind='coordination' AND status IN ('queued','working','failed') GROUP BY status`).all(c.thread.id)
+      const extensions=c.plugins?.list().plugins.filter(p=>p.current&&(!p.current.projectId||p.current.projectId===c.thread.projectId))
+        .map(({id,enabled,loaded,error})=>({id,enabled,loaded,hasError:!!error}))??[]
+      return {offlineBots:c.allowedInstances.filter(i=>!i.online).map(({id,name})=>({id,name})),tasks,coordination,extensions}
+    }}),
   define('task_delegate','创建工作任务。协调策略默认为 notify；仅用户明确要求时选择 assist 或 handoff，后者须指定 handoffTargets。',
     {instanceId:'string',goal:'string',constraints:'array',doneWhen:'array',refs:'array',coordination:'string',handoffTargets:'array'},['instanceId','goal'],
     {group:'task',confirm:true,execute:(c,a)=>{
@@ -354,7 +383,9 @@ function enabled(c:Core,t:Tool,policy:Policy){
     (!c.model||c.thread.projectId||c.model.sharePersonal||Boolean(t.file)||t.public)&&t.allowed?.(c)!==false
 }
 const builtin=new Map(tools.map(tool=>[tool.name,toolEntry({...tool,allowed:(c:Core)=>enabled(c,tool,chatPolicy(c.dir))})]))
-const available=(c:Core,entry:RegisteredTool<Core>)=>entry.allowed?.(c)!==false
+const coordinationTools=new Set(['task_progress','task_communications','task_check_delivery','task_coordination_status','utility_calculate','utility_time'])
+const available=(c:Core,entry:RegisteredTool<Core>)=>
+  (c.actor==='user'||!!c.coordination&&coordinationTools.has(entry.name))&&entry.allowed?.(c)!==false
 export function toolsFor(c:Core){
   return [...builtin.values(),...(c.plugins?.tools.values()??[])].filter(t=>available(c,t))
     .map(({name,description,parameters})=>({name,description,parameters}))
@@ -363,7 +394,17 @@ export function toolCall(c:Core,name:string,raw:string){
   const entry=builtin.get(name)??c.plugins?.tools.get(name)
   if(!entry||!available(c,entry))fail('当前未授权该工具或资料范围',403)
   const args=parseTool(entry,raw)
-  const confirm=typeof entry.confirm==='function'?entry.confirm(args):entry.confirm===true
+  const needsConfirmation=typeof entry.confirm==='function'?entry.confirm(args):entry.confirm===true
+  const confirm=needsConfirmation&&!routineWrite(c,name,args)
   if(confirm&&c.actor!=='user')fail('这项操作须由真实用户发起并确认',403)
   return {confirm,async:entry.async===true,execute:()=>entry.execute(c,args)}
+}
+function routineWrite(c:Core,name:string,args:Record<string,unknown>){
+  if(c.actor!=='user'||!chatPolicy(c.dir).routineWrites)return false
+  if(name==='home_record_save')return ['note','todo'].includes(String(args.type))&&!args.sourceId&&!args.refs
+  if(name==='home_collection_entries')return args.action==='create'
+  if(name!=='utility_daily')return false
+  if(args.action==='create')return args.kind==='todo'
+  return args.action==='complete'&&typeof args.id==='string'&&args.body===undefined&&args.dueAt===undefined&&
+    !!one(c.db,"SELECT 1 FROM daily_items WHERE id=? AND projectId IS ? AND kind='todo' AND state='open'",args.id,c.thread.projectId)
 }
