@@ -17,6 +17,7 @@
   "include": [
     "contracts/**/*.ts",
     "server/**/*.ts",
+    "plugins/**/*.ts",
     "connector/**/*.ts",
     "scripts/**/*.ts"
   ]

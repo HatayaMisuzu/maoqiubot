@@ -10,7 +10,8 @@ export type NodeCommand = {
   projectId?: string | null, profileId?: string, workspaceRef?: string,
   kind: 'run' | 'prepare' | 'steer' | 'cancel' | 'answer',
   payload: {text?: string, inputText?:string, sessionId?: string, nativeRunId?: string, requestId?: string, choice?: string, modelId?:string, attachmentIds?: string[],
-    materials?:unknown[],importSessionId?:string,communication?:Communication,homeAccess?: {token:string,projectId:string,permission?:'read'|'append'|'manage'}}
+    materials?:unknown[],importSessionId?:string,communication?:Communication,communicationAccess?:{token:string},
+    homeAccess?: {token:string,projectId:string,permission?:'read'|'append'|'manage'}}
 }
 export type NodeEvent = {
   key: string, seq: number, instanceId: string, commandId: string, runId: string,

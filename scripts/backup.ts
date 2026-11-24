@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, copyFileSync, renameSync, mkdtempSync, rmSync, s
 import { createHash } from 'node:crypto'
 import {resolve,join,basename,dirname,relative,isAbsolute,sep} from 'node:path'
 import {pathToFileURL} from 'node:url'
+import { tree,writeTree } from '../server/plugins/files.ts'
 
 type Options={connectorDir?:string,connectorConfig?:string,offline?:boolean,includeAccess?:boolean}
 const fileDigest=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -55,6 +56,7 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
       if(opts.offline&&(manifest.activeRunIds.length||table(snap,'chat_jobs')&&snap.prepare("SELECT 1 FROM chat_jobs WHERE status IN ('queued','working')").get()))
         throw Error('仍有待处理运行或主聊，请在结束或人工放弃后执行停机备份')
       if(table(snap,'run_grants'))snap.exec('DELETE FROM run_grants')
+      if(table(snap,'communication_grants'))snap.exec('DELETE FROM communication_grants')
       if(restore){
         // An online or older snapshot may predate a durable receipt on the connector.
         snap.exec(`UPDATE commands SET status='uncertain',detail='从备份恢复，原生送达需核对'
@@ -63,6 +65,8 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
           UPDATE tasks SET status='uncertain' WHERE id IN (SELECT taskId FROM runs WHERE id IN (${activeRuns}));
           UPDATE runs SET status='uncertain',pendingRequest=NULL WHERE id IN (${activeRuns});
           UPDATE chat_jobs SET status='failed' WHERE status IN ('queued','working');`)
+        if(snap.prepare("SELECT 1 FROM pragma_table_info('chat_jobs') WHERE name='operation'").get())
+          snap.exec("UPDATE chat_jobs SET status=CASE WHEN status='awaiting_approval' THEN 'cancelled' ELSE status END,operation=NULL")
       }
       const files=snap.prepare('SELECT id,bytes FROM attachments').all()
       mkdirSync(join(stage,'attachments'),{mode:0o700})
@@ -89,6 +93,22 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
     }
     if(existsSync(join(src,'persona.md')))privateCopy(join(src,'persona.md'),join(stage,'persona.md'))
     for(const name of ['chat-models.json','chat-policy.json'])if(existsSync(join(src,name)))privateCopy(join(src,name),join(stage,name))
+    const plugins=join(src,'plugins.json')
+    if(existsSync(plugins)){
+      const state=JSON.parse(readFileSync(plugins,'utf8'))
+      const copied=new Set<string>()
+      for(const item of Object.values(state.entries) as any[]){
+        if(restore&&item.current?.source!=='bundled'){item.enabled=false;delete item.trusted}
+        for(const version of [item.current,item.previous,item.pending]){
+          if(!version||version.source==='bundled'||copied.has(version.folder))continue
+          if(!/^[a-f0-9-]{36}$/.test(version.folder))throw Error('无效的插件备份目录')
+          writeTree(join(stage,'plugins','packages',version.folder),tree(join(src,'plugins','packages',version.folder)))
+          copied.add(version.folder)
+        }
+      }
+      if(restore)state.revision++
+      writeFileSync(join(stage,'plugins.json'),JSON.stringify(state,null,2),{mode:0o600})
+    }
     const connectorSource=restore?join(src,'connector'):opts.connectorDir
     if(connectorSource&&(!restore||existsSync(connectorSource))){
       const connectorTarget=join(stage,restore?'node-local':'connector'),targetFile=join(connectorTarget,'connector.sqlite')

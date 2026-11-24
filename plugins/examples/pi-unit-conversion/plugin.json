@@ -1,0 +1,9 @@
+{
+  "id": "pi-unit-conversion",
+  "name": "Pi 单位换算示例",
+  "version": "1.0.0",
+  "hostApi": 1,
+  "description": "将 Pi 形态的纯计算工具包装成小毛球工具。",
+  "entry": "index.mjs",
+  "capabilities": ["tools"]
+}

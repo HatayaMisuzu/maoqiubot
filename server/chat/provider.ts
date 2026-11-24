@@ -7,7 +7,12 @@ import { codexEnvironment, codexServiceArgs } from '../../contracts/codex-local.
 
 export type ChatAttachment={id:string,name:string,contentType:string,data:string}
 export type ChatToolDefinition={name:string,description:string,parameters:object}
-export type Generation={signal?:AbortSignal,tools?:ChatToolDefinition[],delta?:(text:string)=>void,plain?:boolean}
+export type ToolCall={id:string;name:string;arguments:string;assistant?:unknown}
+export type ToolExchange={call:ToolCall;result:unknown}
+export type Generation={
+  signal?:AbortSignal;tools?:ChatToolDefinition[];delta?:(text:string)=>void;plain?:boolean;
+  exchanges?:ToolExchange[];systemOverride?:string;
+}
 export type ChatProvider={
   name:string
   generate(prompt:string,attachments:ChatAttachment[],options?:Generation):Promise<unknown>

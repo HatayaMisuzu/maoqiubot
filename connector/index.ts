@@ -68,20 +68,27 @@ async function input(c:Command):Promise<Input> {
 const helper=fileURLToPath(new URL('../scripts/project-api.ts',import.meta.url))
 function grant(c:Command,i:Input) {
   const access=c.payload.homeAccess
-  if(!access) return ()=>{}
+  const communication=c.payload.communicationAccess
+  if(!access&&!communication) return ()=>{}
   const dir=mkdtempSync(join(tmpdir(),'maoqiu-project-'))
-  const path=join(dir,'project.json')
+  const path=join(dir,'project.json'),report=join(dir,'communication.json')
   const cleanup=()=>{
     grantCleanups.delete(cleanup)
     if(existsSync(path))unlinkSync(path)
+    if(existsSync(report))unlinkSync(report)
     if(existsSync(dir))rmdirSync(dir)
   }
   try {
-    writeFileSync(path,JSON.stringify({baseUrl:baseUrl.href.replace(/\/$/,''),token:access.token,projectId:access.projectId}),{mode:0o600,flag:'wx'})
     grantCleanups.add(cleanup)
-    const permission=access.permission??'read'
-    i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限（'+permission+'）。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。请勿读取或输出凭据文件内容。'
-    if(c.taskId)i.text+='\n与小毛球沟通可用同一个工具 POST /runs/'+encodeURIComponent(c.runId)+'/communication ，提交 kind（question、progress、blocked、handoff、delivery 或 request）、text 和唯一 requestId。工作台记录报告来源，报告不会直接触发其他 Bot 或用户验收。'
+    const credentials={baseUrl:baseUrl.href.replace(/\/$/,'')}
+    if(access){
+      writeFileSync(path,JSON.stringify({...credentials,token:access.token,projectId:access.projectId}),{mode:0o600,flag:'wx'})
+      const permission=access.permission??'read'
+      i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限（'+permission+'）。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。请勿读取或输出凭据文件内容。'
+    }
+    if(communication)writeFileSync(report,JSON.stringify({...credentials,token:communication.token}),{mode:0o600,flag:'wx'})
+    if(c.taskId)i.text+='\n向小毛球报告：node "'+helper+'" "'+(communication?report:path)+'" POST /runs/'+encodeURIComponent(c.runId)+
+      '/communication <JSON> ，提交 kind（question、progress、blocked、handoff、delivery 或 request）、text 和唯一 requestId。报告保留 Bot 身份，不代表用户已验收。需要等待答复时先结束或挂起当前推理，之后续接原生会话。'
   } catch(e){cleanup();throw e}
   return cleanup
 }

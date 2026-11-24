@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { setTimeout as sleep } from 'node:timers/promises'
@@ -15,6 +15,9 @@ import { message } from '../server/tasks/index.ts'
 import { Store } from '../connector/store.ts'
 import { transfer } from '../scripts/backup.ts'
 import { hash } from '../server/api/auth.ts'
+import { addressAllowed, checkedAddresses, readHttp } from '../server/plugins/http.ts'
+import { extractHtml } from '../plugins/web/index.ts'
+import { fileURLToPath } from 'node:url'
 
 async function eventually(fn){
   for(let attempt=0;attempt<200;attempt++){
@@ -92,6 +95,388 @@ async function replyTo(api,threadId,messageId,kind='message'){
   return eventually(async()=>(await api('/threads/'+threadId)).messages.find(m=>
     m.data.replyTo===messageId&&m.kind===kind&&(kind!=='message'||m.role==='assistant')))
 }
+async function approveTool(api,threadId,messageId,approved=true){
+  return eventually(async()=>{
+    const snapshot=await api('/threads/'+threadId)
+    const waiting=snapshot.mainChat.pending.find(p=>p.messageId===messageId&&p.proposal)
+    if(waiting)return api('/chat/approve',{messageId,approvalId:waiting.proposal.id,approved})
+    if(snapshot.messages.some(m=>m.data.replyTo===messageId&&(m.role==='assistant'||m.kind==='error')))return {status:'finished'}
+  })
+}
+
+const proposed=async(api,threadId,messageId)=>eventually(async()=>(await api('/threads/'+threadId))
+  .mainChat.pending.find(p=>p.messageId===messageId&&p.proposal)?.proposal)
+
+test('四种流式协议通过 HTTP 保留本轮工具身份并返回实际计算结果',async t=>{
+  const name='utility_calculate',id='tool-phase3-123',args={expression:'(0.1+0.2)*7/3'}
+  const requests=[]
+  let interrupted=false
+  const endpoint=await modelEndpoint(t,(req,res,input)=>{
+    const {url,headers}=req
+    const chat=url.endsWith('/chat/completions'),responses=url.endsWith('/responses'),anthropic=url.endsWith('/messages')
+    requests.push({url,headers,input,chat,responses,anthropic})
+    const result=chat?input.messages.at(-1).role==='tool'&&input.messages.at(-1).content:responses?input.input.at(-1).output:
+      anthropic?input.messages.at(-1).content[0].type==='tool_result'&&input.messages.at(-1).content[0].content:
+        input.contents.at(-1).parts[0].functionResponse?.response
+    const txt='四则运算结果为 0.7'
+    let frames
+    if(chat){
+      frames=result&&!interrupted?[{choices:[{delta:{content:txt},finish_reason:'stop'}]}]:[
+        {choices:[{delta:{tool_calls:[{index:0,id,function:{name,arguments:JSON.stringify(args).slice(0,12)}}]}}]},
+        ...interrupted?[]:[{choices:[{delta:{tool_calls:[{index:0,function:{arguments:JSON.stringify(args).slice(12)}}]},finish_reason:'tool_calls'}]}]]
+    }else if(responses){
+      frames=[{type:'response.completed',response:{status:'completed',output:result?
+        [{type:'message',role:'assistant',content:[{type:'output_text',text:txt}]}]:
+        [{type:'function_call',id:'fc_fixture',call_id:id,name,arguments:JSON.stringify(args),status:'completed'}]}}]
+    }else if(anthropic){
+      frames=[{type:'content_block_start',index:0,content_block:result?{type:'text',text:txt}:{type:'tool_use',id,name,input:{}}},
+        ...result?[]:[{type:'content_block_delta',index:0,delta:{type:'input_json_delta',partial_json:JSON.stringify(args)}}],
+        {type:'message_delta',delta:{stop_reason:result?'end_turn':'tool_use'}},{type:'message_stop'}]
+    }else{
+      frames=[{candidates:[{content:{parts:[result?{text:txt}:{functionCall:{id,name,args},thoughtSignature:'fixture-signature'}]},finishReason:'STOP'}]}]
+    }
+    res.writeHead(200,{'Content-Type':'text/event-stream'})
+    for(const frame of frames)res.write('data: '+JSON.stringify(frame)+'\n\n')
+    res.end()
+  })
+  const {api}=await server(t,{chat:true})
+  for(const protocol of ['openai-compatible','openai-responses','anthropic','gemini']){
+    await configure(api,endpoint,{protocol,model:protocol==='gemini'?'gemini-fixture':'fixture/structured-model',tools:true,stream:true})
+    const thread=await api('/threads',{title:protocol})
+    const before=requests.length
+    const job=await api('/threads/'+thread.id+'/messages',{text:'计算 (0.1+0.2)*7/3'})
+    assert.equal((await replyTo(api,thread.id,job.messageId)).text,'四则运算结果为 0.7')
+    const [first,next]=requests.slice(before)
+    assert.equal(requests.length,before+2)
+    const {input,headers}=next
+    assert.ok(first.input.tools?.length)
+    assert.equal(headers['x-api-key']??headers['x-goog-api-key']??headers.authorization?.slice(7),'fixture-key-do-not-disclose')
+    if(next.chat){
+      assert.equal(input.messages.at(-1).tool_call_id,id)
+      assert.equal(input.messages.at(-2).tool_calls[0].id,id)
+      assert.equal(input.response_format,undefined)
+    }else if(next.responses){
+      assert.equal(input.input.at(-1).call_id,id)
+      assert.equal(input.input.at(-1).type,'function_call_output')
+      assert.equal(input.input.at(-2).id,'fc_fixture')
+      assert.equal(input.store,false)
+    }else if(next.anthropic){
+      assert.equal(input.messages.at(-1).content[0].tool_use_id,id)
+      assert.equal(input.messages.at(-2).role,'assistant')
+      assert.equal(headers['anthropic-version'],'2023-06-01')
+    }else{
+      assert.match(next.url,/streamGenerateContent\?alt=sse$/)
+      assert.equal(input.contents.at(-1).parts[0].functionResponse.id,id)
+      assert.equal(input.contents.at(-2).parts[0].thoughtSignature,'fixture-signature')
+    }
+    assert.match(JSON.stringify(input),/7\/10/)
+  }
+  interrupted=true
+  await configure(api,endpoint,{tools:true,stream:true})
+  const thread=await api('/threads',{title:'未完成的工具流'})
+  const job=await api('/threads/'+thread.id+'/messages',{text:'收到完整回复后才计算'})
+  await replyTo(api,thread.id,job.messageId,'error')
+  assert.equal((await api('/threads/'+thread.id)).messages.some(m=>m.kind==='tool'),false)
+})
+
+test('撤销外部模型授权中止在途请求，危险操作须使用有效的所有者确认',async t=>{
+  let arrived=false,closed=false
+  const endpoint=await modelEndpoint(t,(_req,res)=>{
+    arrived=true
+    res.once('close',()=>{closed=true})
+  })
+  const {api}=await server(t,{chat:true})
+  const model=await configure(api,endpoint,{sharePersonal:true})
+  const thread=await api('/threads',{title:'在途撤销'})
+  const job=await api('/threads/'+thread.id+'/messages',{text:'外部模型正在处理'})
+  await eventually(()=>arrived)
+  await api('/chat/models',{action:'select',id:'codex'})
+  await eventually(()=>closed)
+  assert.match((await replyTo(api,thread.id,job.messageId,'error')).text,/授权发生变化/)
+  assert.ok(model.id)
+
+  const fixture=await server(t,{chat:true,chatProvider:{
+    generate:async()=>({action:'tool',tool:'utility_daily',arguments:JSON.stringify({action:'create',kind:'todo',body:'核对边界'})})
+  }})
+  const origin=await fixture.api('/threads',{title:'等待批准'})
+  const first=await fixture.api('/threads/'+origin.id+'/messages',{text:'只问能否创建，不要做'})
+  const proposal=await proposed(fixture.api,origin.id,first.messageId)
+  const path='/chat/daily?threadId='+origin.id
+  assert.equal((await fixture.api(path)).items.length,0)
+  await fixture.api('/chat/approve',{messageId:first.messageId,approvalId:'wrong',approved:true},{status:409})
+  const request={messageId:first.messageId,approvalId:proposal.id,approved:true}
+  await fixture.api('/chat/approve',request,{token:'not-an-owner',status:401})
+  await fixture.api('/chat/approve',{...request,approved:false})
+  assert.equal((await fixture.api(path)).items.length,0)
+})
+
+test('自然主聊创建代码草稿，所有者审查后激活、更新、回退并调用 Pi 包装工具',async t=>{
+  const manifest=version=>({id:'creator-test',name:'换算扩展',description:'可用性测试',version,hostApi:1,capabilities:['tools']})
+  const entry=n=>n===3?'export function activate(){throw new Error("fixture")}':
+    'export function activate(ctx){ctx.registerTool({name:"format",description:"格式化样值",risk:"read",parameters:{type:"object"},execute(){return {value:'+n+'}}})}'
+  const provider={async generate(prompt){
+    const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    const reply=text=>({action:'reply',text})
+    const tool=(name,args)=>({action:'tool',tool:name,arguments:JSON.stringify(args)})
+    if(ctx.toolResults?.length)return reply(JSON.stringify(ctx.toolResults[0]))
+    const version=Number(ctx.currentUserRequest.at(-1))
+    if(ctx.currentUserRequest.startsWith('帮我创建')){
+      return tool('plugin_scaffold',{manifest:manifest(version+'.0.0'),source:entry(version)})
+    }
+    if(ctx.currentUserRequest.startsWith('Pi'))return tool('pi_unit_conversion__meters_to_cm',{meters:9})
+    return ctx.availableTools.some(t=>t.name==='creator_test__format')?tool('creator_test__format',{}):reply('扩展工具不可用')
+  }}
+  const f=await server(t,{chat:true,chatProvider:provider}),{api}=f
+  const plugins=(action,id,fields={})=>api('/chat/plugins',{action,id,...fields})
+  await api('/chat/policy',{pluginCreator:true})
+  const thread=await api('/threads',{title:'自然扩展能力'})
+  const ask=async(text,confirm=false)=>{
+    const {messageId}=await api('/threads/'+thread.id+'/messages',{text})
+    if(confirm){
+      const proposal=await proposed(api,thread.id,messageId)
+      assert.equal(proposal.tool,'plugin_scaffold')
+      await api('/chat/approve',{messageId,approvalId:proposal.id,approved:true})
+    }
+    return replyTo(api,thread.id,messageId)
+  }
+  for(const n of [1,2,3]){
+    assert.match((await ask('帮我创建换算扩展版本 '+n,true)).text,/"ok":true/)
+    const draft=(await api('/chat/plugins')).plugins.find(p=>p.id==='creator-test')
+    assert.equal(draft.current?.manifest.version,n===1?undefined:(n-1)+'.0.0')
+    assert.equal(draft.pending.source,'creator')
+    const proof=await plugins('validate','creator-test')
+    assert.equal(proof.executed,false)
+    const review=await plugins('review','creator-test')
+    assert.ok(JSON.stringify(review).includes('index.mjs'))
+    await api('/chat/plugins',{action:'activate',id:'creator-test',digest:proof.digest},{status:403})
+    if(n===3){
+      await api('/chat/plugins',{action:'activate',id:'creator-test',digest:proof.digest,trustCode:true},{status:409})
+    }else await plugins('activate','creator-test',{digest:proof.digest,trustCode:true})
+    assert.match((await ask('用扩展测试')).text,new RegExp('"value":'+Math.min(n,2)))
+  }
+  const prior=(await api('/chat/plugins')).plugins.find(p=>p.id==='creator-test').previous
+  await plugins('rollback','creator-test',{digest:prior.digest,trustCode:true})
+  assert.match((await ask('用扩展测试')).text,/"value":1/)
+  await plugins('disable','creator-test')
+  assert.equal((await ask('用扩展测试')).text,'扩展工具不可用')
+  const pi=await plugins('stage',undefined,{path:fileURLToPath(new URL('../plugins/examples/pi-unit-conversion/',import.meta.url))})
+  await plugins('activate',pi.id,{digest:pi.digest,trustCode:true})
+  assert.match((await ask('Pi 工具把 9 米换成厘米')).text,/900/)
+  const archive=await plugins('export',pi.id)
+  assert.ok(Buffer.from(archive.data,'base64').length>160)
+  process.env.MAOQIU_SAFE_PLUGINS='1'
+  try{await f.reopen()}finally{delete process.env.MAOQIU_SAFE_PLUGINS}
+  assert.equal((await api('/chat/plugins')).plugins.find(p=>p.id===pi.id).loaded,false)
+})
+
+test('网页读取限制公开地址与重定向，声明式业务 API 和 SearXNG 在 LAN 内实际往返',async t=>{
+  for(const ip of ['127.0.0.1','0.0.0.0','169.254.169.254','198.18.0.1','::1','::ffff:10.1.2.3','fe80::1']){
+    assert.equal(addressAllowed(ip,'public'),false,ip)
+  }
+  const publicUrl=new URL('https://example.org/')
+  await assert.rejects(checkedAddresses(publicUrl,'public',async()=>[
+    {address:'8.8.8.8',family:4},{address:'10.0.0.2',family:4}]),/不可访问/)
+  const article=extractHtml('<html><head><title>验收文章</title></head><body><nav>菜单内容</nav><article><p>'+
+    '独立正文内容 '.repeat(100)+'</p><p><a href="/more">后续资料</a><a href="javascript:alert(1)">坏链接</a></p>'+
+    '<script>SHOULD_NOT_APPEAR</script></article></body></html>','https://example.org/article')
+  assert.equal(article.title,'验收文章')
+  assert.match(article.body,/独立正文内容/)
+  assert.doesNotMatch(article.body,/菜单内容|SHOULD_NOT_APPEAR/)
+  assert.deepEqual(article.links.map(link=>link.url),['https://example.org/more'])
+
+  const local=Object.values(networkInterfaces()).flat().find(n=>n?.family==='IPv4'&&!n.internal&&addressAllowed(n.address,'lan'))
+  assert.ok(local,'测试需使用真实非 loopback 接口')
+  const requests=[]
+  const networkServer=createServer(async(req,res)=>{
+    const parts=[]
+    for await(const part of req)parts.push(part)
+    const url=new URL(req.url,'http://'+req.headers.host)
+    requests.push({url,method:req.method,auth:req.headers.authorization,body:Buffer.concat(parts).toString()})
+    if(url.pathname==='/oversized'){res.writeHead(200,{'Content-Length':4096}).end('x'.repeat(4096));return}
+    if(url.pathname==='/bad-redirect'){res.writeHead(302,{Location:'http://127.0.0.1/secret'}).end();return}
+    const data=url.pathname==='/search'?{results:[{url:'https://example.org/fact',title:'公开资料',content:'等待核对'}]}:{result:{value:'LAN_OK'}}
+    res.writeHead(200,{'Content-Type':'application/json'}).end(JSON.stringify(data))
+  })
+  networkServer.listen(0,'0.0.0.0')
+  await once(networkServer,'listening')
+  t.after(()=>new Promise(resolve=>{networkServer.closeAllConnections();networkServer.close(resolve)}))
+  const endpoint='http://'+local.address+':'+networkServer.address().port
+  const signal=new AbortController().signal
+  await assert.rejects(readHttp(endpoint+'/bad-redirect',{signal,network:'lan',redirects:2}),/超出|不可访问/)
+  await assert.rejects(readHttp(endpoint+'/oversized',{signal,network:'lan',maxBytes:1024}),/大小|上限/)
+  const keyEnv='MAOQIU_PLUGIN_KEY_PHASE3_FIXTURE'
+  process.env[keyEnv]='test-authentication-value'
+  t.after(()=>delete process.env[keyEnv])
+
+  const provider={async generate(prompt){
+    const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    if(ctx.toolResults?.length)return {action:'reply',text:JSON.stringify(ctx.toolResults[0])}
+    if(ctx.currentUserRequest.includes('假冒搜索'))return {action:'tool',tool:'web__search',arguments:'{"query":"私密资料"}'}
+    return {action:'tool',tool:ctx.currentUserRequest.includes('写入')?'fixture_api__write':'fixture_api__lookup',arguments:'{"value":"abc"}'}
+  }}
+  const {api}=await server(t,{chat:true,chatProvider:provider})
+  const parameters={type:'object',required:['value'],additionalProperties:false,properties:{value:{type:'string'}}}
+  const draft=await api('/chat/plugins',{action:'stageManifest',manifest:{id:'fixture-api',version:'1.0.0',hostApi:1,
+    name:'API Fixture',description:'用户隔离的业务地址',capabilities:['tools','network.api'],
+    httpTools:[
+      {name:'lookup',description:'查业务',parameters,endpoint,privateLan:true,method:'GET',path:'/lookup/{value}',query:{keyword:'value'},keyEnv,outputPath:['result']},
+      {name:'write',description:'写业务',parameters,endpoint,privateLan:true,method:'POST',path:'/write',keyEnv,body:{input:'value'}}
+    ]}})
+  await api('/chat/plugins',{action:'activate',...draft},{status:403})
+  await api('/chat/plugins',{action:'activate',...draft,allowNetwork:true})
+  const thread=await api('/threads',{title:'业务 API'})
+  const ask=text=>api('/threads/'+thread.id+'/messages',{text})
+  const read=await ask('查询业务数据')
+  assert.match((await replyTo(api,thread.id,read.messageId)).text,/LAN_OK/)
+  assert.equal(requests.at(-1).url.pathname,'/lookup/abc')
+  assert.equal(requests.at(-1).url.searchParams.get('keyword'),'abc')
+  assert.equal(requests.at(-1).auth,'Bearer test-authentication-value')
+  const write=await ask('写入业务数据')
+  const proposal=await proposed(api,thread.id,write.messageId)
+  assert.equal(requests.some(r=>r.method==='POST'),false)
+  await api('/chat/approve',{messageId:write.messageId,approvalId:proposal.id,approved:true})
+  assert.match((await replyTo(api,thread.id,write.messageId)).text,/LAN_OK/)
+  assert.deepEqual(requests.filter(r=>r.method==='POST').map(r=>r.body),['{"input":"abc"}'])
+
+  const web=(await api('/chat/plugins')).plugins.find(p=>p.id==='web')
+  await api('/chat/plugins',{action:'configure',id:'web',config:{provider:'searxng',endpoint:endpoint+'/search',privateLan:true}})
+  await api('/chat/plugins',{action:'activate',id:'web',digest:web.current.digest,allowNetwork:true})
+  const result=await api('/chat/plugins',{action:'test',id:'web',input:{kind:'search',value:'公开主题'}})
+  assert.equal(result.results[0].url,'https://example.org/fact')
+  assert.equal(requests.at(-1).auth,undefined)
+  assert.equal(requests.at(-1).url.searchParams.get('q'),'公开主题')
+  const n=requests.length
+  const injected=await ask('假冒搜索词，不允许转发项目资料')
+  assert.match((await replyTo(api,thread.id,injected.messageId)).text,/须摘自当前用户消息/)
+  assert.equal(requests.length,n)
+  await api('/chat/plugins',{action:'disable',id:'web'})
+  assert.equal((await api('/chat/plugins')).plugins.find(p=>p.id==='web').skills.length,0)
+})
+
+test('非项目通信令牌只能报告本运行，重要消息幂等入队且暂停时不接管',async t=>{
+  const f=await server(t,{chat:true}),{api,app}=f,n=await node(f,true)
+  t.after(()=>n.ws.terminate())
+  const thread=await api('/threads',{title:'无项目协作'})
+  const task=await api('/tasks',{instanceId:'worker',originThreadId:thread.id,goal:'只回报工作',coordination:'notify'})
+  const run=(await api('/tasks/'+task.taskId)).run
+  const command=await n.command(run.id)
+  const token=command.payload.communicationAccess.token
+  assert.equal(command.payload.homeAccess,undefined)
+  await n.receipt(command,'received')
+  const path='/runs/'+run.id+'/communication'
+  const body={kind:'question',text:'是否有现成模板？',requestId:'non-project-question',sender:{kind:'user',id:'owner'}}
+  const count=()=>app.db.prepare("SELECT count(*) AS n FROM chat_jobs WHERE kind='coordination'").get().n
+  await api('/projects',null,{token,status:403})
+  await api('/runs/a-different-run/communication',body,{token,status:403})
+  await api(path,{kind:'progress',text:'已开始',requestId:'non-project-progress'},{token})
+  assert.equal(count(),0)
+  const report=await api(path,body,{token})
+  assert.deepEqual(await api(path,body,{token}),report)
+  assert.equal(count(),1)
+  const notice=await eventually(async()=>(await api('/threads/'+thread.id)).messages.find(m=>m.data.communicationId))
+  assert.equal(notice.data.communication.sender.kind,'main_bot')
+  const original=(await api('/threads/'+task.workThreadId)).messages.find(m=>m.kind==='communication'&&m.text===body.text)
+  assert.equal(original.data.communication.sender.kind,'work_bot')
+  await api('/tasks/'+task.taskId+'/coordination',{paused:true})
+  await api(path,{...body,requestId:'paused-question'},{token})
+  assert.equal(count(),1)
+})
+
+test('项目协调引用确认事实、限定交接目标并自动通知交付',async t=>{
+  const f=await server(t,{chat:true,chatProvider:{async generate(prompt){
+    const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    if(ctx.type==='question')return {action:'tool',tool:'reply_fact',arguments:JSON.stringify({recordIds:[ctx.facts[0].id]})}
+    if(ctx.type==='handoff')return {action:'tool',tool:'handoff',arguments:JSON.stringify({instanceId:ctx.requestTarget})}
+    return {action:'reply',text:'请由用户选择方案'}
+  }}}),{api}=f,n=await node(f,true)
+  t.after(()=>n.ws.terminate())
+  const p=await api('/projects',{name:'有限协调范围'})
+  for(const instanceId of ['worker','worker-b'])await api('/projects/'+p.id+'/workspaces',{instanceId,workspaceRef:f.dir,allowAgentAccess:true})
+  const fact=await api('/records',{projectId:p.id,type:'requirement',body:'交付目录为 release-notes',confirmation:'user'})
+  const origin=await api('/threads',{projectId:p.id})
+  const assignment=await api('/tasks',{originThreadId:origin.id,instanceId:'worker',goal:'整理交付说明',
+    coordination:'handoff',handoffTargets:['worker-b']})
+  const work=await api('/tasks/'+assignment.taskId)
+  const first=await n.command(work.run.id)
+  const path='/runs/'+first.runId+'/communication'
+  const token=first.payload.communicationAccess.token
+  await n.receipt(first,'received')
+  const question=await api(path,{kind:'question',text:'交付目录是什么？',requestId:'facts-request'},{token})
+  const follow=await eventually(async()=>(await api('/threads/'+work.task.workThreadId)).commands.find(c=>c.status==='waiting'&&c.payload.text?.includes('release-notes')))
+  assert.equal(follow.payload.communication.sender.kind,'main_bot')
+  assert.match(follow.payload.text,new RegExp(fact.id))
+  assert.equal(follow.payload.communication.replyTo,question.id)
+  await api(path,{kind:'handoff',text:'目录已确认，可由第二个 Bot 接续',recipientInstanceId:'worker-b',
+    requestId:'auto-handoff',version:'v1',remaining:['写交付说明']},{token})
+  const child=await eventually(()=>n.frames.find(frame=>frame.command?.instanceId==='worker-b')?.command)
+  assert.equal(child.payload.communication.sender.kind,'main_bot')
+  assert.equal(child.payload.communication.projectId,p.id)
+  const childTask=(await api('/tasks/'+child.taskId)).task
+  assert.equal(childTask.brief.coordination.parentTaskId,assignment.taskId)
+  assert.equal(childTask.brief.coordination.mode,'notify')
+  await n.receipt(child,'received')
+  await api('/runs/'+child.runId+'/communication',{kind:'delivery',text:'交付说明已写',requestId:'auto-delivery',
+    version:'r7',completed:['说明'],paths:['readme.md'],checks:['Bot 自查']},{token:child.payload.communicationAccess.token})
+  const delivery=await eventually(async()=>(await api('/threads/'+origin.id)).messages.find(m=>m.text.includes('版本 r7')))
+  assert.match(delivery.text,/readme.md|Bot 自查/)
+  assert.match(delivery.text,/待核对/)
+  assert.equal((await api('/tasks/'+child.taskId)).review,null)
+  await n.event(first,'completed',{text:'交付给下一位 Bot'})
+  const sent=await eventually(()=>n.frames.find(frame=>frame.command?.id===follow.id)?.command)
+  assert.notEqual(sent.runId,first.runId)
+  assert.equal(sent.payload.communication.replyTo,question.id)
+  await n.receipt(sent,'received')
+  assert.equal((await api('/threads/'+work.task.workThreadId)).commands.find(c=>c.id===follow.id).status,'received')
+})
+
+test('记忆候选核对、跨范围隔离、事项到期补记与恢复保留草稿',async t=>{
+  const f=await server(t,{chat:true,chatProvider:{async generate(prompt){
+    const ctx=JSON.parse(prompt.slice(prompt.indexOf('\n{')+1))
+    return {action:'reply',text:'已记录候选',memoryCandidate:{body:ctx.currentUserRequest,type:'preference',factKey:' Ｍarkdown　偏好 '}}
+  }}}),{api}=f
+  await api('/chat/policy',{memoryCandidates:true})
+  const personal=await api('/threads',{title:'隔离的记忆'})
+  const project=await api('/projects',{name:'隔离项目'})
+  const scoped=await api('/threads',{projectId:project.id})
+  for(const [original,outcome] of [['长期使用 Markdown','accept'],['临时使用纯文本','reject']]){
+    const job=await api('/threads/'+personal.id+'/messages',{text:original})
+    await replyTo(api,personal.id,job.messageId)
+    const list='/chat/memory-candidates?threadId='
+    const [candidate]=(await api(list+personal.id)).items
+    assert.equal(candidate.original,original)
+    assert.deepEqual((await api(list+scoped.id)).items,[])
+    const review=await api('/chat/memory-candidates',{action:outcome,id:candidate.id,threadId:personal.id})
+    if(outcome==='accept'){
+      const record=await api('/records/'+review.recordId)
+      assert.equal(record.factKey,'markdown 偏好')
+      assert.equal(record.confirmation,'user')
+    }else assert.equal(review.status,'rejected')
+  }
+  const due=await api('/chat/daily',{action:'create',threadId:personal.id,kind:'reminder',body:'检查迁移',
+    dueAt:new Date(Date.now()+1200).toISOString()})
+  f.app.db.prepare('UPDATE daily_items SET dueAt=? WHERE id=?').run(new Date(Date.now()-1000).toISOString(),due.id)
+  const packagePath=fileURLToPath(new URL('../plugins/examples/pi-unit-conversion/',import.meta.url))
+  const draft=await api('/chat/plugins',{action:'stage',path:packagePath})
+  await api('/chat/plugins',{action:'activate',id:draft.id,digest:draft.digest,trustCode:true})
+  await f.reopen()
+  const get=async()=>(await api('/threads/'+personal.id)).messages.filter(m=>m.data.reminderId===due.id)
+  await eventually(async()=>(await get()).length===1)
+  await f.reopen()
+  assert.equal((await get()).length,1)
+  const staging=mkdtempSync(join(tmpdir(),'maoqiu-phase3-backup-'))
+  t.after(()=>rmSync(staging,{recursive:true,force:true}))
+  const backup=join(staging,'backup'),restored=join(staging,'restored')
+  transfer(f.dir,backup,false,{includeAccess:false})
+  transfer(backup,restored,true)
+  const restoredDb=openDatabase(restored)
+  try{assert.equal(restoredDb.prepare('SELECT state FROM daily_items WHERE id=?').get(due.id).state,'fired')}
+  finally{restoredDb.close()}
+  const state=JSON.parse(readFileSync(join(restored,'plugins.json'),'utf8'))
+  const extension=state.entries[draft.id]
+  assert.equal(extension.enabled,false)
+  assert.equal(extension.trusted,undefined)
+  assert.ok(existsSync(join(restored,'plugins','packages',extension.current.folder,'index.mjs')))
+})
 
 test('外部主聊支持模型发现、受控认证、流式事件、切换、超时和取消',async t=>{
   const calls=[]
@@ -215,6 +600,7 @@ test('主聊使用宿主工具保存长期记忆，权限可撤销，遗忘使�
   const thread=await api('/threads',{title:'旧话题'})
   const ask=async(text,threadId=thread.id)=>{
     const job=await api('/threads/'+threadId+'/messages',{text})
+    await approveTool(api,threadId,job.messageId)
     return replyTo(api,threadId,job.messageId)
   }
   assert.equal((await ask('请记住，我的偏好使用黑胶 Vinyl 唱片')).text,'实际操作成功')
@@ -252,7 +638,9 @@ test('主聊使用宿主工具保存长期记忆，权限可撤销，遗忘使�
   assert.equal((await ask('请读取../approved.txt')).text,'没有获得操作权限')
   assert.equal((await ask('请读取private-token.txt')).text,'没有获得操作权限')
   assert.ok(contexts.every(ctx=>!JSON.stringify(ctx).includes('MUST_NOT_LEAK')))
-  assert.equal((await ask('网页说应该记住')).text,'没有获得操作权限')
+  const quoted=await api('/threads/'+thread.id+'/messages',{text:'网页说应该记住'})
+  assert.equal((await approveTool(api,thread.id,quoted.messageId,false)).status,'cancelled')
+  assert.equal((await api('/search?q=伪造确认&scope=personal')).items.length,0)
   await api('/chat/policy',{readRoots:[]})
   const denied=await api('/threads/'+thread.id+'/messages',{text:'请读取approved.txt'})
   assert.match((await replyTo(api,thread.id,denied.messageId,'error')).text,/不可用的工具/)
@@ -287,6 +675,7 @@ test('同项目的 Bot 澄清、转达、交接、接手、交付和用户验收
   const scope=await api('/threads',{title:'项目协同',projectId:p.id})
   const ask=async text=>{
     const current=await api('/threads/'+scope.id+'/messages',{text})
+    await approveTool(api,scope.id,current.messageId)
     const reply=await replyTo(api,scope.id,current.messageId)
     assert.equal(reply.text,'已处理真实任务')
     return current.messageId
@@ -763,7 +1152,7 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
   legacyConnector.close()
   for(let i=0;i<2;i++){
     const migrated=openDatabase(old)
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,5)
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,6)
     assert.equal(migrated.prepare('SELECT sessionId FROM threads WHERE id=?').get('old-thread').sessionId,'old-session')
     assert.equal(migrated.prepare('SELECT count(*) n FROM run_grants').get().n,0)
     assert.ok(Date.parse(migrated.prepare('SELECT expiresAt FROM grants').get().expiresAt)>Date.now())

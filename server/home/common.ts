@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 export type DB = DatabaseSync;
 export type RunPermission = 'read'|'append'|'manage';
-export type Principal = { id: string; owner: boolean; projects: string[]; runPermission?: RunPermission };
+export type Principal = { id: string; owner: boolean; projects: string[]; runPermission?: RunPermission; communicationOnly?:boolean };
 export type Context = { method: string; path: string; body: any; query: URLSearchParams; principal: Principal; dataDir: string };
 export const uid = () => randomUUID();
 export const now = () => new Date().toISOString();

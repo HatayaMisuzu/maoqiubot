@@ -44,6 +44,22 @@
     },
     "arguments": {
       "type": "string"
+    },
+    "memoryCandidate": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "properties": {
+            "body": {"type": "string"},
+            "factKey": {"type": "string"},
+            "type": {"type": "string", "enum": ["preference", "note", "decision", "requirement"]},
+            "important": {"type": "boolean"}
+          },
+          "required": ["body", "factKey", "type", "important"],
+          "additionalProperties": false
+        }
+      ]
     }
   },
   "required": [
@@ -56,7 +72,8 @@
     "doneWhen",
     "summary",
     "tool",
-    "arguments"
+    "arguments",
+    "memoryCandidate"
   ],
   "additionalProperties": false
 }

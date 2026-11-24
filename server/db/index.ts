@@ -72,10 +72,26 @@ export function openDatabase(dir: string) {
         throughMessageId TEXT NOT NULL REFERENCES messages(id),version INTEGER NOT NULL DEFAULT 1);
       CREATE INDEX msg_recovery_thread ON messages(threadId) WHERE kind='recovery';
       CREATE INDEX chat_job_thread_status ON chat_jobs(threadId,status);
+    `),db=>db.exec(`
+      ALTER TABLE chat_jobs ADD COLUMN operation TEXT;
+      ALTER TABLE chat_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'user_turn';
+      CREATE INDEX chat_jobs_dispatch ON chat_jobs(status,kind,id);
+      CREATE TABLE communication_grants(runId TEXT PRIMARY KEY REFERENCES runs(id), token TEXT NOT NULL,
+        tokenHash TEXT NOT NULL UNIQUE, expiresAt TEXT NOT NULL);
+      CREATE TABLE daily_items(id TEXT PRIMARY KEY, projectId TEXT REFERENCES projects(id),threadId TEXT NOT NULL REFERENCES threads(id),
+        kind TEXT NOT NULL CHECK(kind IN ('todo','reminder')),body TEXT NOT NULL,dueAt TEXT,state TEXT NOT NULL,revision INTEGER NOT NULL);
+      CREATE INDEX daily_due ON daily_items(dueAt) WHERE kind='reminder' AND state='open';
+      CREATE TABLE memory_candidates(id TEXT PRIMARY KEY,threadId TEXT NOT NULL REFERENCES threads(id),
+        messageId TEXT NOT NULL UNIQUE REFERENCES messages(id), projectId TEXT REFERENCES projects(id),
+        body TEXT NOT NULL,factKey TEXT,recordType TEXT NOT NULL,important INTEGER NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL);
     `)])
     db.exec('UPDATE instances SET online=0')
+    db.function('maoqiu_fact_key',{deterministic:true},value=>typeof value==='string'?normalizeFactKey(value):null)
     return db
   }catch(e){db.close();throw e}
+}
+export function normalizeFactKey(value:string){
+  return value.normalize('NFKC').trim().replace(/\s+/gu,' ').toLowerCase()
 }
 function initLegacySchema(db: DatabaseSync) {
   db.exec(`

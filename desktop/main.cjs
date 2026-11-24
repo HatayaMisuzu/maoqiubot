@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, session, shell, utilityProcess } = require('electron')
+const { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, session, shell, utilityProcess } = require('electron')
 const { once } = require('node:events')
 const { existsSync, mkdirSync, readdirSync, readFileSync, statSync } = require('node:fs')
 const { delimiter, dirname, join, resolve } = require('node:path')
@@ -123,7 +123,17 @@ async function start() {
   addInstalledCodexToPath()
   Menu.setApplicationMenu(null)
   const { startServer } = await import(pathToFileURL(join(paths.root, 'server', 'index.ts')).href)
-  workbench = startServer({ host: '127.0.0.1', port: 0, dataDir: paths.dataDir })
+  workbench = startServer({ host: '127.0.0.1', port: 0, dataDir: paths.dataDir, desktop: {
+    status: () => {
+      const result = view()
+      return { connectorRunning:result.connectorRunning, lastError:result.lastError,
+        instances:result.instances.map(({id,name,adapterKey,workspaceRef,profileId,detected})=>({id,name,adapterKey,workspaceRef,profileId,detected})) }
+    },
+    save: value => saveInstance(settings(), workbench.db, value),
+    restart: async () => { await restartConnector(); return {connectorRunning:!!connector} },
+    openPath: path => shell.openPath(path),
+    notify: body => { if(Notification.isSupported())new Notification({title:'小毛球提醒',body}).show() }
+  } })
   await once(workbench.server, 'listening')
   const { port } = workbench.server.address()
   origin = 'http://127.0.0.1:' + port

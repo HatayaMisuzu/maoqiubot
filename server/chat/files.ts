@@ -17,7 +17,7 @@ export function allowedRoot(raw:string,dataDir:string){
     fail('资料根目录不能包含工作台数据、登录目录或秘密文件目录')
   return actual
 }
-export function localFiles(root:string,input:string,action:'list'|'read'|'write',text?:string){
+export function localFiles(root:string,input:string,action:'list'|'read'|'write'|'open'|'archive',text?:string){
   const parts=input.split(/[\\/]+/)
   if(isAbsolute(input)||parts.some(p=>p==='..'||p.endsWith('.')||p.endsWith(' ')||/[:*?<>|"\0]/.test(p)||
     /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(p))||hasSecretPath(input))fail('文件路径越出授权范围',403)
@@ -32,6 +32,11 @@ export function localFiles(root:string,input:string,action:'list'|'read'|'write'
     return {root,path:input,items:readdirSync(dest,{withFileTypes:true}).filter(f=>!secrets.test(f.name)&&!f.isSymbolicLink()&&
       (f.isDirectory()||f.isFile()&&textExtensions.has(extname(f.name).toLowerCase()))).slice(0,100).map(f=>({name:f.name,directory:f.isDirectory()}))}
   }
+  if(action==='open'){
+    const stat=statSync(dest)
+    if(!stat.isDirectory()&&(!stat.isFile()||!textExtensions.has(extname(dest).toLowerCase())))fail('只能打开已授权的文件夹或普通文本',403)
+    return {root,path:input,localPath:dest}
+  }
   if(!textExtensions.has(extname(dest).toLowerCase()))fail('轻量工具只处理 TXT、Markdown、CSV 等文本资料',403)
   if(action==='write'){
     if(typeof text!=='string'||Buffer.byteLength(text)>64*1024||text.includes('\0'))fail('文本须在 64 KiB 以内')
@@ -42,5 +47,5 @@ export function localFiles(root:string,input:string,action:'list'|'read'|'write'
   if(!file.isFile()||file.size>64*1024)fail('文件过大或不是普通文本文件')
   const content=readFileSync(dest,'utf8')
   if(content.includes('\0'))fail('不支持二进制文件')
-  return {root,path:input,bytes:file.size,text:content.slice(0,12000)}
+  return {root,path:input,bytes:file.size,text:action==='archive'?content:content.slice(0,12000)}
 }

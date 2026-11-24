@@ -1,40 +1,29 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { homeApi } from '../home/index.ts'
 import { id, required, changed, fail, one, must, unpack } from '../db/index.ts'
-import { createThread, draftDelegate, delegate, sendInput, control, reconcileRun, reportCommunication, taskCommunications, getThread, latestRun, message, messages, messagePage, hasRunArtifacts, taskView, reviewDelivery, modelView, selectModel, prepareModels, importNativeSession } from '../tasks/index.ts'
+import { createThread, draftDelegate, delegate, sendInput, control, reconcileRun, reportCommunication, taskCommunications, getThread, latestRun, message, messages, messagePage, hasRunArtifacts, taskView, reviewDelivery, modelView, selectModel, prepareModels, importNativeSession, manageCoordination } from '../tasks/index.ts'
 import { hash,secret } from './auth.ts'
 import { persona, savePersona } from '../chat/persona.ts'
 import { modelSettings, updateModelSettings } from '../chat/model-settings.ts'
 import { chatPolicy, saveChatPolicy } from '../chat/tools.ts'
+import { pendingChat, resolveOperation } from '../chat/approval.ts'
+import { projectWorkspaces } from '../tasks/workspaces.ts'
+import { dailyAction, listDaily } from '../chat/daily.ts'
+import { memoryCandidates, reviewMemory } from '../chat/memory.ts'
 
 export function route(db:DatabaseSync,ctx:any){
-  const {method,path,body:b,dataDir,principal,localRequest,query}=ctx
+  const {method,path,body:b,dataDir,principal,localRequest,query,plugins}=ctx
   const [,area,key,sub]=path.split('/')
   if(area==='runs'&&key&&sub==='communication'&&method==='POST'){
+    if(principal.communicationOnly&&principal.id==='run:'+key+':communication')
+      return reportCommunication(db,dataDir,key,undefined,b)
     if(!principal.runPermission||principal.id!=='run:'+key)fail('仅本运行的工作 Bot 可提交此通信',403)
     return reportCommunication(db,dataDir,key,principal.projects[0],b)
   }
+  if(principal.communicationOnly)fail('此运行令牌仅允许提交本任务通信',403)
   if(area==='projects'&&key&&sub==='workspaces'){
     if(!principal.owner)fail('仅所有者可配置执行工作区',403)
-    must(db,'SELECT id FROM projects WHERE id=?',key)
-    if(method==='POST'){
-      const instance=must(db,'SELECT * FROM instances WHERE id=?',required(b.instanceId,'instanceId'))
-      if(required(b.workspaceRef,'workspaceRef')!==instance.workspaceRef)fail('执行实例的工作区与选择不一致',409)
-      if(b.allowAgentAccess!==undefined && typeof b.allowAgentAccess!=='boolean')fail('allowAgentAccess 须为布尔值')
-      const permission=b.agentPermission??'read'
-      if(!['read','append','manage'].includes(permission))fail('无效的运行资料权限')
-      db.prepare(`INSERT INTO project_workspaces(projectId,instanceId,allowAgentAccess,agentPermission) VALUES(?,?,?,?)
-        ON CONFLICT(projectId,instanceId) DO UPDATE SET allowAgentAccess=excluded.allowAgentAccess,agentPermission=excluded.agentPermission`).run(key,instance.id,b.allowAgentAccess===true?1:0,permission)
-      db.prepare('DELETE FROM run_grants WHERE projectId=? AND instanceId=? AND (?=0 OR permission<>?)').run(key,instance.id,b.allowAgentAccess===true?1:0,permission)
-      changed(db,'home',{projectId:key,path})
-    }
-    if(method==='DELETE'){
-      const instanceId=required(b.instanceId,'instanceId')
-      db.prepare('DELETE FROM project_workspaces WHERE projectId=? AND instanceId=?').run(key,instanceId)
-      db.prepare('DELETE FROM run_grants WHERE projectId=? AND instanceId=?').run(key,instanceId)
-      changed(db,'home',{projectId:key,path})
-    }
-    if(['GET','POST','DELETE'].includes(method))return {items:db.prepare('SELECT i.id AS instanceId,i.name,i.nodeId,i.profileId,i.workspaceRef,p.allowAgentAccess,p.agentPermission FROM project_workspaces p JOIN instances i ON p.instanceId=i.id WHERE p.projectId=? ORDER BY i.name').all(key)}
+    if(['GET','POST','DELETE'].includes(method))return projectWorkspaces(db,key,method,b)
   }
   if(['projects','spaces','collections','modules','records','sources','attachments','submissions','search'].includes(area)){
     const result=homeApi(db,ctx)
@@ -45,19 +34,35 @@ export function route(db:DatabaseSync,ctx:any){
   }
   if(!principal.owner)fail('此授权仅允许访问指定项目资料',403)
   if(path==='/events/latest'&&method==='GET')return {cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
+  if(path==='/chat/memory-candidates'&&['GET','POST'].includes(method)){
+    if(!localRequest)fail('记忆候选限本机所有者',403)
+    const thread=getThread(db,required(method==='GET'?query.get('threadId'):b.threadId,'话题 ID'))
+    if(thread.instanceId!=='main')fail('请选择主聊话题')
+    return method==='GET'?{items:memoryCandidates(db,thread)}:reviewMemory(db,dataDir,thread,b)
+  }
+  if(path==='/chat/daily'&&['GET','POST'].includes(method)){
+    if(!localRequest)fail('事项管理限本机所有者',403)
+    const thread=getThread(db,required(method==='GET'?query.get('threadId'):b.threadId,'话题 ID'))
+    if(thread.instanceId!=='main')fail('请选择主聊话题')
+    return method==='GET'?{items:listDaily(db,thread.projectId)}:dailyAction(db,thread,b)
+  }
   if(path==='/chat/persona' && ['GET','POST'].includes(method)){
     if(!localRequest)fail('主聊人格限本机配置',403)
     return method==='GET'?persona(dataDir):savePersona(dataDir,b)
   }
   if(['/chat/models','/chat/policy'].includes(path)&&['GET','POST'].includes(method)){
     if(!localRequest)fail('主聊配置限本机所有者操作',403)
-    if(path==='/chat/models')return method==='GET'?modelSettings(dataDir):updateModelSettings(dataDir,b)
+    if(path==='/chat/models')return method==='GET'?modelSettings(dataDir,plugins?.providers()):updateModelSettings(dataDir,b,plugins?.providers())
     return method==='GET'?chatPolicy(dataDir):saveChatPolicy(dataDir,b)
+  }
+  if(path==='/chat/approve'&&method==='POST'){
+    if(!localRequest)fail('操作确认限本机',403)
+    return resolveOperation(db,b)
   }
   if(path==='/chat/cancel'&&method==='POST'){
     if(!localRequest)fail('主聊控制限本机',403)
-    const job=must(db,"SELECT * FROM chat_jobs WHERE messageId=? AND status IN ('queued','working')",required(b.messageId,'messageId'))
-    db.prepare("UPDATE chat_jobs SET status='cancelled' WHERE id=?").run(job.id)
+    const job=must(db,"SELECT * FROM chat_jobs WHERE messageId=? AND status IN ('queued','working','awaiting_approval')",required(b.messageId,'messageId'))
+    db.prepare("UPDATE chat_jobs SET status='cancelled',operation=NULL WHERE id=?").run(job.id)
     const prior=one(db,`SELECT 1 FROM messages WHERE threadId=? AND kind='tool'
       AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.ok')=1`,job.threadId,job.messageId)
     message(db,job.threadId,'system','activity',prior?'已停止主聊生成。请查看本轮已执行的工具操作。':'已取消主聊生成。',{replyTo:job.messageId})
@@ -95,9 +100,9 @@ export function route(db:DatabaseSync,ctx:any){
       const taskData=thread.taskId?taskView(db,thread.taskId):{run:latestRun(db,key),commands:db.prepare('SELECT * FROM commands WHERE threadId=? ORDER BY rowid').all(key).map(c=>unpack(c,['payload']))}
       const page=query.has('messageLimit')?messagePage(db,key,null,query.get('messageLimit')):{messages:messages(db,key)}
       const submittedArtifacts=!!taskData.run&&hasRunArtifacts(db,key,taskData.run.id)
-      const settings=thread.instanceId==='main'?modelSettings(dataDir):null
+      const settings=thread.instanceId==='main'?modelSettings(dataDir,plugins?.providers()):null
       const mainChat=settings?{
-        pending:db.prepare("SELECT messageId,status FROM chat_jobs WHERE threadId=? AND status IN ('queued','working') ORDER BY id").all(thread.id),
+        pending:pendingChat(db,thread.id),
         model:settings.models.find(m=>m.id===settings.activeId)?.name
       }:undefined
       return {thread,...page,...taskData,submittedArtifacts,mainChat,model:modelView(db,thread),cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
@@ -113,6 +118,10 @@ export function route(db:DatabaseSync,ctx:any){
   if(path==='/tasks'&&method==='POST'){executionAccess(required(b.instanceId,'instanceId'));return delegate(db,dataDir,b)}
   if(area==='tasks'&&key&&sub==='review'&&method==='POST')return reviewDelivery(db,key,b)
   if(area==='tasks'&&key&&sub==='communication'&&method==='GET')return taskCommunications(db,key)
+  if(area==='tasks'&&key&&sub==='coordination'&&method==='POST'){
+    if(!localRequest)fail('协调授权限本机所有者',403)
+    return manageCoordination(db,key,b)
+  }
   if(area==='tasks'&&key&&method==='GET')return taskView(db,key)
   if(area==='runs'&&key&&sub==='recovery'&&method==='POST')return reconcileRun(db,key,b)
   if(area==='runs'&&key&&sub==='commands'&&method==='POST'){

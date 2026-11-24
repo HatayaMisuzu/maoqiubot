@@ -18,7 +18,14 @@
     "test": "node --test"
   },
   "dependencies": {
-    "ws": "^8.18.3"
+    "@mozilla/readability": "0.6.0",
+    "ajv": "8.20.0",
+    "fflate": "0.8.3",
+    "ipaddr.js": "2.5.0",
+    "linkedom": "0.18.15",
+    "robots-parser": "3.1.1",
+    "ws": "^8.18.3",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",

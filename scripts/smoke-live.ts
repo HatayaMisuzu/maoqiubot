@@ -45,9 +45,16 @@ try{
   const inst=(await api('/instances')).find((i:any)=>i.id==='codex-local')
   await api('/projects/'+p.id+'/workspaces',{instanceId:inst.id,workspaceRef:inst.workspaceRef})
   const t=await api('/threads',{projectId:p.id,title:'主聊验收'})
-  await api('/threads/'+t.id+'/messages',{text:'请实际派活，明确委派给 codex-local。在工作话题只回复 MAOQIU_WORKER_OK，无需调用任何工具，不读写文件。'})
+  const pending=await api('/threads/'+t.id+'/messages',{text:'请实际派活，明确委派给 codex-local。在工作话题只回复 MAOQIU_WORKER_OK，无需调用任何工具，不读写文件。'})
   const card=await wait('主聊真实委派',async()=>{
     const s=await api('/threads/'+t.id)
+    const request=s.mainChat.pending.find((item:any)=>item.messageId===pending.messageId&&item.proposal)
+    if(request){
+      assert.equal(request.proposal.tool,'task_delegate')
+      assert.equal(request.proposal.arguments.instanceId,'codex-local')
+      assert.match(request.proposal.arguments.goal,/MAOQIU_WORKER_OK/)
+      await api('/chat/approve',{messageId:pending.messageId,approvalId:request.proposal.id,approved:true})
+    }
     const card=s.messages.find((m:any)=>m.kind==='task_card')
     if(card)return card
     const err=s.messages.find((m:any)=>m.kind==='error'||m.role==='assistant'&&m.kind==='message')
@@ -91,6 +98,33 @@ try{
   const timeline=await api('/projects/'+p.id+'/timeline')
   assert.ok(timeline.items.find((r:any)=>r.body.includes('MAOQIU_FOLLOWUP_OK')))
   console.log('已验证同一原生线程的两个 turn、三次只读查看、新话题查询旧任务和项目结果')
+  const daily=await api('/threads',{title:'主聊计算验收'})
+  const calculation=await api('/threads/'+daily.id+'/messages',{text:'请调用工作台计算工具计算 (0.1+0.2)*7/3，按真实工具结果回答。'})
+  await wait('主聊真实计算',async()=>{
+    const {messages}=await api('/threads/'+daily.id)
+    const error=messages.find((m:any)=>m.kind==='error'&&m.data.replyTo===calculation.messageId)
+    if(error)throw Error('主聊计算失败：'+error.text)
+    const reply=messages.find((m:any)=>m.kind==='message'&&m.role==='assistant'&&m.data.replyTo===calculation.messageId)
+    if(!reply)return false
+    assert.ok(messages.some((m:any)=>m.kind==='tool'&&m.data.ok&&m.data.tool==='utility_calculate'))
+    assert.match(reply.text,/0\.7|7\/10/)
+    return true
+  })
+  console.log('已验证真实 Codex 主聊调用宿主计算工具并使用回执')
+  writeFileSync(join(workspace,'phase3-smoke.txt'),'MAOQIU_DATA_READBACK_17')
+  await api('/chat/policy',{readRoots:[workspace]})
+  const reading=await api('/threads/'+daily.id+'/messages',{text:'请实际读取已授权目录内的 phase3-smoke.txt，只回答文件内容。'})
+  await wait('主聊真实资料读取',async()=>{
+    const {messages}=await api('/threads/'+daily.id)
+    const error=messages.find((m:any)=>m.kind==='error'&&m.data.replyTo===reading.messageId)
+    if(error)throw Error('主聊资料读取失败：'+error.text)
+    const reply=messages.find((m:any)=>m.kind==='message'&&m.role==='assistant'&&m.data.replyTo===reading.messageId)
+    if(!reply)return false
+    assert.ok(messages.some((m:any)=>m.kind==='tool'&&m.data.ok&&m.data.tool==='local_files_read'&&m.data.replyTo===reading.messageId))
+    assert.match(reply.text,/MAOQIU_DATA_READBACK_17/)
+    return true
+  })
+  console.log('已验证真实 Codex 主聊读取授权资料并按正文回复')
   const registered=(await api('/instances')).find((i:any)=>i.id==='codex-local')
   if(!registered.capabilities.sessionList)throw Error('本机 Codex 未声明可核对的会话目录')
   const existing=await wait('读取本次原生会话',async()=>{

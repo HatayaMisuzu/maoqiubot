@@ -103,10 +103,22 @@ export function taskCommunications(db:DatabaseSync,taskId:string){
       recordId:entry.data?.recordId,delivery:entry.data?.delivery}
   })}
 }
-export function reportCommunication(db:DatabaseSync,dir:string,runId:string,projectId:string,b:any){
+function queueCoordination(db:DatabaseSync,task:any,messageId:string,type:string){
+  const scope=task.brief.coordination
+  if(!scope||scope.mode==='off'||scope.paused||task.originThreadId===task.workThreadId||type==='progress')return false
+  if(!['question','blocked','request','handoff','delivery','completed','failed','input_required'].includes(type))return false
+  const origin=getThread(db,task.originThreadId)
+  if(origin.instanceId!=='main')return false
+  const inserted=db.prepare("INSERT OR IGNORE INTO chat_jobs(threadId,messageId,status,kind) VALUES(?,?,'queued','coordination')")
+    .run(origin.id,messageId)
+  if(inserted.changes)changed(db,'chat',{threadId:origin.id,messageId,status:'coordination_queued',taskId:task.id})
+  return Boolean(inserted.changes)
+}
+export function reportCommunication(db:DatabaseSync,dir:string,runId:string,homeProjectId:string|undefined,b:any){
   if(!b.requestId)fail('工作 Bot 通信须使用唯一 requestId')
   const run=must(db,'SELECT * FROM runs WHERE id=?',runId),thread=getThread(db,run.threadId)
-  if(thread.projectId!==projectId||!run.taskId||!['queued','running','waiting_input','cancelling'].includes(run.status))fail('通信仅允许发送给当前运行关联的任务',403)
+  const projectId=thread.projectId
+  if(homeProjectId!==undefined&&projectId!==homeProjectId||!run.taskId||!['queued','running','waiting_input','cancelling'].includes(run.status))fail('通信仅允许发送给当前运行关联的任务',403)
   const task=getTask(db,run.taskId),type=required(b.kind,'通信类型'),text=required(b.text,'通信正文')
   if(!['question','progress','blocked','handoff','delivery','request'].includes(type)||text.length>6000)fail('不支持此通信类型或内容过长')
   const replyTo=b.replyTo==null?undefined:required(b.replyTo,'replyTo')
@@ -116,6 +128,12 @@ export function reportCommunication(db:DatabaseSync,dir:string,runId:string,proj
     fail('只能请求小毛球向同项目内的其他已绑定 Bot 转交',403)
   const rawRefs=b.refs??[]
   if(!Array.isArray(rawRefs)||rawRefs.length>15||rawRefs.some(ref=>!ref||!['source','record','attachment'].includes(ref.type)))fail('通信只接受当前项目已授权的资料引用')
+  if(rawRefs.length&&!homeProjectId){
+    const receipt=JSON.parse(one(db,"SELECT payload FROM commands WHERE runId=? AND kind='run' AND status IN ('sent','received','done') ORDER BY rowid LIMIT 1",runId)?.payload??'{}')
+    const granted=rawRefs.every(ref=>ref.type==='attachment'?receipt.attachmentIds?.includes(ref.id):
+      receipt.materials?.some((m:any)=>m.id===ref.id&&m.type===ref.type))
+    if(!granted)fail('仅通信令牌只可引用本运行收到的资料',403)
+  }
   const {materials,attachmentIds}=makeInput(db,dir,{refs:rawRefs},projectId)
   const refs=materials.map(m=>({id:m.id,type:m.type,revision:'revision' in m?m.revision:undefined}))
   const sender={kind:'work_bot',id:run.instanceId} as const
@@ -127,7 +145,7 @@ export function reportCommunication(db:DatabaseSync,dir:string,runId:string,proj
   const archive=delivery&&addTaskRecord(db,projectId,run.taskId,type==='handoff'?'handoff':'result',text,
     {...delivery,runId,instanceId:run.instanceId,communicationId:msg,refs,workThreadId:thread.id})
   if(archive)db.prepare("UPDATE messages SET data=json_set(data,'$.recordId',?) WHERE id=?").run(archive.id,msg)
-  if(['question','blocked','handoff','delivery','request'].includes(type)&&task.originThreadId!==thread.id){
+  if(!queueCoordination(db,task,msg,type)&&['question','blocked','handoff','delivery','request'].includes(type)&&task.originThreadId!==thread.id&&!task.brief.coordination?.paused){
     message(db,task.originThreadId,'system','task_update',text,{workThreadId:thread.id,runId,type,status:task.status,communicationId:msg,recordId:archive?.id},[],run.taskId,
       {sender:system,type:type+'_notice',replyTo:msg})
   }
@@ -135,6 +153,13 @@ export function reportCommunication(db:DatabaseSync,dir:string,runId:string,proj
 }
 export function checkQueuedInput(db:DatabaseSync,c:any,payload:any){
   projectWorkspace(db,c.projectId,c.instanceId)
+  if(payload.coordination){
+    const {taskId,revision}=payload.coordination
+    const task=getTask(db,taskId),scope=task.brief.coordination
+    const binding=one(db,'SELECT allowAgentAccess FROM project_workspaces WHERE projectId=? AND instanceId=?',task.projectId,task.instanceId)
+    if(!scope||scope.revision!==revision||scope.paused||!binding?.allowAgentAccess)
+      fail('协调或项目资料授权已变化，已阻止发送',409)
+  }
   const first=c.taskId&&!payload.materials&&one(db,"SELECT id FROM commands WHERE taskId=? AND kind='run' ORDER BY rowid LIMIT 1",c.taskId)
   const materials=payload.materials??(first?.id===c.id?getTask(db,c.taskId).brief.materials:[])
   for(const ref of materials??[]){
@@ -312,7 +337,31 @@ export function draftDelegate(db:DatabaseSync,dir:string,b:any){
   db.prepare('INSERT INTO task_drafts VALUES(?,?)').run(thread.id,origin.id)
   return thread
 }
-export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:string) {
+function coordinationScope(db:DatabaseSync,projectId:string|null,b:any,fallback:string){
+  const mode=b.coordination??fallback
+  if(!['off','notify','assist','handoff'].includes(mode))fail('任务协调策略无效')
+  const targets=b.handoffTargets??[]
+  if(!Array.isArray(targets)||targets.length>5||targets.some(target=>typeof target!=='string'))fail('转派目标须为最多五个项目实例')
+  if(mode==='handoff'&&(!projectId||!targets.length))fail('自动转派须指定同项目中的目标实例')
+  for(const target of targets)projectWorkspace(db,projectId,target)
+  return {mode,targets:[...new Set<string>(targets)],revision:1,paused:false}
+}
+export function manageCoordination(db:DatabaseSync,taskId:string,b:any){
+  const task=getTask(db,taskId),origin=getThread(db,task.originThreadId)
+  if(origin.instanceId!=='main'||task.originThreadId===task.workThreadId)fail('此工作话题没有小毛球协调范围',409)
+  const previous=task.brief.coordination
+  if(previous?.parentTaskId&&b.coordination==='handoff')fail('已转派任务不能继续自动转派',409)
+  const next={...coordinationScope(db,task.projectId,{coordination:b.coordination??previous?.mode,
+    handoffTargets:b.handoffTargets??previous?.targets},'notify'),revision:(previous?.revision??0)+1,
+    paused:b.paused===true,parentTaskId:previous?.parentTaskId}
+  db.prepare("UPDATE tasks SET brief=json_set(brief,'$.coordination',json(?)) WHERE id=?").run(JSON.stringify(next),task.id)
+  if(next.paused||next.mode==='off')db.prepare(`UPDATE chat_jobs SET status='cancelled' WHERE kind='coordination'
+    AND status IN ('queued','working') AND messageId IN (SELECT id FROM messages WHERE taskId=?)`).run(task.id)
+  changed(db,'coordination',{taskId:task.id,threadId:origin.id,scope:next})
+  return next
+}
+type CoordinationApproval={taskId:string;revision:number}
+export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:string,coordination?:CoordinationApproval) {
   const {origin,inst,projectId}=delegationTarget(db,b)
   const goal=required(b.goal,'goal'),title=goal.slice(0,70)
   const {attachmentIds,materials}=makeInput(db,dir,b,projectId,inst)
@@ -328,7 +377,9 @@ export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:strin
     db.prepare('DELETE FROM task_drafts WHERE threadId=?').run(key)
   }else thread=createThread(db,dir,{instanceId:inst.id,projectId,title,modelId:b.modelId})
   const lines=(v:any)=>(v==null?[]:Array.isArray(v)?v:[v]).map((s:any)=>required(s,'条件'))
-  const taskId=id(),brief={goal,constraints:lines(b.constraints),doneWhen:lines(b.doneWhen),materials,attachmentIds,projectId,workspaceRef:inst.workspaceRef}
+  const scope=origin.instanceId==='main'?coordinationScope(db,projectId,b,sourceMessageId?'notify':'off'):undefined
+  const taskId=id(),brief={goal,constraints:lines(b.constraints),doneWhen:lines(b.doneWhen),materials,attachmentIds,projectId,workspaceRef:inst.workspaceRef,
+    ...(scope?{coordination:{...scope,parentTaskId:coordination?.taskId}}:{})}
   const prompt=JSON.stringify(brief,null,2)
   db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)').run(taskId,origin.id,thread.id,inst.id,projectId,goal,JSON.stringify(brief),'queued',now())
   db.prepare('UPDATE threads SET taskId=? WHERE id=?').run(taskId,thread.id)
@@ -337,17 +388,17 @@ export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:strin
     sourceMessageId,runId:run.id,taskId,threadId:thread.id,projectId}
   const assignment=message(db,thread.id,'user','brief',prompt,{brief},[],taskId,communication)
   message(db,origin.id,'assistant','task_card',goal,{workThreadId:thread.id,instanceId:inst.id,replyTo:sourceMessageId},[],taskId,{sender:system,type:'assignment_notice'})
-  enqueue(db,run,'run',{text:prompt,attachmentIds,materials,communication:{...communication,messageId:assignment}})
+  enqueue(db,run,'run',{text:prompt,attachmentIds,materials,coordination,communication:{...communication,messageId:assignment}})
   addTaskRecord(db,projectId,taskId,'start',goal,{instanceId:inst.id,runId:run.id,workThreadId:thread.id,workspaceRef:inst.workspaceRef,doneWhen:brief.doneWhen})
   return {taskId,workThreadId:thread.id,runId:run.id,status:'queued'}
 }
-export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMessageId?:string){
+export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMessageId?:string,coordination?:CoordinationApproval){
   if(one(db,'SELECT 1 FROM task_drafts WHERE threadId=?',thread.id))fail('请通过委派表单提交此草稿',409)
   projectWorkspace(db,thread.projectId,thread.instanceId)
   const target=thread.instanceId==='main'?undefined:instance(db,thread.instanceId)
   const {attachmentIds,materials}=makeInput(db,dir,b,thread.projectId,target)
   const text=required(b.text || (attachmentIds.length?'请查看随附材料':''),'text')
-  const payload=inputPayload(text,attachmentIds,materials)
+  const payload={...inputPayload(text,attachmentIds,materials),coordination}
   const active=latestRun(db,thread.id)
   if(active?.status==='uncertain') fail('原运行送达待核对',409)
   checkManualRetry(db,active,b)
@@ -490,11 +541,11 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   if(terminal.has(kind)) status=kind
   db.prepare('UPDATE runs SET status=?,pendingRequest=? WHERE id=?').run(status,kind==='input_required'?JSON.stringify(data):terminal.has(kind)?null:run.pendingRequest,run.id)
   const addressed=JSON.parse(run.commandPayload).communication
-  if(kind!=='accepted') message(db,thread.id,'assistant',kind,String(data.text??''),{...data,runId:run.id},[],thread.taskId,{
+  const nativeMessage=kind!=='accepted'?message(db,thread.id,'assistant',kind,String(data.text??''),{...data,runId:run.id},[],thread.taskId,{
     sender:{kind:'work_bot',id:run.instanceId},recipient:addressed?.sender?.kind==='main_bot'?botAudience('main'):userAudience,
     type:kind==='completed'?'delivery':kind,replyTo:addressed?.messageId,
     visibility:addressed?.sender?.kind==='main_bot'&&!['input_required','artifact','failed','blocked'].includes(kind)?'bot_internal':'user_visible'
-  })
+  }):null
   const needsReview=kind==='completed'&&task&&(Boolean(task.brief.doneWhen?.length)||Boolean(data.remaining?.length))
   if(task){
     let taskStatus=status
@@ -505,13 +556,18 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
       const last=one(db,"SELECT text FROM messages WHERE threadId=? AND kind='message' AND role='assistant' AND json_extract(data,'$.runId')=? ORDER BY rowid DESC LIMIT 1",thread.id,run.id)
       const summary=String(kind==='completed'?(last?.text||data.text||taskStatus):(data.text||last?.text||taskStatus))
       addTaskRecord(db,task.projectId,task.id,kind==='input_required'?'checkpoint':'result',summary,{runId:run.id,instanceId:run.instanceId,status:taskStatus,doneWhen:task.brief.doneWhen,remaining:Array.isArray(data.remaining)?data.remaining:[],verified:Array.isArray(data.verified)?data.verified:[],verificationSource:'agent',version:data.version??null,artifacts:db.prepare("SELECT id FROM messages WHERE threadId=? AND kind='artifact' AND json_extract(data,'$.runId')=?").all(thread.id,run.id)})
-      if(kind!=='cancelled' && task.originThreadId!==thread.id) message(db,task.originThreadId,'assistant','task_update',summary,{workThreadId:thread.id,status:taskStatus,runId:run.id},[],task.id,
+      const alreadyDelivered=kind==='completed'&&one(db,`SELECT 1 FROM chat_jobs j JOIN messages m ON m.id=j.messageId
+        WHERE j.kind='coordination' AND j.status NOT IN ('failed','cancelled') AND m.taskId=?
+          AND json_extract(m.data,'$.runId')=? AND json_extract(m.data,'$.type')='delivery'`,task.id,run.id)
+      const queued=alreadyDelivered||nativeMessage&&queueCoordination(db,task,nativeMessage,kind)
+      if(!queued&&kind!=='cancelled' && task.originThreadId!==thread.id&&!task.brief.coordination?.paused) message(db,task.originThreadId,'assistant','task_update',summary,{workThreadId:thread.id,status:taskStatus,runId:run.id},[],task.id,
         {sender:system,type:kind==='input_required'?'question_notice':'delivery_notice',replyTo:addressed?.sourceMessageId})
     }
   }
   changed(db,'run',{taskId:thread.taskId,runId:run.id,threadId:thread.id,status,activity:kind})
   if(terminal.has(kind)){
     db.prepare('DELETE FROM run_grants WHERE runId=?').run(run.id)
+    db.prepare('DELETE FROM communication_grants WHERE runId=?').run(run.id)
     db.prepare("UPDATE commands SET status='withdrawn' WHERE runId=? AND kind!='run' AND status='queued'").run(run.id)
     if(kind==='completed' && !['cancelling','uncertain'].includes(run.status) && !needsReview) advance(db,run,thread)
     else db.prepare("UPDATE commands SET status='held' WHERE runId=? AND status='waiting'").run(run.id)

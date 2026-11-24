@@ -341,13 +341,19 @@ export function recallMemory(db:DB,projectId:string|null,text:string){
     const key=r.type+'\0'+extractKey(r.factKey)
     if(!winners.has(key)){
       const alternatives=rows(db,recordSelect+` WHERE r.project_id IS ? AND r.kind=? AND r.forgotten=0
-        AND lower(trim(json_extract(v.snapshot,'$.factKey')))=? AND (? OR ${sharedRecordSql()})
-        ORDER BY r.updated_at DESC,r.rowid DESC`,projectId,r.type,r.factKey.trim().toLowerCase(),Number(!projectId))
+        AND maoqiu_fact_key(json_extract(v.snapshot,'$.factKey'))=? AND (? OR ${sharedRecordSql()})
+        ORDER BY r.updated_at DESC,r.rowid DESC`,projectId,r.type,extractKey(r.factKey),Number(!projectId))
         .map(toRecord).filter(candidate=>current(candidate))
       winners.set(key,effectiveFacts(alternatives)[0]?.id??r.id)
     }
     return winners.get(key)===r.id
   }).slice(0,6).map(r=>({...factRecord({...visibleRecord(db,p,r),body:r.body.slice(0,800)}),projectId:r.projectId}));
+}
+export function memoryFact(db:DB,projectId:string|null,type:string,key:string){
+  const alternatives=rows(db,recordSelect+` WHERE r.project_id IS ? AND r.kind=? AND r.forgotten=0
+    AND maoqiu_fact_key(json_extract(v.snapshot,'$.factKey'))=? AND (? OR ${sharedRecordSql()})
+    ORDER BY r.updated_at DESC,r.rowid DESC`,projectId,type,extractKey(key),Number(!projectId)).map(toRecord).filter(r=>current(r));
+  return effectiveFacts(alternatives)[0];
 }
 export function homeApi(db:DB,ctx:Context):any {
   const {path,method,principal:p}=ctx, b=ctx.body ?? {};

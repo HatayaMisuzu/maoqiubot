@@ -13,7 +13,7 @@ const checksums = JSON.parse(readFileSync(join(root, 'node_modules/electron/chec
 const runtimePackages = Object.entries(lockfile.packages)
   .filter(([path, info]) => path.startsWith('node_modules/') && !info.dev)
   .map(([path]) => path)
-const runtimeDirectories = new Set(['desktop', 'server', 'connector', 'contracts', 'web-demo'])
+const runtimeDirectories = new Set(['desktop', 'server', 'connector', 'contracts', 'web-demo', 'plugins'])
 const runtimeFiles = new Set([
   'package.json',
   'connector/config.example.json',
@@ -33,7 +33,8 @@ function exclude(path) {
   }
   const parts = file.split('/')
   if (!runtimeDirectories.has(parts[0]) || parts.some(part => part.startsWith('.') || part === 'data')) return true
-  return !(stat.isDirectory() || /\.(?:cjs|mjs|js|ts|html|css|ico|png|svg|webp|woff2)$/.test(file))
+  return !(stat.isDirectory() || /\.(?:cjs|mjs|js|ts|html|css|ico|png|svg|webp|woff2)$/.test(file) ||
+    parts[0]==='plugins'&&/\.(?:json|md)$/.test(file))
 }
 
 mkdirSync(out, { recursive: true })

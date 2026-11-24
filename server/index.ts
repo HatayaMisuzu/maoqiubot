@@ -10,11 +10,17 @@ import { attachNodes } from './api/nodes.ts'
 import { mainWorker } from './chat/index.ts'
 import type { ChatProvider } from './chat/provider.ts'
 import { selectedModel } from './chat/model-settings.ts'
-import { discoverModels, probeModel } from './chat/compatible.ts'
+import { discoverModels, probeCapability, probeModel } from './chat/compatible.ts'
 import { checkQueuedInput, homeRead, nativeSessionTarget } from './tasks/index.ts'
 import { isLocal } from './api/local.ts'
+import { pluginHost } from './plugins/host.ts'
+import { coordinationWorker } from './chat/coordination.ts'
+import { dueReminders } from './chat/daily.ts'
+import { expireApprovals } from './chat/approval.ts'
+import type { DesktopBridge } from './chat/tools.ts'
 
 const webRoot=fileURLToPath(new URL('../web-demo/',import.meta.url))
+const favicon=fileURLToPath(new URL('../desktop/icon.ico',import.meta.url))
 const mime:Record<string,string>={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.png':'image/png','.webp':'image/webp','.svg':'image/svg+xml','.ico':'image/x-icon','.woff2':'font/woff2'}
 async function body(req:IncomingMessage){
   const chunks:Buffer[]=[];let size=0
@@ -28,14 +34,16 @@ function json(res:ServerResponse,status:number,value:any){
   res.end(JSON.stringify(value))
 }
 const stable=(v:any):any=>Array.isArray(v)?v.map(stable):v && typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])])):v
-export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat?:boolean,chatProvider?:ChatProvider}={}){
+export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat?:boolean,chatProvider?:ChatProvider,desktop?:DesktopBridge}={}){
   const dataDir=resolve(opts.dataDir??process.env.MAOQIU_DATA??'data'),db=openDatabase(dataDir),auth=access(dataDir)
+  const plugins=pluginHost(dataDir)
+  const coordination=coordinationWorker(db,dataDir,plugins,opts.chatProvider)
   const ticket=secret(), sessions=new Set<string>();let ticketExpires=Date.now()+5*60000
   const streams=new Map<ServerResponse,number>()
   const chat=mainWorker(db,dataDir,opts.chatProvider,(threadId,messageId,text)=>{
     const data=JSON.stringify({kind:'chat_delta',threadId,messageId,text})
     for(const res of streams.keys())if(!res.writableNeedDrain&&!res.writableEnded)res.write('data: '+data+'\n\n')
-  })
+  },plugins,{desktop:opts.desktop,listSessions:(inst,cursor)=>nodes.listSessions(inst,cursor)})
   const server=createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff')
     res.setHeader('Referrer-Policy','no-referrer')
@@ -53,8 +61,8 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       if(!url.pathname.startsWith('/api/v1/')){
         if(method!=='GET')fail('接口不存在',404)
         const rel=decodeURIComponent(url.pathname.slice(1))||'index.html'
-        const file=resolve(webRoot,rel)
-        if(!file.startsWith(resolve(webRoot)+sep)||!mime[extname(file)])fail('页面不存在',404)
+        const file=rel==='favicon.ico'?favicon:resolve(webRoot,rel)
+        if((file!==favicon&&!file.startsWith(resolve(webRoot)+sep))||!mime[extname(file)])fail('页面不存在',404)
         let buf:Buffer
         try{buf=readFileSync(file)}catch{fail('页面不存在',404)}
         res.writeHead(200,{'Content-Type':mime[extname(file)],'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"});res.end(buf);return
@@ -85,6 +93,17 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         res.write(': connected\n\n');streams.set(res,cursor);res.on('close',()=>streams.delete(res));broadcast();return
       }
       const b=method==='GET'?{}:await body(req)
+      if(path==='/chat/plugins'&&['GET','POST'].includes(method)){
+        if(!principal.owner||!isLocal(req))fail('插件管理限本机所有者',403)
+        if(b.projectId)mustProject(b.projectId)
+        await plugins.ready
+        const ctrl=new AbortController()
+        res.once('close',()=>{if(!res.writableEnded)ctrl.abort()})
+        const result=method==='GET'?plugins.list():await plugins.manage(b,ctrl.signal)
+        chat.revalidate()
+        coordination.revalidate()
+        return json(res,200,result)
+      }
       const sessionCatalog=path.match(/^\/instances\/([\w-]{1,128})\/sessions$/)
       if(method==='GET'&&sessionCatalog){
         if(!principal.owner||!isLocal(req))fail('原生会话目录限本机所有者',403)
@@ -93,13 +112,14 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         const inst=nativeSessionTarget(db,sessionCatalog[1],url.searchParams.get('projectId')||null)
         return json(res,200,await nodes.listSessions(inst,cursor))
       }
-      if(method==='POST'&&['/chat/models/test','/chat/models/discover'].includes(path)){
+      if(method==='POST'&&['/chat/models/test','/chat/models/discover','/chat/models/capability'].includes(path)){
         if(!principal.owner||!isLocal(req))fail('模型测试限本机所有者',403)
         const config=selectedModel(dataDir,typeof b.id==='string'?b.id:undefined)
         if(!config)fail('本机 Codex 通过主聊发送消息测试，模型目录由官方客户端管理',409)
         const ctrl=new AbortController()
         res.once('close',()=>{if(!res.writableEnded)ctrl.abort()})
-        const result=await (path.endsWith('/discover')?discoverModels(config,ctrl.signal):probeModel(config,ctrl.signal))
+        const result=await (path.endsWith('/discover')?discoverModels(config,ctrl.signal):
+          path.endsWith('/capability')?probeCapability(config,b.capability,ctrl.signal):probeModel(config,ctrl.signal))
         return json(res,200,result)
       }
       if(['POST','PATCH','DELETE'].includes(method) && b.requestId!=null && (typeof b.requestId!=='string'||!b.requestId.length||b.requestId.length>256))fail('requestId 无效')
@@ -113,7 +133,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
             return JSON.parse(previous.result)
           }
         }
-        const value=route(db,{method,path,query:url.searchParams,body:b,principal,dataDir,localRequest:isLocal(req)})
+        const value=route(db,{method,path,query:url.searchParams,body:b,principal,dataDir,localRequest:isLocal(req),plugins})
         if(signature) db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run(principal.id,b.requestId,signature,JSON.stringify(value))
         return value
       })
@@ -128,6 +148,8 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       json(res,200,result)
       if(method!=='GET'){
         if(path==='/chat/cancel')chat.abort(result.jobId)
+        chat.revalidate()
+        coordination.revalidate()
         if(b.action==='inspect'&&/^\/runs\/[^/]+\/recovery$/.test(path))nodes.inspect(result.runId)
         else nodes.flush()
         broadcast();if(opts.chat!==false)void chat.tick()
@@ -135,18 +157,24 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
     }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}
   })
   const nodes=attachNodes(server,db,auth.node)
+  function mustProject(projectId:unknown){
+    if(typeof projectId!=='string'||!one(db,'SELECT 1 FROM projects WHERE id=?',projectId))fail('项目不存在',404)
+  }
   function broadcast(){for(const [res,after] of streams){
     if(res.writableNeedDrain)continue
     const events=db.prepare('SELECT * FROM events WHERE cursor>? ORDER BY cursor LIMIT 200').all(after)
     for(const e of events){const value={...JSON.parse(String(e.body)),kind:e.kind,cursor:e.cursor};const ok=res.write('id: '+e.cursor+'\ndata: '+JSON.stringify(value)+'\n\n');streams.set(res,Number(e.cursor));if(!ok)break}
   }}
-  const interval=setInterval(()=>{nodes.flush();broadcast();if(opts.chat!==false)void chat.tick()},500)
+  const interval=setInterval(()=>{
+    nodes.flush();chat.revalidate();coordination.revalidate();expireApprovals(db);dueReminders(db,opts.desktop?.notify);broadcast()
+    if(opts.chat!==false){void chat.tick();void coordination.tick()}
+  },500)
   const heartbeat=setInterval(()=>{for(const r of streams.keys())if(!r.writableNeedDrain)r.write(': heartbeat\n\n')},15000)
   server.on('close',()=>{clearInterval(interval);clearInterval(heartbeat)})
   const port=opts.port??Number(process.env.PORT??4317),host=opts.host??process.env.HOST??'127.0.0.1'
   server.listen(port,host)
   return {server,db,auth,ticket,dataDir,async close(){
-    clearInterval(interval);clearInterval(heartbeat);nodes.close();chat.abort()
+    clearInterval(interval);clearInterval(heartbeat);nodes.close();chat.abort();coordination.abort()
     for(const r of streams.keys())r.end()
     await new Promise<void>((done)=>server.close(()=>done()))
     db.close()

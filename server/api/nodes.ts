@@ -90,6 +90,8 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
   })
   const timer=setInterval(()=>{
     db.prepare('DELETE FROM run_grants WHERE expiresAt<=?').run(now())
+    db.prepare(`DELETE FROM communication_grants WHERE expiresAt<=? OR runId IN
+      (SELECT id FROM runs WHERE status NOT IN ('queued','running','waiting_input'))`).run(now())
     db.prepare('DELETE FROM grants WHERE expiresAt<=?').run(now())
     for(const c of online.values()){if(!c.alive)c.ws.terminate();else{c.alive=false;c.ws.ping()}}
   },30000)
@@ -128,11 +130,19 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
         .run(c.runId,hash(token),token,c.projectId,c.instanceId,expiresAt,binding)
       grant={token,projectId:c.projectId,permission:binding}
     }
+    let communicationAccess=c.kind==='run'&&c.taskId&&one(db,'SELECT token FROM communication_grants WHERE runId=? AND expiresAt>?',c.runId,now())
+    if(!communicationAccess&&c.kind==='run'&&c.taskId&&!previous){
+      const token=secret()
+      db.prepare('INSERT INTO communication_grants(runId,token,tokenHash,expiresAt) VALUES(?,?,?,?)')
+        .run(c.runId,token,hash(token),new Date(Date.now()+24*3600000).toISOString())
+      communicationAccess={token}
+    }
     if(!previous)db.prepare("UPDATE commands SET payload=json_set(payload,'$.dispatch',json(?)),status='sent' WHERE id=?")
       .run(JSON.stringify(dispatch),c.id)
     return {id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,projectId:c.projectId,
       profileId:c.profileId,workspaceRef:c.workspaceRef,kind:c.kind,payload:{text:dispatch.text,sessionId:dispatch.sessionId,nativeRunId:dispatch.nativeRunId,
-        attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,communication,importSessionId,...(grant?{homeAccess:grant}:{})}}
+        attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,communication,importSessionId,
+        ...(grant?{homeAccess:grant}:{}),...(communicationAccess?{communicationAccess}:{})}}
   }
   function flush(){
     for(const [nodeId,link] of online){

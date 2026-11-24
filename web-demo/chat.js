@@ -1,6 +1,7 @@
 import {$,el,api,at,btn,iconBtn,phase,form,upload,download,notice,state,url} from './lib.js';
 import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
-import {mainModels,mainPermissions} from './main-settings.js';
+import {daily,mainModels,mainPermissions,memories} from './main-settings.js';
+import {extensions} from './extensions.js';
 const drafts=new Map();
 const main=()=>state.snapshot?.thread?.instanceId==='main'||(!state.thread&&(!state.instance||state.instance==='main'));
 const draftKey=()=>state.thread||('new:'+ (state.instance||'main'));
@@ -292,6 +293,19 @@ export const chat = actions=>{
     const {task,run,review,commands=[]}=snapshot;if(!task&&(!run||run.modelSetup&&run.status!=='uncertain'))return null;
     const root=el('div'),actionsBox=el('div','actions');
     if(task)actionsBox.append(btn('任务通信',()=>communication(task.id),'secondary'));
+    if(task?.brief?.coordination)actionsBox.append(btn('协调设置',()=>{
+      const scope=task.brief.coordination;
+      const modes=[{id:'off',name:'关闭'},{id:'notify',name:'仅通知'},{id:'assist',name:'使用项目事实答复'}];
+      if(task.projectId&&!scope.parentTaskId)modes.push({id:'handoff',name:'允许同项目转派'});
+      form('任务协调',[
+        {key:'coordination',label:'协调方式',value:scope.mode,options:modes},
+        ...(task.projectId&&!scope.parentTaskId?[{key:'targets',label:'允许转派的实例 ID，用逗号分隔',value:scope.targets.join(', ')}]:[]),
+        {key:'status',label:'运行状态',value:scope.paused?'pause':'resume',options:[{id:'resume',name:'允许协调'},{id:'pause',name:'暂停协调'}]},
+      ],'保存',async({coordination,targets,status})=>{
+        await api('/tasks/'+url(task.id)+'/coordination',{coordination,handoffTargets:targets?targets.split(',').map(id=>id.trim()).filter(Boolean):[],paused:status==='pause'});
+        await actions.refresh();
+      });
+    },'secondary'));
     const assignee=instance(snapshot.thread.instanceId);
     const criteria=task?.brief?.doneWhen;
     if(run?.status==='completed'&&Array.isArray(criteria)&&criteria.length){
@@ -357,7 +371,9 @@ export const chat = actions=>{
     $('subhead').textContent=[t?.projectId&&state.projects.find(p=>p.id===t.projectId)?.name,snap?.mainChat?.model,agent&&agent.id!=='main'?(agent.online?'节点在线':'节点离线'):null].filter(Boolean).join(' · ');
     const model=modelPicker(snap,agent);
     $('tools').replaceChildren(...(main()?[btn('主聊模型',()=>mainModels(actions.refresh),'ghost'),
-      btn('主聊权限',mainPermissions,'ghost'),btn('主聊人格',editPersona,'ghost'),btn('委派任务',delegate,'secondary','task')]:model?[model]:[]));
+      btn('主聊权限',mainPermissions,'ghost'),btn('主聊人格',editPersona,'ghost'),btn('插件与 Skill',extensions,'ghost'),
+      ...(t?[btn('记忆候选',()=>memories(t.id),'ghost'),btn('事项提醒',()=>daily(t.id),'ghost')]:[]),
+      btn('委派任务',delegate,'secondary','task')]:model?[model]:[]));
     if(!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup&&snap.run.status!=='uncertain')){
       const seed=text=>{const n=$('input');n.value=text;n.dispatchEvent(new Event('input'));n.focus()};
       content.replaceChildren(el('div','welcome',el('h2','',main()?'今天想一起做什么？':'和'+(agent?.name||'工作 Bot')+'聊聊'),
@@ -376,10 +392,30 @@ export const chat = actions=>{
       const role=comm?actorLabel(comm.sender):m.role==='user'?'你':m.role==='assistant'?(agent?.name||'小毛球'):({activity:'原生活动',artifact:'成果',input_required:'请求回应'}[m.kind]||'工作台');
       const article=el('article','msg '+(m.role==='user'?'user':''),el('div','msg-meta',role,el('small','',at(m.createdAt))));
       if(m.text)article.append(el('div',m.kind==='activity'?'activity text':'text',m.text));
+      if(m.data?.webReferences?.length||m.data?.webResult){
+        const web=m.data.webResult,refs=m.data.webReferences??web.references??[];
+        const sources=el('details','muted',el('summary','','网页来源 · '+refs.length));
+        if(web?.query)sources.append(el('p','muted',web.query+' · '+web.provider+' · '+web.elapsedMs+' ms'));
+        if(web?.body)sources.append(el('p','text',web.body));
+        for(const item of refs){
+          try{
+            const target=new URL(item.url);
+            if(!['https:','http:'].includes(target.protocol))continue;
+            const link=el('a','',item.title||target.hostname);link.href=target.href;link.target='_blank';link.rel='noopener noreferrer';
+            sources.append(el('p','muted',link,' · '+at(item.retrievedAt)));
+          }catch{}
+        }
+        article.append(sources);
+      }
       if(m.data?.usedMemories?.length)article.append(el('details','muted',el('summary','','引用记忆 · '+m.data.usedMemories.length),
         ...m.data.usedMemories.map(memory=>el('p','muted',(memory.projectId?'项目':'个人')+' · 版本 '+memory.revision+' · '+memory.id))));
       if(m.taskId&&m.taskId!==t?.taskId){const task=snap.linkedTasks?.[m.taskId],status=phase(task?.status||m.data?.status);
         article.append(btn('查看工作话题'+(status?' · '+status:''),()=>openTask(m.taskId),'task-card','task'))}
+      if(m.kind==='tool'&&m.data.workThreadId)article.append(btn('打开工作话题',()=>actions.openThread(m.data.workThreadId),'task-card','task'));
+      if(m.data?.communicationId&&m.data?.workThreadId&&comm?.type==='clarification_notice'){
+        article.append(btn('回复工作 Bot',()=>form('回复工作 Bot',[{key:'text',label:'你的原话',type:'textarea',required:true}],
+          '发送',async ({text})=>{await api('/threads/'+url(m.data.workThreadId)+'/messages',{text,replyTo:m.data.communicationId});await actions.refresh()}),'secondary'));
+      }
       if(m.refs?.length)article.append(el('div','reference-list',...m.refs.filter(ref=>ref.type!=='attachment').map(ref=>
         el('small','muted',(referenceTypes[ref.type]||'引用')+' · '+(ref.title||ref.text||ref.id).slice(0,70)))));
       for(const id of m.data?.attachmentIds||[])article.append(btn('下载附件',()=>download(id),'ghost','file'));
@@ -399,6 +435,14 @@ export const chat = actions=>{
       }else stream.append(article);
     }
     for(const job of snap.mainChat?.pending||[]){
+      if(job.proposal){
+        const resolve=async approved=>{await api('/chat/approve',{messageId:job.messageId,approvalId:job.proposal.id,approved});await actions.refresh()};
+        const {tool,arguments:args,expires}=job.proposal;
+        stream.append(el('article','msg',el('strong','','请确认 · '+tool),
+          el('pre','text',JSON.stringify(args,null,2)),el('small','muted','有效至 '+at(expires)),
+          el('div','actions',btn('确认执行',()=>resolve(true),'primary'),btn('拒绝',()=>resolve(false),'ghost'))));
+        continue;
+      }
       stream.append(el('div','pending',el('span','',job.status==='queued'?'主聊等待处理':'主聊正在回复'),
         btn('取消生成',async()=>{await api('/chat/cancel',{messageId:job.messageId});await actions.refresh()},'ghost')));
     }
