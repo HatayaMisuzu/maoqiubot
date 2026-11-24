@@ -2,7 +2,8 @@ import type { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 
 export type DB = DatabaseSync;
-export type Principal = { id: string; owner: boolean; projects: string[] };
+export type RunPermission = 'read'|'append'|'manage';
+export type Principal = { id: string; owner: boolean; projects: string[]; runPermission?: RunPermission };
 export type Context = { method: string; path: string; body: any; query: URLSearchParams; principal: Principal; dataDir: string };
 export const uid = () => randomUUID();
 export const now = () => new Date().toISOString();
@@ -23,6 +24,11 @@ export function obj(v: unknown, label: string): Record<string, any> {
 }
 export function strings(v: unknown, label: string): string[] {
   return [...new Set(list(v, label).map(x => str(x, label)))];
+}
+export function iso(v:unknown,name:string) {
+  if(v==null)return null;
+  if(typeof v!=='string'||!Number.isFinite(Date.parse(v)))fail(400,'无效 '+name);
+  return new Date(v).toISOString();
 }
 export function parse(raw: unknown): any { return JSON.parse(String(raw)); }
 export function one(db: DB, sql: string, ...args: any[]): any { return db.prepare(sql).get(...args); }

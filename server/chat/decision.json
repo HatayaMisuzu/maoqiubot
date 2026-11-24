@@ -34,6 +34,9 @@
       "items": {
         "type": "string"
       }
+    },
+    "summary": {
+      "type": "string"
     }
   },
   "required": [
@@ -43,7 +46,8 @@
     "taskId",
     "goal",
     "constraints",
-    "doneWhen"
+    "doneWhen",
+    "summary"
   ],
   "additionalProperties": false
 }

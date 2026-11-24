@@ -1,10 +1,12 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fail, list, now, obj, one, parse, projectAccess, revision, rows, run, str, strings, uid } from './common.ts';
+import { fail, iso, list, now, obj, one, parse, projectAccess, revision, rows, run, str, strings, uid } from './common.ts';
 import type { DB, Context, Principal } from './common.ts';
 import { initSpaces, createSpace, spaceApi } from './spaces.ts';
+import { search } from './search.ts';
 
 const recordTypes = ['requirement','decision','preference','note','conclusion','handoff','comment','reply','todo','result','progress','start','artifact','verified','next','blocked','failure','stopped','partial','completed'];
+const maxAttachmentBytes=16*1024*1024;
 export function initHome(db: DB) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, binding TEXT, space_id TEXT, created_at TEXT NOT NULL);
@@ -42,7 +44,7 @@ function makeProject(db: DB, p: Principal, b: any) {
   const id = uid(), name = str(b.name,'name');
   const binding = b.binding == null ? null : typeof b.binding === 'string' ? str(b.binding,'binding') : obj(b.binding,'binding');
   run(db,'INSERT INTO projects VALUES(?,?,?,NULL,?)',id,name,JSON.stringify(binding),now());
-  const space = createSpace(db,p,{projectId:id,name});
+  const space = createSpace(db,p,{projectId:id,name,templateSpaceId:b.templateSpaceId});
   run(db,'UPDATE projects SET space_id=? WHERE id=?',space.id,id);
   return getProject(db,id);
 }
@@ -60,7 +62,7 @@ function acl(db: DB, p: Principal, b: any): ACL {
   return {projects,endpoints};
 }
 function canRead(a: ACL, p: Principal) {
-  return p.owner || a.projects.some(id=>p.projects.includes(id)) || a.endpoints.includes(p.id);
+  return p.owner || a.projects.some(id=>p.projects.includes(id)) || (!p.runPermission && a.endpoints.includes(p.id));
 }
 function canReferenceAsset(db:DB,p:Principal,table:'sources'|'attachments',id:string,projectId:string|null) {
   const row=one(db,`SELECT acl FROM ${table} WHERE id=?`,id);
@@ -85,27 +87,30 @@ function source(db: DB, p: Principal, id: string, projectId:string|null=null) {
 }
 function attachment(db: DB, ctx: Context, id: string, withData: boolean) {
   const a = asset(db,ctx.principal,'attachments',id);
+  const access:ACL=parse(a.acl),p=ctx.principal;
   return {id:a.id,name:a.name,contentType:a.mime,size:a.bytes,createdAt:a.created_at,
+    projectIds:access.projects.filter(pid=>p.owner||p.projects.includes(pid)),
+    endpointIds:access.endpoints.filter(eid=>p.owner||p.id===eid),
     ...(withData ? {data:readFileSync(join(ctx.dataDir,'attachments',a.id)).toString('base64')} : {})};
 }
 function storeAttachment(db: DB, ctx: Context) {
   const b = ctx.body, access = acl(db,ctx.principal,b), name = str(b.name,'name');
+  if (typeof b.data==='string' && b.data.length>4*Math.ceil(maxAttachmentBytes/3)) fail(413,'单个附件不能超过 16 MiB');
   if (typeof b.data !== 'string' || b.data.length % 4 || !/^[A-Za-z0-9+/]*={0,2}$/.test(b.data)) fail(400,'data 应为 base64');
   const buf = Buffer.from(b.data,'base64');
+  if (buf.length>maxAttachmentBytes) fail(413,'单个附件不能超过 16 MiB');
   if (buf.toString('base64') !== b.data) fail(400,'无效 base64');
   const id = uid(), mime = str(b.contentType ?? 'application/octet-stream','contentType');
+  if (!/^[\w!#$&^.+-]+\/[\w!#$&^.+-]+$/.test(mime)) fail(400,'无效的附件媒体类型');
   const folder = join(ctx.dataDir,'attachments');
-  mkdirSync(folder,{recursive:true});
-  writeFileSync(join(folder,id),buf,{flag:'wx'});
-  run(db,'INSERT INTO attachments VALUES(?,?,?,?,?,?)',id,name,mime,buf.length,now(),JSON.stringify(access));
+  mkdirSync(folder,{recursive:true,mode:0o700});
+  const destination=join(folder,id);
+  writeFileSync(destination,buf,{flag:'wx',mode:0o600});
+  try { run(db,'INSERT INTO attachments VALUES(?,?,?,?,?,?)',id,name,mime,buf.length,now(),JSON.stringify(access)); }
+  catch(e){unlinkSync(destination);throw e;}
   return attachment(db,ctx,id,false);
 }
 function extractKey(s: string) { return s.normalize('NFKC').trim().replace(/\s+/g,' ').toLowerCase(); }
-function iso(v: any, name: string) {
-  if (v == null) return null;
-  if (typeof v !== 'string' || !Number.isFinite(Date.parse(v))) fail(400,`无效 ${name}`);
-  return new Date(v).toISOString();
-}
 function recordValues(b:any) {
   const validFrom=iso(b.validFrom,'validFrom'), validUntil=iso(b.validUntil,'validUntil');
   if (validFrom && validUntil && validUntil <= validFrom) fail(400,'有效期结束早于开始');
@@ -135,7 +140,7 @@ function visibleRecord(db:DB,p:Principal,r:ReturnType<typeof toRecord>) {
   return r;
 }
 function insertRecord(db:DB,projectId:string|null,taskId:string|null,kind:string,author:string,submitter:string,sourceId:string|null,b:any) {
-  const v=recordValues(b), id=uid(), at=now();
+  const v={...recordValues(b),confirmationBy:submitter}, id=uid(), at=now();
   assertUnblocked(db,sourceId,kind,v,projectId);
   run(db,'INSERT INTO records VALUES(?,?,?,?,?,?,?,1,?,?,0)',id,projectId,taskId,kind,author,submitter,sourceId,at,at);
   run(db,'INSERT INTO record_revisions VALUES(?,1,?,?)',id,JSON.stringify(v),at);
@@ -173,6 +178,8 @@ function userRecord(db:DB,p:Principal,projectId:string|null,b:any) {
   projectAccess(db,p,projectId);
   const kind=str(b.type ?? 'note','type');
   if (!recordTypes.includes(kind)) fail(400,'未知记录类型');
+  if(p.runPermission && kind==='verified') fail(403,'运行令牌不能提交验收结论');
+  if(p.runPermission && ['user','confirmed','observed'].includes(b.confirmation)) b={...b,confirmation:'unconfirmed'};
   const src=b.sourceId == null ? null : str(b.sourceId,'sourceId');
   if (src) {
     const s=source(db,p,src);
@@ -209,12 +216,15 @@ function writeSubmission(db:DB,ctx:Context) {
   return {source:source(db,p,id),sourceId:id,records};
 }
 function current(r:any, at=now()) { return (!r.validFrom || r.validFrom<=at) && (!r.validUntil || r.validUntil>at); }
-function timeline(db:DB,p:Principal,id:string) {
+function timeline(db:DB,p:Principal,id:string,strictSources=false) {
   return rows(db,recordSelect+' WHERE r.project_id=? AND r.forgotten=0 ORDER BY r.created_at DESC,r.rowid DESC',id)
-    .map(row=>visibleRecord(db,p,toRecord(row)));
+    .flatMap(row=>{
+      const original=toRecord(row),visible=visibleRecord(db,p,original);
+      return strictSources&&original.sourceId&&!visible.sourceId?[]:[visible];
+    });
 }
-function brief(db:DB,p:Principal,id:string) {
-  const project=getProject(db,id),records=timeline(db,p,id).filter(r=>current(r));
+function brief(db:DB,p:Principal,id:string,strictSources=false) {
+  const project=getProject(db,id),records=timeline(db,p,id,strictSources).filter(r=>current(r));
   const personalPrefs=p.owner ? rows(db,recordSelect+" WHERE r.project_id IS NULL AND r.kind='preference' AND r.forgotten=0 ORDER BY r.updated_at DESC").map(toRecord).filter(r=>current(r)) : [];
   const by=(...ks:string[])=>records.filter(r=>ks.includes(r.type));
   const work=records.filter(r=>r.taskId || ['result','progress','handoff','artifact'].includes(r.type));
@@ -240,22 +250,22 @@ function brief(db:DB,p:Principal,id:string) {
   });
   const openItems=[...new Set([...by('todo').filter(r=>r.extra.status!=='done').map(r=>r.body),
     ...latestWork.flatMap(r=>Array.isArray(r.extra.remaining)?r.extra.remaining.filter((v:any)=>typeof v==='string'):[])])];
-  const verified:any[]=[],pendingVerification:any[]=[],nextSteps:any[]=[];
+  const verified:any[]=[],claimedVerification:any[]=[],pendingVerification:any[]=[],nextSteps:any[]=[];
   for (const r of latestWork) {
     const provenance={id:r.id,sourceId:r.sourceId,taskId:r.taskId,author:r.author};
     const checks=Array.isArray(r.extra.verified)?r.extra.verified:[];
+    const trusted=r.submitter==='server' && ['user','workbench'].includes(r.extra.verificationSource);
+    const evidenceSource=trusted?(r.extra.verificationSource??'user'):'self_reported';
     const met=new Set<string>();
     for (const check of checks) {
-      if (typeof check==='string') {
-        met.add(check);
-        verified.push({...provenance,body:check});
-      }
-      else if (check?.met===true && typeof check.criterion==='string') {
-        met.add(check.criterion);
-        verified.push({...provenance,body:check.criterion,...(typeof check.evidence==='string'?{evidence:check.evidence}:{})});
-      }
+      const body=typeof check==='string'?check:check?.met===true&&typeof check.criterion==='string'?check.criterion:null;
+      if(!body)continue;
+      if(trusted)met.add(body);
+      (trusted?verified:claimedVerification).push({...provenance,body,verificationSource:evidenceSource,
+        at:r.createdAt,reviewId:trusted?(r.extra.reviewId??null):null,
+        ...(typeof check?.evidence==='string'?{evidence:check.evidence}:{})});
     }
-    if (['partial','awaiting_review'].includes(r.extra.status) && r.extra.deliveryVerified!==true && Array.isArray(r.extra.doneWhen)) {
+    if (['partial','awaiting_review'].includes(r.extra.status) && Array.isArray(r.extra.doneWhen)) {
       const criteria=r.extra.doneWhen.filter((value:unknown)=>typeof value==='string' && !met.has(value));
       if (criteria.length) pendingVerification.push({recordId:r.id,taskId:r.taskId,criteria});
     }
@@ -263,33 +273,73 @@ function brief(db:DB,p:Principal,id:string) {
       if (typeof body==='string') nextSteps.push({...provenance,body});
     }
   }
+  const externalChecks=by('verified').filter(r=>r.submitter!=='owner');
   return {project,requirements:by('requirement'),preferences:[...by('preference'),...personalPrefs],decisions:by('decision'),latestWork,
-    handoffs:by('handoff'),openItems,pendingVerification,verified:[...by('verified'),...verified],nextSteps:[...by('next'),...nextSteps],records};
+    handoffs:by('handoff'),openItems,pendingVerification,
+    verified:[...by('verified').filter(r=>r.submitter==='owner').map(r=>({...r,verificationSource:'user'})),...verified],
+    claimedVerification:[...externalChecks.map(r=>({...r,verificationSource:'self_reported'})),...claimedVerification],
+    nextSteps:[...by('next'),...nextSteps],records};
 }
-function search(db:DB,ctx:Context) {
-  const {principal:p,query:q}=ctx,project=q.get('projectId'),query=(q.get('q')??'').trim().toLowerCase(),sourceFilter=q.get('sourceId');
-  if (project) projectAccess(db,p,project);
-  const explicit=new Set([...q.getAll('ref'),...q.getAll('id')]),from=iso(q.get('from'),'from'),to=iso(q.get('to'),'to');
-  const platform=q.get('platform'), results:any[]=[];
-  for(const raw of rows(db,recordSelect+' WHERE r.forgotten=0 ORDER BY r.updated_at DESC').map(toRecord)){
-    if ((!p.owner && !p.projects.includes(raw.projectId)) || (project && project!==raw.projectId) || !current(raw)) continue;
-    const r=visibleRecord(db,p,raw);
-    if (sourceFilter && sourceFilter!==r.sourceId) continue;
-    if (platform && (!r.sourceId || one(db,'SELECT platform FROM sources WHERE id=?',r.sourceId)?.platform!==platform)) continue;
-    results.push({id:r.id,kind:'record',type:r.type,text:r.body,sourceId:r.sourceId,at:r.updatedAt,href:'/api/v1/records/'+r.id});
-  }
-  for(const s of rows(db,'SELECT * FROM sources ORDER BY created_at DESC')){
-    const a:ACL=parse(s.acl);
-    if (!canRead(a,p) || (project && !a.projects.includes(project)) || (sourceFilter && sourceFilter!==s.id) || (platform && s.platform!==platform)) continue;
-    results.push({id:s.id,kind:'source',text:s.title+' '+s.text,sourceId:s.id,at:s.created_at,href:'/api/v1/sources/'+s.id});
-  }
-  return {items:results.filter(r=>(!from || r.at>=from) && (!to || r.at<=to) && (explicit.has(r.id) || r.text.toLowerCase().includes(query)))
-    .sort((a,b)=>Number(explicit.has(b.id))-Number(explicit.has(a.id)) || b.at.localeCompare(a.at))
-    .map(({text,...r})=>({...r,summary:text.slice(0,240)}))};
+const claimsConfirmation=(value:unknown)=>['user','confirmed','observed'].some(status=>status===value);
+const confirmed=(r:any)=>['owner','server'].includes(r.confirmationBy??r.submitter) && claimsConfirmation(r.confirmation);
+function factRecord(r:any) {
+  const confirmation=claimsConfirmation(r.confirmation)&&!confirmed(r)?'unconfirmed':r.confirmation;
+  return {id:r.id,type:r.type,body:r.body,confirmation,sourceId:r.sourceId,revision:r.revision};
+}
+function effectiveFacts(records:any[]){
+  const seen=new Set<string>();
+  return [...records].sort((a,b)=>Number(confirmed(b))-Number(confirmed(a))||b.updatedAt.localeCompare(a.updatedAt))
+    .filter(r=>{
+      if(!r.factKey)return true;
+      const key=r.type+':'+extractKey(r.factKey);
+      if(seen.has(key))return false;
+      seen.add(key);return true;
+    });
+}
+export function prepareProjectContext(db:DB,id:string) {
+  // The context follows the project ACL even when assembled for an owner action.
+  const p:Principal={id:'',owner:false,projects:[id]};
+  const data=brief(db,p,id,true);
+  let backgroundBudget=8000;
+  const facts=effectiveFacts([...data.requirements,...data.decisions,...data.preferences]).flatMap(r=>{
+    if(confirmed(r)&&r.type!=='preference')return [factRecord(r)];
+    if(backgroundBudget<=0)return [];
+    const body=r.body.slice(0,Math.min(backgroundBudget,1200));
+    backgroundBudget-=body.length;
+    return [factRecord({...r,body})];
+  });
+  const superseded=new Set(data.handoffs.flatMap(r=>r.refs));
+  const handoffs=data.handoffs.filter(r=>!superseded.has(r.id)).slice(0,3).map(r=>({
+    ...factRecord(r),body:r.body.slice(0,1800),version:r.extra?.version,
+    remaining:Array.isArray(r.extra?.remaining)?r.extra.remaining.slice(0,15):[]
+  }));
+  return {project:{id,name:data.project.name},facts,handoffs,openItems:data.openItems.slice(0,20),
+    pendingVerification:data.pendingVerification.slice(0,10)};
+}
+export function recallMemory(db:DB,projectId:string|null,text:string){
+  const words=text.toLowerCase().slice(0,2000).match(/[\p{L}\p{N}]+/gu)??[];
+  const terms=[...new Set(words.flatMap(word=>{
+    const chars=Array.from(word);
+    return /\p{Script=Han}/u.test(word)?chars.slice(1).map((c,i)=>chars[i]+c):word.length>=3?[word]:[];
+  }))].slice(0,80);
+  if(!terms.length)return [];
+  const candidates=rows(db,recordSelect+` WHERE r.project_id IS ? AND r.forgotten=0
+    AND r.kind IN ('note','preference','decision','conclusion')
+    ORDER BY r.updated_at DESC,r.rowid DESC LIMIT 100`,projectId).map(toRecord);
+  const visible=candidates.filter(r=>current(r)&&(!projectId||!r.sourceId||canReferenceAsset(db,{id:'',owner:false,projects:[projectId]},'sources',r.sourceId,projectId)));
+  return effectiveFacts(visible).map(r=>{
+    const body=r.body.toLowerCase(),score=terms.filter(term=>body.includes(term)).length;
+    return {r,score};
+  }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,6)
+    .map(({r})=>factRecord({...r,body:r.body.slice(0,800)}));
 }
 export function homeApi(db:DB,ctx:Context):any {
   const {path,method,principal:p}=ctx, b=ctx.body ?? {};
   const [,area,id,action]=path.split('/');
+  if(p.runPermission && method!=='GET'){
+    const append=method==='POST' && (['/records','/submissions','/attachments'].includes(path) || /^\/projects\/[^/]+\/records$/.test(path));
+    if(p.runPermission==='read' || (p.runPermission==='append' && !append)) fail(403,'运行令牌没有此项写入权限');
+  }
   if (area==='projects') {
     if (path==='/projects' && method==='POST') return makeProject(db,p,b);
     if (path==='/projects' && method==='GET') return {items:rows(db,'SELECT id FROM projects ORDER BY created_at DESC').filter(x=>p.owner || p.projects.includes(x.id)).map(x=>getProject(db,x.id))};
@@ -331,9 +381,14 @@ export function homeApi(db:DB,ctx:Context):any {
       if(ctx.query.get('history')==='1') return {...visible,history:rows(db,'SELECT rev,snapshot,created_at FROM record_revisions WHERE record_id=? ORDER BY rev DESC',id).map(h=>({revision:h.rev,createdAt:h.created_at,...parse(h.snapshot)}))};
       return visible;
     }
+    const protectedRecord=r.submitter==='server' || r.type==='verified'&&r.submitter==='owner' ||
+      confirmed(r)&&['requirement','decision','preference'].includes(r.type);
     if (method==='PATCH') {
       revision(r.revision,b.expectedRevision,visible);
-      const v=recordValues({...r,...b});
+      if(!p.owner && protectedRecord) fail(403,'此记录由工作台或所有者维护');
+      const confirmation=p.runPermission && ['user','confirmed','observed'].includes(b.confirmation??r.confirmation)?'unconfirmed':b.confirmation??r.confirmation;
+      const confirmationBy=p.owner&&!Object.hasOwn(b,'confirmation')?(r.confirmationBy??r.submitter):p.id;
+      const v={...recordValues({...r,...b,confirmation}),confirmationBy};
       for (const ref of v.refs) if (record(db,p,ref).projectId!==r.projectId) fail(400,'引用范围不一致');
       assertUnblocked(db,r.sourceId,r.type,v,r.projectId);
       const n=r.revision+1,at=now();
@@ -342,6 +397,7 @@ export function homeApi(db:DB,ctx:Context):any {
       return visibleRecord(db,p,record(db,p,id));
     }
     if (method==='DELETE') {
+      if(!p.owner && protectedRecord) fail(403,'此记录由工作台或所有者维护');
       revision(r.revision,b.expectedRevision,visible);
       return forgetRecord(db,r);
     }

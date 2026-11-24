@@ -11,7 +11,14 @@ type Structure={name:string,theme:string,cover:string|null,pages:Page[],collecti
 type Space={id:string,projectId:string|null,revision:number,structure:Structure};
 const fields=['text','date','select','number','attachment','record'];
 const actions=['openSource','addEntry','writeHandoff'];
-const moduleTypes=[{type:'source-card',version:1,name:'资料出处',config:{sourceId:'source'},renderer:'source-card',actions:['openSource'],fallback:'reference'}];
+const moduleTypes=[
+  {type:'brief',name:'项目简报',config:{},actions:[]},
+  {type:'timeline',name:'项目时间线',config:{},actions:['writeHandoff']},
+  {type:'collection',name:'集合视图',config:{collectionId:'collection'},actions:['addEntry']},
+  {type:'text',name:'正文',config:{text:'text'},actions:[]},
+  {type:'reference',name:'来源引用',config:{sourceId:'source'},actions:['openSource']},
+  {type:'source-card',name:'资料出处',config:{sourceId:'source'},actions:['openSource'],fallback:'reference'}
+].map(m=>({...m,version:1,renderer:m.type}));
 export function initSpaces(db:DB) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS spaces (id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), revision INTEGER NOT NULL, structure TEXT NOT NULL);
@@ -224,6 +231,9 @@ function editStructure(db:DB,space:Space,ops:any[],h:Hooks) {
         if(reg) fail(409,'集合 ID 已使用');
         addUnique(s.collections,{id,name:str(v.name,'collection.name'),fields:fs}); break;
       }
+      case 'updateCollection':
+        collection(op.collectionId).name=str(op.name,'collection.name');
+        break;
       case 'addField': addUnique(collection(op.collectionId).fields,asField(obj(op.field,'field'))); break;
       case 'updateField': {
         const c=collection(op.collectionId),f=byId(c.fields,op.fieldId,'字段'),replacement=asField({...f,...obj(op.field,'field'),id:f.id});
@@ -231,8 +241,11 @@ function editStructure(db:DB,space:Space,ops:any[],h:Hooks) {
           for(const e of readEntries(db,c.id)){
             const values={...(migrated.get(e.id)?.values ?? e.values)};
             if(values[f.id]==null) continue;
+            if(Object.hasOwn(op.entryRevisions??{},e.id))revision(e.revision,op.entryRevisions[e.id],visibleEntry(e,new Map(c.fields.map(f=>[f.id,f.type])),h));
             if(f.type!==replacement.type) {
               if(!op.migration || !Object.hasOwn(op.migration,e.id)) fail(409,'字段迁移需要为每个现有条目指定新值');
+              values[f.id]=op.migration[e.id];
+            } else if(op.migration && Object.hasOwn(op.migration,e.id)){
               values[f.id]=op.migration[e.id];
             }
             valueOk(values[f.id],replacement,h);
@@ -266,7 +279,7 @@ function editStructure(db:DB,space:Space,ops:any[],h:Hooks) {
       const filter=b.config.filter;
       if (filter && (old?.config.collectionId!==c.id || JSON.stringify(old.config.filter)!==JSON.stringify(filter))) {
         const f=byId(c.fields,filter.fieldId,'视图字段');
-        if (f.type==='attachment' || f.type==='record') valueOk(filter.value,f,h);
+        valueOk(filter.value,f,h);
       }
     }
     for (const [key,kind] of [['sourceId','source'],['attachmentId','attachment']] as const) {
@@ -326,6 +339,68 @@ function saveRevision(db:DB,s:Space,structure:Structure){
   for(const c of structure.collections) run(db,'INSERT OR IGNORE INTO space_collections VALUES(?,?)',c.id,s.id);
   return {...s,revision:n,structure};
 }
+function restoreSpace(db:DB,s:Space,h:Hooks,b:any){
+  revision(s.revision,b.expectedRevision,visibleSpace(s,h));
+  const target=b.targetRevision ?? b.revision;
+  if(!Number.isInteger(target)) fail(400,'需要 targetRevision');
+  const scope=b.scope??'layout',mode=b.mode??'apply';
+  if(!['layout','structure'].includes(scope)||!['preview','apply'].includes(mode))fail(400,'无效的恢复范围或模式');
+  const row=one(db,'SELECT structure FROM space_revisions WHERE space_id=? AND revision=?',s.id,target);
+  if(!row)fail(404,'空间修订不存在');
+  const structure:Structure=parse(row.structure);
+  const conflicts:{collectionId:string,entryId:string,entryRevision:number,fieldId:string}[]=[], migrations:Migration[]=[];
+  const summary:string[]=[];
+  if(scope==='layout'){
+    const previous=structure.collections;
+    structure.collections=s.structure.collections;
+    for(const page of structure.pages) {
+      page.blocks=page.blocks.filter(block=>{
+        const live=structure.collections.find(c=>c.id===block.config.collectionId);
+        if(block.type==='collection'&&!live){summary.push('跳过已归档集合的视图');return false;}
+        const old=previous.find(c=>c.id===live?.id);
+        if(live)for(const [option,id] of [['groupBy',block.config.groupBy],['sort',block.config.sort?.fieldId],['filter',block.config.filter?.fieldId]]){
+          if(!id)continue;
+          const f=live.fields.find(f=>f.id===id && f.type===old?.fields.find(x=>x.id===id)?.type);
+          try {
+            if(!f)throw Error();
+            if(option==='filter')valueOk(block.config.filter.value,f);
+          }catch{
+            delete block.config[option];summary.push('移除不兼容的历史视图设置');
+          }
+        }
+        block.actions=block.actions.filter(a=>!a.params.collectionId||structure.collections.some(c=>c.id===a.params.collectionId));
+        return true;
+      });
+    }
+  }else{
+    const replacements=obj(b.migrations??{},'migrations');
+    for(const c of structure.collections){
+      const entries=readEntries(db,c.id),types=entryFields(db,s,s.structure.collections.find(x=>x.id===c.id)??{...c,fields:[]},entries);
+      for(const e of entries){
+        const edits=replacements[e.id], values={...e.values};
+        if(Object.hasOwn(b.entryRevisions??{},e.id))revision(e.revision,b.entryRevisions[e.id],visibleEntry(e,types,h));
+        let changed=false;
+        for(const f of c.fields) {
+          if(Object.hasOwn(edits??{},f.id)){
+            valueOk(edits[f.id],f,h);
+            values[f.id]=edits[f.id];changed=true;continue;
+          }
+          if(values[f.id]==null)continue;
+          try {
+            if(types.has(f.id)&&types.get(f.id)!==f.type)throw Error();
+            valueOk(values[f.id],f);
+          }catch { conflicts.push({collectionId:c.id,entryId:e.id,entryRevision:e.revision,fieldId:f.id}); }
+        }
+        if(changed)migrations.push({id:e.id,values});
+      }
+    }
+  }
+  const details={mode,scope,summary:[...new Set(summary)],conflicts,migratedEntries:migrations.length};
+  if(mode==='preview')return {...visibleSpace({...s,structure},h),...details};
+  if(conflicts.length)fail(409,'现有条目需要转换后才能恢复历史字段定义',details);
+  for(const e of migrations)run(db,'UPDATE collection_entries SET value_json=?,revision=revision+1,updated_at=? WHERE id=?',JSON.stringify(e.values),now(),e.id);
+  return {...visibleSpace(saveRevision(db,s,structure),h),...details};
+}
 export function spaceApi(db:DB,ctx:Context,scope:(projectId:string|null)=>Hooks):any {
   const {path,method,principal:p,query:q}=ctx,b=ctx.body ?? {};
   const [,area,id,action,itemId]=path.split('/').map(part=>{
@@ -349,20 +424,9 @@ export function spaceApi(db:DB,ctx:Context,scope:(projectId:string|null)=>Hooks)
       const result=editStructure(db,s,ops,h);
       const change=b.mode==='preview'?{...s,structure:result.structure}:saveRevision(db,s,result.structure);
       if(b.mode==='apply') for(const e of result.migrated.values()) run(db,'UPDATE collection_entries SET value_json=?,revision=revision+1,updated_at=? WHERE id=?',JSON.stringify(e.values),now(),e.id);
-      return {...visibleSpace(change,h),mode:b.mode,pageId:result.pageId,summary:result.summary};
+      return {...visibleSpace(change,h),mode:b.mode,pageId:result.pageId,summary:result.summary,migratedEntries:result.migrated.size};
     }
-    if(action==='restore' && method==='POST'){
-      revision(s.revision,b.expectedRevision,visibleSpace(s,h));
-      const target=b.targetRevision ?? b.revision;
-      if(!Number.isInteger(target)) fail(400,'需要 targetRevision');
-      const r=one(db,'SELECT structure FROM space_revisions WHERE space_id=? AND revision=?',id,target);
-      if(!r) fail(404,'空间修订不存在');
-      const structure:Structure=parse(r.structure);
-      for(const c of structure.collections) for(const e of readEntries(db,c.id)) for(const f of c.fields) {
-        try {valueOk(e.values[f.id],f);} catch {fail(409,'现有条目无法使用历史字段定义，需先迁移');}
-      }
-      return visibleSpace(saveRevision(db,s,structure),h);
-    }
+    if(action==='restore' && method==='POST')return restoreSpace(db,s,h,b);
     if(action==='actions' && method==='POST'){
       const binding=s.structure.pages.flatMap(x=>x.blocks).flatMap(block=>block.actions.map(action=>({block,action}))).find(x=>x.action.id===itemId);
       if(!binding) fail(404,'动作不存在');

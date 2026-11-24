@@ -176,6 +176,7 @@ test('项目接手简报展示验收证据和剩余条件',t=>{
   const brief=()=>api('GET','/projects/'+p.id+'/brief',{},endpoint);
   assert.deepEqual(brief().pendingVerification[0].criteria,['包含原始数据','补录 B 波段']);
   addTaskRecord(db,p.id,'task-1','result','已审阅',{runId:'run-1',status:'partial',doneWhen:['包含原始数据','补录 B 波段'],
+    verificationSource:'user',
     verified:[{criterion:'包含原始数据',met:true,evidence:'图 1'},'R 波段同步'],remaining:['补录 B 波段'],nextSteps:['取 B 波段原件']});
   const handoff=brief();
   assert.deepEqual(handoff.verified.map(r=>[r.body,r.evidence]),[['包含原始数据','图 1'],['R 波段同步',undefined]]);

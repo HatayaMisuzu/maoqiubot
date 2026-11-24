@@ -38,7 +38,7 @@ export async function api(path,body,method=body?'POST':'GET') {
 export const items = data=>Array.isArray(data)?data:(data?.items??[]);
 export const url = value=>encodeURIComponent(value);
 export const at = ts=>{if(!ts)return '';const date=new Date(ts);return Number.isNaN(date.getTime())?'':date.toLocaleString('zh-CN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})};
-export const phase = value=>({queued:'待送达',running:'运行中',waiting_input:'等待回应',cancelling:'正在停止',blocked:'受阻',awaiting_review:'待验收',partial:'部分交付',completed:'已完成',cancelled:'已停止',failed:'失败',uncertain:'送达待核对',waiting:'下一轮待发',held:'已挂起',sent:'已发送',received:'已接收',done:'已处理'}[value]??value??'');
+export const phase = value=>({queued:'待送达',running:'运行中',waiting_input:'等待回应',cancelling:'正在停止',blocked:'受阻',awaiting_review:'待验收',partial:'部分交付',completed:'执行结束',verified:'验收通过',cancelled:'已停止',failed:'失败',uncertain:'送达待核对',waiting:'下一轮待发',held:'已挂起',sent:'已发送',received:'已接收',done:'已处理'}[value]??value??'');
 export function form(title,fields,submit,onSave) {
   const dialog=$('dialog');if(dialog.open)dialog.close();
   const f=el('form','',el('h2','',title));dialog.replaceChildren(f);
@@ -60,11 +60,15 @@ export function form(title,fields,submit,onSave) {
   return {dialog,form:f,controls,save};
 }
 export async function upload(file,projectId){
+  if(file.size>16*1024*1024)throw Error('单个附件不能超过 16 MiB');
   const data=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=()=>reject(new Error('无法读取附件'));reader.readAsDataURL(file)});
   return api('/attachments',{name:file.name,contentType:file.type||'application/octet-stream',data,...(projectId?{projectId}:{})});
 }
 export async function download(id) {
-  const data=await api('/attachments/'+url(id)),bytes=Uint8Array.from(atob(data.data),ch=>ch.charCodeAt(0));
-  const a=el('a');a.href=URL.createObjectURL(new Blob([bytes],{type:'application/octet-stream'}));a.download=data.name||'附件';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+  const response=await fetch('/api/v1/attachments/'+url(id)+'?download=1',{headers:headers()});
+  if(!response.ok)throw Error('无法下载附件（'+response.status+'）');
+  const encoded=response.headers.get('Content-Disposition')?.split("filename*=UTF-8''")[1];
+  const a=el('a');a.href=URL.createObjectURL(await response.blob());a.download=encoded?decodeURIComponent(encoded):'附件';
+  a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
 export const state={threads:[],instances:[],projects:[],view:'chat',thread:null,project:null,page:null,snapshot:null};

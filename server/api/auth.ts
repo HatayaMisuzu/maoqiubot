@@ -2,7 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import { one, owner } from '../db/index.ts'
+import { now, one, owner } from '../db/index.ts'
+import type { Principal } from '../home/common.ts'
 
 export const secret=()=>randomBytes(32).toString('base64url')
 export const hash=(s:string)=>createHash('sha256').update(s).digest('hex')
@@ -17,10 +18,17 @@ export function access(dir:string) {
   if(typeof cfg.ownerToken!=='string'||cfg.ownerToken.length<16||Object.values(cfg.nodes).some(t=>typeof t!=='string'||t.length<16))throw Error('请配置至少 16 个字符的独立访问令牌')
   if(new Set([cfg.ownerToken,...Object.values(cfg.nodes)]).size!==1+Object.keys(cfg.nodes).length)throw Error('所有者及节点令牌必须独立')
   return {cfg,node(token:string){return Object.keys(cfg.nodes).find(k=>token && same(token,cfg.nodes[k]))},
-    principal(db:DatabaseSync,token:string){if(!token)return
+    principal(db:DatabaseSync,token:string):Principal|undefined{if(!token)return
       if(same(token,cfg.ownerToken))return owner
       const digest=hash(token)
-      const grant=one(db,'SELECT id,projectId FROM grants WHERE tokenHash=?',digest) ?? one(db,"SELECT 'instance:' || instanceId || ':' || projectId AS id,projectId FROM run_grants WHERE tokenHash=?",digest)
+      const grant=one(db,'SELECT id,projectId FROM grants WHERE tokenHash=? AND (expiresAt IS NULL OR expiresAt>?)',digest,now())
       if(grant)return {id:grant.id,owner:false,projects:[grant.projectId as string]}
+      const run=one(db,`SELECT g.runId,g.projectId,g.permission FROM run_grants g
+        JOIN runs r ON r.id=g.runId AND r.instanceId=g.instanceId
+        JOIN threads t ON t.id=r.threadId AND t.projectId=g.projectId
+        JOIN project_workspaces p ON p.projectId=g.projectId AND p.instanceId=g.instanceId
+        WHERE g.tokenHash=? AND g.expiresAt>? AND p.allowAgentAccess=1 AND p.agentPermission=g.permission
+          AND r.status IN ('queued','running','waiting_input','cancelling')`,digest,now())
+      if(run)return {id:'run:'+run.runId,owner:false,projects:[run.projectId],runPermission:run.permission}
     }}
 }

@@ -1,8 +1,9 @@
-const { app, BrowserWindow, Menu, Tray, dialog, nativeImage, session, shell, utilityProcess } = require('electron')
+const { app, BrowserWindow, Menu, Tray, dialog, ipcMain, nativeImage, session, shell, utilityProcess } = require('electron')
 const { once } = require('node:events')
-const { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } = require('node:fs')
+const { existsSync, mkdirSync, readdirSync, readFileSync, statSync } = require('node:fs')
 const { delimiter, dirname, join, resolve } = require('node:path')
 const { pathToFileURL } = require('node:url')
+const { connectorSettings, settingsView, saveInstance } = require('./connector-settings.cjs')
 
 app.setName('小毛球 Bot 工作台')
 app.setAppUserModelId('local.xiaomaoqiu.workbench')
@@ -15,7 +16,7 @@ if (process.env.MAOQIU_DESKTOP_PROFILE) {
 let workbench, connector, window, tray
 let closing = false
 let allowExit = false
-let origin
+let origin, connectorExit, restarting
 
 function isProjectDirectory(path) {
   try {
@@ -38,18 +39,6 @@ function appPaths() {
   return { root, workspace, dataDir }
 }
 
-function connectorConfig({ root, workspace, dataDir }) {
-  const configured = process.env.MAOQIU_CONNECTOR_CONFIG
-  if (configured) return resolve(configured)
-  const localConfig = join(workspace, 'connector', 'config.local.json')
-  if (existsSync(localConfig)) return localConfig
-  const config = JSON.parse(readFileSync(join(root, 'connector', 'config.example.json'), 'utf8'))
-  config.stateDir = join(dataDir, 'node-local')
-  const file = join(dataDir, 'desktop-connector.json')
-  writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 })
-  return file
-}
-
 function addInstalledCodexToPath() {
   if (process.platform !== 'win32' || !process.env.LOCALAPPDATA) return
   const bin = join(process.env.LOCALAPPDATA, 'OpenAI', 'Codex', 'bin')
@@ -70,7 +59,7 @@ function show() {
   window.focus()
 }
 
-function createWindow(root, login) {
+function createWindow(root, login, restartConnector) {
   const iconFile = join(root, 'desktop', 'icon.png')
   const icon = nativeImage.createFromPath(iconFile)
   const privateSession = session.fromPartition('xiaomaoqiu-workbench')
@@ -88,6 +77,7 @@ function createWindow(root, login) {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
+      preload: join(root, 'desktop', 'preload.cjs'),
       devTools: false
     }
   })
@@ -110,6 +100,9 @@ function createWindow(root, login) {
     tray.setToolTip('小毛球 Bot 工作台')
     tray.setContextMenu(Menu.buildFromTemplate([
       { label: '打开小毛球', click: show },
+      { label: '重启 Agent 连接器', click: () => {
+        void restartConnector().catch(error => dialog.showErrorBox('无法重启连接器', error.message))
+      } },
       { label: '退出工作台', click: () => app.quit() }
     ]))
     tray.on('double-click', show)
@@ -134,9 +127,50 @@ async function start() {
   await once(workbench.server, 'listening')
   const { port } = workbench.server.address()
   origin = 'http://127.0.0.1:' + port
-  const config = connectorConfig(paths)
+  const settings = () => connectorSettings(paths)
+  function view() {
+    const s = settings()
+    try { return { ...settingsView(s), connectorRunning: !!connector, lastError: connectorExit } }
+    catch { return { ...s, instances: [], connectorRunning: false, lastError: '无法读取连接器配置，请核对路径和 JSON 内容。' } }
+  }
+  function restartConnector() {
+    if (restarting) return restarting
+    if (closing) return Promise.reject(Error('工作台正在退出'))
+    const busy = connector && workbench.db.prepare(`SELECT 1 FROM runs r JOIN instances i ON r.instanceId=i.id
+      WHERE i.nodeId='local' AND (r.status IN ('running','waiting_input','cancelling') OR
+        r.status='queued' AND EXISTS(SELECT 1 FROM commands c WHERE c.runId=r.id AND c.status IN ('sent','received'))) LIMIT 1`).get()
+    if (busy) return Promise.reject(Error('本机 Agent 仍在执行。请等待结束或先在工作话题停止运行'))
+    restarting = (async () => {
+      const config = settings().file
+      settingsView(settings())
+      await stopConnector()
+      if (!closing) launchConnector(paths, config, port)
+      return view()
+    })().finally(() => { restarting = undefined })
+    return restarting
+  }
+  function handle(channel, callback) {
+    ipcMain.handle(channel, (event, value) => {
+      if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame ||
+        URL.parse(event.senderFrame.url)?.origin !== origin) throw Error('连接器设置限工作台主窗口')
+      return callback(value)
+    })
+  }
+  handle('connector:settings', view)
+  handle('connector:save', value => saveInstance(settings(), workbench.db, value))
+  handle('connector:restart', restartConnector)
+  try {
+    const config=settings()
+    settingsView(config)
+    launchConnector(paths, config.file, port)
+  } catch { connectorExit = '连接器未启动，请在 Agent 设置中检查配置。' }
+  await createWindow(paths.root, origin + '/login?ticket=' + workbench.ticket, restartConnector)
+}
+
+function launchConnector(paths, config, port) {
   const env = { ...process.env }
   delete env.OWNER_TOKEN
+  connectorExit = undefined
   connector = utilityProcess.fork(join(paths.root, 'desktop', 'connector.mjs'), [config], {
     cwd: paths.workspace,
     serviceName: '小毛球 Agent 连接器',
@@ -149,12 +183,11 @@ async function start() {
   })
   connector.once('exit', code => {
     connector = undefined
-    if (!closing) dialog.showErrorBox('Agent 连接器已退出', '退出代码 ' + code + '。可以继续查看项目和记录，重新打开工作台可启动连接器。')
+    if (!closing && !restarting) connectorExit = '连接器已退出（代码 ' + code + '）。可在 Agent 设置或托盘中重启。'
   })
-  await createWindow(paths.root, origin + '/login?ticket=' + workbench.ticket)
 }
 
-async function stop() {
+async function stopConnector() {
   if (connector) {
     const child = connector
     const exited = once(child, 'exit')
@@ -162,11 +195,19 @@ async function stop() {
     let timer
     try {
       await Promise.race([exited, new Promise(resolve => { timer = setTimeout(resolve, 2000) })])
-      if (connector === child) child.kill()
+      if (connector === child) {
+        child.kill()
+        await Promise.race([exited, new Promise(resolve => { setTimeout(resolve, 2000).unref() })])
+        if (connector === child) throw Error('旧连接器仍在退出，请稍后重试')
+      }
     } finally {
       clearTimeout(timer)
     }
   }
+}
+async function stop() {
+  await restarting?.catch(() => {})
+  await stopConnector()
   if (workbench) await workbench.close()
   tray?.destroy()
 }

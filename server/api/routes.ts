@@ -1,11 +1,12 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { homeApi } from '../home/index.ts'
 import { id, required, changed, fail, one, must, unpack } from '../db/index.ts'
-import { createThread, draftDelegate, delegate, sendInput, control, getThread, latestRun, messages, taskView, reviewDelivery, modelView, selectModel, prepareModels } from '../tasks/index.ts'
+import { createThread, draftDelegate, delegate, sendInput, control, getThread, latestRun, messages, messagePage, hasRunArtifacts, taskView, reviewDelivery, modelView, selectModel, prepareModels } from '../tasks/index.ts'
 import { hash,secret } from './auth.ts'
+import { persona, savePersona } from '../chat/persona.ts'
 
 export function route(db:DatabaseSync,ctx:any){
-  const {method,path,body:b,dataDir,principal,localRequest}=ctx
+  const {method,path,body:b,dataDir,principal,localRequest,query}=ctx
   const [,area,key,sub]=path.split('/')
   if(area==='projects'&&key&&sub==='workspaces'){
     if(!principal.owner)fail('仅所有者可配置执行工作区',403)
@@ -14,11 +15,20 @@ export function route(db:DatabaseSync,ctx:any){
       const instance=must(db,'SELECT * FROM instances WHERE id=?',required(b.instanceId,'instanceId'))
       if(required(b.workspaceRef,'workspaceRef')!==instance.workspaceRef)fail('执行实例的工作区与选择不一致',409)
       if(b.allowAgentAccess!==undefined && typeof b.allowAgentAccess!=='boolean')fail('allowAgentAccess 须为布尔值')
-      db.prepare('INSERT INTO project_workspaces(projectId,instanceId,allowAgentAccess) VALUES(?,?,?) ON CONFLICT(projectId,instanceId) DO UPDATE SET allowAgentAccess=excluded.allowAgentAccess').run(key,instance.id,b.allowAgentAccess===true?1:0)
-      if(b.allowAgentAccess!==true)db.prepare('DELETE FROM run_grants WHERE projectId=? AND instanceId=?').run(key,instance.id)
+      const permission=b.agentPermission??'read'
+      if(!['read','append','manage'].includes(permission))fail('无效的运行资料权限')
+      db.prepare(`INSERT INTO project_workspaces(projectId,instanceId,allowAgentAccess,agentPermission) VALUES(?,?,?,?)
+        ON CONFLICT(projectId,instanceId) DO UPDATE SET allowAgentAccess=excluded.allowAgentAccess,agentPermission=excluded.agentPermission`).run(key,instance.id,b.allowAgentAccess===true?1:0,permission)
+      db.prepare('DELETE FROM run_grants WHERE projectId=? AND instanceId=? AND (?=0 OR permission<>?)').run(key,instance.id,b.allowAgentAccess===true?1:0,permission)
       changed(db,'home',{projectId:key,path})
     }
-    if(['GET','POST'].includes(method))return {items:db.prepare('SELECT i.id AS instanceId,i.name,i.nodeId,i.profileId,i.workspaceRef,p.allowAgentAccess FROM project_workspaces p JOIN instances i ON p.instanceId=i.id WHERE p.projectId=? ORDER BY i.name').all(key)}
+    if(method==='DELETE'){
+      const instanceId=required(b.instanceId,'instanceId')
+      db.prepare('DELETE FROM project_workspaces WHERE projectId=? AND instanceId=?').run(key,instanceId)
+      db.prepare('DELETE FROM run_grants WHERE projectId=? AND instanceId=?').run(key,instanceId)
+      changed(db,'home',{projectId:key,path})
+    }
+    if(['GET','POST','DELETE'].includes(method))return {items:db.prepare('SELECT i.id AS instanceId,i.name,i.nodeId,i.profileId,i.workspaceRef,p.allowAgentAccess,p.agentPermission FROM project_workspaces p JOIN instances i ON p.instanceId=i.id WHERE p.projectId=? ORDER BY i.name').all(key)}
   }
   if(['projects','spaces','collections','modules','records','sources','attachments','submissions','search'].includes(area)){
     const result=homeApi(db,ctx)
@@ -28,6 +38,11 @@ export function route(db:DatabaseSync,ctx:any){
     }
   }
   if(!principal.owner)fail('此授权仅允许访问指定项目资料',403)
+  if(path==='/events/latest'&&method==='GET')return {cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
+  if(path==='/chat/persona' && ['GET','POST'].includes(method)){
+    if(!localRequest)fail('主聊人格限本机配置',403)
+    return method==='GET'?persona(dataDir):savePersona(dataDir,b)
+  }
   function executionAccess(instanceId:string){
     const adapter=one(db,'SELECT adapterKey FROM instances WHERE id=?',instanceId)?.adapterKey
     if(!localRequest && (adapter==='codex'||instanceId==='main'))fail('个人 ChatGPT 登录只支持同机使用工作台',403)
@@ -36,8 +51,11 @@ export function route(db:DatabaseSync,ctx:any){
     const projectId=required(b.projectId,'projectId')
     must(db,'SELECT id FROM projects WHERE id=?',projectId)
     const token=secret(),key=id()
-    db.prepare('INSERT INTO grants VALUES(?,?,?)').run(hash(token),key,projectId)
-    return {id:key,projectId,token}
+    const days=b.expiresInDays??30
+    if(!Number.isInteger(days)||days<1||days>365)fail('expiresInDays 须为 1 到 365 的整数')
+    const expiresAt=new Date(Date.now()+days*86400000).toISOString()
+    db.prepare('INSERT INTO grants(tokenHash,id,projectId,expiresAt) VALUES(?,?,?,?)').run(hash(token),key,projectId,expiresAt)
+    return {id:key,projectId,token,expiresAt}
   }
   if(area==='grants' && method==='DELETE' && key){
     db.prepare('DELETE FROM grants WHERE id=?').run(key)
@@ -50,8 +68,11 @@ export function route(db:DatabaseSync,ctx:any){
     const thread=getThread(db,key)
     if(!sub && method==='GET'){
       const taskData=thread.taskId?taskView(db,thread.taskId):{run:latestRun(db,key),commands:db.prepare('SELECT * FROM commands WHERE threadId=? ORDER BY rowid').all(key).map(c=>unpack(c,['payload']))}
-      return {thread,messages:messages(db,key),...taskData,model:modelView(db,thread),cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
+      const page=query.has('messageLimit')?messagePage(db,key,null,query.get('messageLimit')):{messages:messages(db,key)}
+      const submittedArtifacts=!!taskData.run&&hasRunArtifacts(db,key,taskData.run.id)
+      return {thread,...page,...taskData,submittedArtifacts,model:modelView(db,thread),cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
     }
+    if(sub==='messages'&&method==='GET')return messagePage(db,key,query.get('before'),query.get('limit'))
     if(sub==='messages'&&method==='POST'){executionAccess(thread.instanceId);return sendInput(db,dataDir,thread,b)}
     if(sub==='model'&&method==='POST'){
       executionAccess(thread.instanceId)

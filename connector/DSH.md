@@ -10,6 +10,8 @@ DSH 的 `desktop`、`web` 和 `acp` 分别加载各自的 profile。桌面里选
 node connector/native-smoke.ts connector/config.example.json dsh-local --inspect-models
 ```
 
+启动器路径因安装位置而异。可在桌面工作台左下角打开「Agent 设置」，保存实际路径后点「测试连接」。保存路径时保留实例身份。更换工作目录或 profile 时，从同一设置入口登记新的实例 ID。连接测试确认节点登记和握手。读取模型目录成功后，仍需实际发送一条消息才能验证供应方登录及额度。
+
 以下独立配置仅供另有 OpenCode 授权的实例选用。默认桌面启动配置使用上面的官方 ACP 入口。
 
 ## 使用 OpenCode Go API key

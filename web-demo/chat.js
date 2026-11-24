@@ -1,4 +1,5 @@
 import {$,el,api,at,btn,iconBtn,phase,form,upload,download,notice,state,url} from './lib.js';
+import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
 const drafts=new Map();
 const main=()=>state.snapshot?.thread?.instanceId==='main'||(!state.thread&&(!state.instance||state.instance==='main'));
 const draftKey=()=>state.thread||('new:'+ (state.instance||'main'));
@@ -215,8 +216,19 @@ export const chat = actions=>{
   async function openTask(id){
     const data=await api('/tasks/'+url(id));await actions.openThread(data.task.workThreadId);
   }
+  async function editPersona(){
+    const current=await api('/chat/persona');
+    const ui=form('主聊人格',[{key:'text',label:current.source==='custom'?'当前使用自定义人格':'当前使用默认人格',
+      type:'textarea',value:current.text,required:true}],'保存人格',async({text})=>{
+      await api('/chat/persona',{text});notice('人格将在下一轮生效。');
+    });
+    ui.controls.text.maxLength=4000;
+    if(current.source==='custom')ui.save.before(btn('恢复默认',async()=>{
+      await api('/chat/persona',{reset:true});ui.dialog.close();notice('已恢复默认人格。');
+    },'secondary'));
+  }
   function runBox(snapshot){
-    const {task,run,commands=[]}=snapshot;if(!task&&(!run||run.modelSetup))return null;
+    const {task,run,review,commands=[]}=snapshot;if(!task&&(!run||run.modelSetup))return null;
     const root=el('div'),actionsBox=el('div','actions');
     const assignee=instance(snapshot.thread.instanceId);
     const criteria=task?.brief?.doneWhen;
@@ -234,7 +246,15 @@ export const chat = actions=>{
     if(run&&['queued','running','waiting_input'].includes(run.status)&&assignee?.availableActions?.includes('cancel'))
       actionsBox.append(btn('停止运行',async()=>{await controls(run,{kind:'cancel'});await actions.refresh()},'secondary'));
     const status=run&&['cancelling','waiting_input','uncertain'].includes(run.status)?run.status:(task?.status||run?.status);
-    root.append(el('div','status',el('strong','',phase(status)),actionsBox));
+    const statusText=status==='completed'&&review?.status==='completed'?'验收通过':phase(status);
+    const detail=[run?.status==='completed'&&statusText!=='执行结束'?'执行结束':null,snapshot.submittedArtifacts?'成果已提交':null].filter(Boolean);
+    root.append(el('div','status',el('strong','',[...detail,statusText].join(' · ')),actionsBox));
+    if(review)root.append(el('div','pending',el('strong','','所有者验收 · '+at(review.at)),
+      ...review.checks.map(c=>el('p','text',(c.met?'已满足':'待补齐')+' · '+c.criterion+' · '+c.evidence))));
+    if(status==='uncertain')root.append(el('p','muted','原生运行结果待核对。支持查询的实例会在重新连接时尝试核对。'),
+      hasDesktopSettings()?btn('检查连接',desktopSettings,'secondary'):null);
+    const issue=commands.filter(c=>c.runId===run?.id&&['failed','uncertain'].includes(c.status)&&c.detail).at(-1);
+    if(issue)root.append(el('p','muted',issue.detail));
     const request=run?.pendingRequest;
     if(request&&run.status==='waiting_input'){
       const options=el('div','actions');for(const opt of request.options||[]){const key=typeof opt==='string'?opt:(opt.id||opt.value||opt.optionId);if(!key)continue;
@@ -259,13 +279,19 @@ export const chat = actions=>{
     $('heading').textContent=t?.title||agent?.name||'小毛球';
     $('subhead').textContent=[t?.projectId&&state.projects.find(p=>p.id===t.projectId)?.name,agent&&agent.id!=='main'?(agent.online?'节点在线':'节点离线'):null].filter(Boolean).join(' · ');
     const model=modelPicker(snap,agent);
-    $('tools').replaceChildren(...(main()?[btn('委派任务',delegate,'secondary','task')]:model?[model]:[]));
+    $('tools').replaceChildren(...(main()?[btn('主聊人格',editPersona,'ghost'),btn('委派任务',delegate,'secondary','task')]:model?[model]:[]));
     if(!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup)){
       const seed=text=>{const n=$('input');n.value=text;n.dispatchEvent(new Event('input'));n.focus()};
       content.replaceChildren(el('div','welcome',el('h2','',main()?'今天想一起做什么？':'和'+(agent?.name||'工作 Bot')+'聊聊'),
+        agent?.capabilities?.error?el('p','form-err',agent.capabilities.error):null,
         el('div','actions',btn('开始新对话',()=>newThread(agent?.id),'outline','edit'),btn('整理一个想法',()=>seed('帮我整理一个想法：'),'outline','file'),btn('写一段代码',()=>seed('帮我写一段代码：'),'outline','code'))));return;
     }
-    const stream=el('div','stream'),box=runBox(snap);if(box)stream.append(box);
+    const stream=el('div','stream'),box=runBox(snap);
+    if(agent?.capabilities?.error)stream.append(el('p','form-err',agent.capabilities.error));
+    if(t?.sessionId)stream.append(el('details','muted',el('summary','','原生会话'),el('code','',t.sessionId),
+      el('p','muted','可接续工作台已绑定的会话。外部会话的工作目录或 profile 无法在此核验，暂不支持导入。')));
+    if(box)stream.append(box);
+    if(snap.nextBefore)stream.append(btn('加载更早消息',actions.loadOlder,'secondary'));
     for(const m of snap.messages||[]){
       const role=m.role==='user'?'你':m.role==='assistant'?(agent?.name||'小毛球'):({activity:'原生活动',artifact:'成果',input_required:'请求回应'}[m.kind]||'工作台');
       const article=el('article','msg '+(m.role==='user'?'user':''),el('div','msg-meta',role,el('small','',at(m.createdAt))));

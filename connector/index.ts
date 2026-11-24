@@ -1,6 +1,6 @@
 import {existsSync,mkdirSync,mkdtempSync,readFileSync,unlinkSync,writeFileSync,rmdirSync,realpathSync} from 'node:fs'
 import {tmpdir,homedir} from 'node:os'
-import {basename,resolve,join} from 'node:path'
+import {basename,isAbsolute,resolve,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
 import WebSocket from 'ws'
@@ -8,7 +8,7 @@ import {registry} from './adapters/index.ts'
 import {Store,type ReceiptStatus} from './store.ts'
 import type {Command,Instance,Adapter,Run,Input,Capabilities} from './types.ts'
 
-const config=JSON.parse(readFileSync(process.argv[2]||'connector/config.example.json','utf8'))
+const config=JSON.parse(readFileSync(process.argv[2]||'connector/config.example.json','utf8').replace(/^\uFEFF/,''))
 const token=process.env.NODE_TOKEN
 if(!token) throw new Error('需要设置 NODE_TOKEN')
 const url=new URL(process.env.MAOQIU_NODE_URL||config.url)
@@ -24,6 +24,7 @@ const instances=new Map<string,Entry>()
 const running=new Map<string,{run:Run,adapter:Adapter}>()
 const handling=new Set<string>()
 const occupied=new Set<string>()
+const grantCleanups=new Set<()=>void>()
 let ws:WebSocket|undefined
 let stopping=false
 function send(frame:object) {
@@ -64,11 +65,18 @@ function grant(c:Command,i:Input) {
   if(!access) return ()=>{}
   const dir=mkdtempSync(join(tmpdir(),'maoqiu-project-'))
   const path=join(dir,'project.json')
+  const cleanup=()=>{
+    grantCleanups.delete(cleanup)
+    if(existsSync(path))unlinkSync(path)
+    if(existsSync(dir))rmdirSync(dir)
+  }
   try {
     writeFileSync(path,JSON.stringify({baseUrl:baseUrl.href.replace(/\/$/,''),token:access.token,projectId:access.projectId}),{mode:0o600,flag:'wx'})
-    i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。可用同一工具查看交接、记录及空间，修改页面先取修订号，再 preview、apply。请勿读取或输出凭据文件内容。'
-  } catch(e){if(existsSync(path)) unlinkSync(path);rmdirSync(dir);throw e}
-  return ()=>{if(existsSync(path)) unlinkSync(path);rmdirSync(dir)}
+    grantCleanups.add(cleanup)
+    const permission=access.permission??'read'
+    i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限（'+permission+'）。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。请勿读取或输出凭据文件内容。'
+  } catch(e){cleanup();throw e}
+  return cleanup
 }
 async function handle(c:Command) {
   if(!c.id || !c.instanceId || !c.runId || !c.threadId || !c.payload) throw new Error('节点命令缺少标识')
@@ -181,6 +189,7 @@ async function startAdapter(entry:Entry,restarting=false) {
   let ready=false
   try {
     if(instance.adapterKey==='codex'&&!loopback)throw Error('个人 Codex 登录只支持同机运行')
+    if(isAbsolute(instance.command)&&!existsSync(instance.command))throw Error('找不到配置的 Agent 可执行程序')
     instance.workspaceRef=realpathSync(instance.workspaceRef)
     const key=instance.adapterKey==='codex'?'CODEX_HOME':'DSH_HOME'
     const home=resolve(instance.env?.[key]||process.env[key]||join(homedir(),instance.adapterKey==='codex'?'.codex':'.dsh'))
@@ -242,6 +251,7 @@ function connect(){
 function stop(){
   stopping=true
   ws?.close()
+  for(const cleanup of grantCleanups)try{cleanup()}catch{}
   for(const entry of instances.values()){
     clearTimeout(entry.restart)
     entry.adapter?.close()

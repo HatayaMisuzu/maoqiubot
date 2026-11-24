@@ -8,6 +8,7 @@ import { access,hash,secret } from './api/auth.ts'
 import { route } from './api/routes.ts'
 import { attachNodes } from './api/nodes.ts'
 import { mainWorker } from './chat/index.ts'
+import type { ChatProvider } from './chat/provider.ts'
 import { homeRead } from './tasks/index.ts'
 import { isLocal } from './api/local.ts'
 
@@ -25,11 +26,11 @@ function json(res:ServerResponse,status:number,value:any){
   res.end(JSON.stringify(value))
 }
 const stable=(v:any):any=>Array.isArray(v)?v.map(stable):v && typeof v==='object'?Object.fromEntries(Object.keys(v).sort().map(k=>[k,stable(v[k])])):v
-export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat?:boolean}={}){
+export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat?:boolean,chatProvider?:ChatProvider}={}){
   const dataDir=resolve(opts.dataDir??process.env.MAOQIU_DATA??'data'),db=openDatabase(dataDir),auth=access(dataDir)
   const ticket=secret(), sessions=new Set<string>();let ticketExpires=Date.now()+5*60000
   const streams=new Map<ServerResponse,number>()
-  const chat=mainWorker(db,dataDir)
+  const chat=mainWorker(db,dataDir,opts.chatProvider)
   const server=createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff')
     res.setHeader('Referrer-Policy','no-referrer')
@@ -38,6 +39,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       const host=req.headers.host??''
       if(req.headers.origin && new URL(req.headers.origin).host!==host)fail('来源不匹配',403)
       if(url.pathname==='/login'&&method==='GET'){
+        if(!isLocal(req))fail('工作台登录链接限本机使用',403)
         if(ticketExpires<=Date.now()||url.searchParams.get('ticket')!==ticket)fail('登录链接已使用或已过期',403)
         ticketExpires=0
         const sid=secret();sessions.add(sid)
@@ -79,6 +81,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       const b=method==='GET'?{}:await body(req)
       if(['POST','PATCH','DELETE'].includes(method) && b.requestId!=null && (typeof b.requestId!=='string'||!b.requestId.length||b.requestId.length>256))fail('requestId 无效')
       const result=transaction(db,()=>{
+        if(method!=='GET' && token && !principal.owner && !auth.principal(db,token))fail('项目资料授权已失效',401)
         const signature=b.requestId?hash(JSON.stringify([method,path,stable(b)])):null
         if(signature){
           const previous=one(db,'SELECT * FROM requests WHERE principal=? AND requestId=?',principal.id,b.requestId)
@@ -91,6 +94,14 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         if(signature) db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run(principal.id,b.requestId,signature,JSON.stringify(value))
         return value
       })
+      if(method==='GET' && /^\/attachments\/[^/]+$/.test(path)){
+        if(url.searchParams.get('download')==='1' && typeof result.data==='string'){
+          const bytes=Buffer.from(result.data,'base64')
+          res.writeHead(200,{'Content-Type':'application/octet-stream','Content-Length':bytes.length,'Cache-Control':'no-store',
+            'Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(result.name.toWellFormed()).replace(/['()*]/g,c=>'%'+c.charCodeAt(0).toString(16))})
+          res.end(bytes);return
+        }
+      }
       json(res,200,result)
       if(method!=='GET'){nodes.flush();broadcast();if(opts.chat!==false)void chat()}
     }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}

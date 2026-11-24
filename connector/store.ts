@@ -7,15 +7,30 @@ export class Store {
   db:DatabaseSync
   constructor(path:string) {
     this.db=new DatabaseSync(path)
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+    try {
+      this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000')
+      this.migrate()
+    }catch(e){this.db.close();throw e}
+  }
+  private migrate() {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const version=this.db.prepare('PRAGMA user_version').get()?.user_version
+      if(version!==0 && version!==1)throw Error('连接器数据库版本高于当前支持的版本')
+      if(version===0){
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL,detail TEXT);
       CREATE TABLE IF NOT EXISTS bindings(thread TEXT PRIMARY KEY,instance TEXT NOT NULL,workspace TEXT NOT NULL,session TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,native TEXT,seq INTEGER NOT NULL DEFAULT 0,terminal INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY,event TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS native_items(run TEXT,item TEXT,PRIMARY KEY(run,item));
       CREATE TABLE IF NOT EXISTS receipt_acks(id TEXT PRIMARY KEY,status TEXT NOT NULL);`)
-    if(!this.db.prepare('PRAGMA table_info(bindings)').all().some(c=>c.name==='runtime')) this.db.exec('ALTER TABLE bindings ADD COLUMN runtime TEXT')
-    if(!this.db.prepare('PRAGMA table_info(commands)').all().some(c=>c.name==='submitted')) this.db.exec('ALTER TABLE commands ADD COLUMN submitted INTEGER')
+        if(!this.db.prepare('PRAGMA table_info(bindings)').all().some(c=>c.name==='runtime')) this.db.exec('ALTER TABLE bindings ADD COLUMN runtime TEXT')
+        if(!this.db.prepare('PRAGMA table_info(commands)').all().some(c=>c.name==='submitted')) this.db.exec('ALTER TABLE commands ADD COLUMN submitted INTEGER')
+        this.db.exec('PRAGMA user_version=1')
+      }
+      this.db.exec('COMMIT')
+    }catch(e){this.db.exec('ROLLBACK');throw e}
   }
   command(c:Command) {
     // The server owns the input and credentials. Local recovery needs only routing IDs.
