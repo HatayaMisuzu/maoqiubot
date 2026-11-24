@@ -1,6 +1,6 @@
 import {readFileSync} from 'node:fs'
 import {randomUUID} from 'node:crypto'
-import {resolve} from 'node:path'
+import {basename,isAbsolute,resolve} from 'node:path'
 import {registry} from './adapters/index.ts'
 import {Dsh} from './adapters/dsh.ts'
 import type {Instance,Run} from './types.ts'
@@ -8,6 +8,9 @@ const [filename,id,...prompts]=process.argv.slice(2)
 const config=JSON.parse(readFileSync(filename,'utf8'))
 const instance:Instance=config.instances.find((x:Instance)=>x.id===id)
 if(!instance) throw new Error('没有该实例')
+const dshExecutable=process.env.MAOQIU_DSH_EXECUTABLE
+if(instance.adapterKey==='dsh'&&!isAbsolute(instance.command)&&dshExecutable&&isAbsolute(dshExecutable)&&
+  /^dsh(?:\.cmd|\.exe)?$/i.test(basename(dshExecutable)))instance.command=dshExecutable
 instance.workspaceRef=resolve(instance.workspaceRef)
 const adapter=new registry[instance.adapterKey](instance)
 const timer=setTimeout(()=>adapter.close(),120000)

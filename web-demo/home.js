@@ -164,21 +164,40 @@ export const home = actions=>{
     });
   }
   async function openRecord(id){
-    const rec=await api('/records/'+url(id));
+    const endpoint='/records/'+url(id);
+    const rec=await api(endpoint);
     const edit=()=>form('编辑记录',[{key:'body',label:'内容',type:'textarea',value:rec.body,required:true},
       {key:'confirmation',label:'确认性质',options:[
         {id:'user',name:'由所有者确认'},{id:'unconfirmed',name:'待确认'},{id:'inferred',name:'推测'},
         {id:'confirmed',name:'已确认'},{id:'observed',name:'观察记录'}
       ],value:rec.confirmation}], '保存',async values=>{
-      await api('/records/'+url(id),{...values,expectedRevision:rec.revision},'PATCH');
+      await api(endpoint,{...values,expectedRevision:rec.revision},'PATCH');
       await actions.refresh();
     });
-    const forget=()=>display('忘记记录',el('p','text','这条记录将退出检索和召回，原始资料仍保留。'),
+    const sharing=()=>form('派生知识共享',[{key:'mode',label:'项目中的可见性',options:[
+      {id:'source',name:'随资料访问权限共享'},
+      {id:'independent',name:'确认该版本可作为独立项目知识'},
+      {id:'hidden',name:'停止共享正文与修订'}
+    ],value:rec.shareDerived===false?'hidden':rec.independentKnowledge?'independent':'source'}],'保存',async ({mode})=>{
+      await api(endpoint,{expectedRevision:rec.revision,shareDerived:mode!=='hidden',independentKnowledge:mode==='independent',
+        ...(mode==='independent'?{confirmation:'user'}:{})},'PATCH');
+      await actions.refresh();await openRecord(id);
+    });
+    const history=async()=>{
+      const {history:revisions}=await api(endpoint+'?history=1');
+      display('修订历史',...revisions.map(revision=>el('article','record',
+        el('strong','','版本 '+revision.revision+' · '+at(revision.createdAt)),el('p','text',revision.body))));
+    };
+    const forget=()=>display('忘记记录',el('p','text','该记录将退出检索和后续聊天召回。原件及已经送达的消息会保留。'),
       btn('确认忘记',async()=>{
-        await api('/records/'+url(id),{expectedRevision:rec.revision},'DELETE');
+        await api(endpoint,{expectedRevision:rec.revision},'DELETE');
         $('dialog').close();await actions.refresh();
       },'primary'));
-    display(labels[rec.type]||'记录',recordRow(rec),rec.submitter==='server'?null:el('div','actions',btn('编辑记录',edit,'secondary'),btn('忘记记录',forget,'ghost')));
+    display(labels[rec.type]||'记录',recordRow(rec),el('div','actions',
+      btn('修订历史',history,'ghost'),
+      rec.projectId?btn('派生知识共享',sharing,'secondary'):null,
+      rec.submitter==='server'?null:btn('编辑记录',edit,'secondary'),
+      rec.submitter==='server'?null:btn('忘记记录',forget,'ghost')));
   }
   function entryForm(c,path,entry){
     const fields=c.fields.map(f=>({key:f.id,label:f.name+(f.type==='record'?'（记录 ID）':''),type:({number:'number',date:'date',attachment:'file'}[f.type]||'text'),

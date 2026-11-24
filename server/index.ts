@@ -9,7 +9,9 @@ import { route } from './api/routes.ts'
 import { attachNodes } from './api/nodes.ts'
 import { mainWorker } from './chat/index.ts'
 import type { ChatProvider } from './chat/provider.ts'
-import { homeRead } from './tasks/index.ts'
+import { selectedModel } from './chat/model-settings.ts'
+import { discoverModels, probeModel } from './chat/compatible.ts'
+import { checkQueuedInput, homeRead, nativeSessionTarget } from './tasks/index.ts'
 import { isLocal } from './api/local.ts'
 
 const webRoot=fileURLToPath(new URL('../web-demo/',import.meta.url))
@@ -30,7 +32,10 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
   const dataDir=resolve(opts.dataDir??process.env.MAOQIU_DATA??'data'),db=openDatabase(dataDir),auth=access(dataDir)
   const ticket=secret(), sessions=new Set<string>();let ticketExpires=Date.now()+5*60000
   const streams=new Map<ServerResponse,number>()
-  const chat=mainWorker(db,dataDir,opts.chatProvider)
+  const chat=mainWorker(db,dataDir,opts.chatProvider,(threadId,messageId,text)=>{
+    const data=JSON.stringify({kind:'chat_delta',threadId,messageId,text})
+    for(const res of streams.keys())if(!res.writableNeedDrain&&!res.writableEnded)res.write('data: '+data+'\n\n')
+  })
   const server=createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff')
     res.setHeader('Referrer-Policy','no-referrer')
@@ -60,13 +65,14 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       if(!principal){
         const nodeId=auth.node(token),m=path.match(/^\/attachments\/([^/]+)$/)
         if(method==='GET'&&nodeId&&m){
-          const c=one(db,`SELECT c.payload,t.projectId FROM commands c
+          const c=one(db,`SELECT c.*,t.projectId FROM commands c
             JOIN instances i ON i.id=c.instanceId
             JOIN threads t ON t.id=c.threadId
             JOIN runs r ON r.id=c.runId
             WHERE c.id=? AND i.nodeId=? AND c.kind IN ('run','steer') AND c.status IN ('sent','received')
               AND r.status IN ('queued','running','waiting_input','cancelling')`,url.searchParams.get('commandId'),nodeId)
           if(!c||!JSON.parse(c.payload).attachmentIds?.includes(m[1]))fail('附件未随此命令授权',403)
+          checkQueuedInput(db,c,JSON.parse(c.payload))
           return json(res,200,homeRead(db,dataDir,path,c.projectId))
         }
         fail('请使用工作台访问令牌登录',401)
@@ -79,6 +85,23 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         res.write(': connected\n\n');streams.set(res,cursor);res.on('close',()=>streams.delete(res));broadcast();return
       }
       const b=method==='GET'?{}:await body(req)
+      const sessionCatalog=path.match(/^\/instances\/([\w-]{1,128})\/sessions$/)
+      if(method==='GET'&&sessionCatalog){
+        if(!principal.owner||!isLocal(req))fail('原生会话目录限本机所有者',403)
+        const cursor=url.searchParams.get('cursor')
+        if(cursor&&cursor.length>2000)fail('原生会话游标无效')
+        const inst=nativeSessionTarget(db,sessionCatalog[1],url.searchParams.get('projectId')||null)
+        return json(res,200,await nodes.listSessions(inst,cursor))
+      }
+      if(method==='POST'&&['/chat/models/test','/chat/models/discover'].includes(path)){
+        if(!principal.owner||!isLocal(req))fail('模型测试限本机所有者',403)
+        const config=selectedModel(dataDir,typeof b.id==='string'?b.id:undefined)
+        if(!config)fail('本机 Codex 通过主聊发送消息测试，模型目录由官方客户端管理',409)
+        const ctrl=new AbortController()
+        res.once('close',()=>{if(!res.writableEnded)ctrl.abort()})
+        const result=await (path.endsWith('/discover')?discoverModels(config,ctrl.signal):probeModel(config,ctrl.signal))
+        return json(res,200,result)
+      }
       if(['POST','PATCH','DELETE'].includes(method) && b.requestId!=null && (typeof b.requestId!=='string'||!b.requestId.length||b.requestId.length>256))fail('requestId 无效')
       const result=transaction(db,()=>{
         if(method!=='GET' && token && !principal.owner && !auth.principal(db,token))fail('项目资料授权已失效',401)
@@ -103,7 +126,12 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         }
       }
       json(res,200,result)
-      if(method!=='GET'){nodes.flush();broadcast();if(opts.chat!==false)void chat()}
+      if(method!=='GET'){
+        if(path==='/chat/cancel')chat.abort(result.jobId)
+        if(b.action==='inspect'&&/^\/runs\/[^/]+\/recovery$/.test(path))nodes.inspect(result.runId)
+        else nodes.flush()
+        broadcast();if(opts.chat!==false)void chat.tick()
+      }
     }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}
   })
   const nodes=attachNodes(server,db,auth.node)
@@ -112,13 +140,13 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
     const events=db.prepare('SELECT * FROM events WHERE cursor>? ORDER BY cursor LIMIT 200').all(after)
     for(const e of events){const value={...JSON.parse(String(e.body)),kind:e.kind,cursor:e.cursor};const ok=res.write('id: '+e.cursor+'\ndata: '+JSON.stringify(value)+'\n\n');streams.set(res,Number(e.cursor));if(!ok)break}
   }}
-  const interval=setInterval(()=>{nodes.flush();broadcast();if(opts.chat!==false)void chat()},500)
+  const interval=setInterval(()=>{nodes.flush();broadcast();if(opts.chat!==false)void chat.tick()},500)
   const heartbeat=setInterval(()=>{for(const r of streams.keys())if(!r.writableNeedDrain)r.write(': heartbeat\n\n')},15000)
   server.on('close',()=>{clearInterval(interval);clearInterval(heartbeat)})
   const port=opts.port??Number(process.env.PORT??4317),host=opts.host??process.env.HOST??'127.0.0.1'
   server.listen(port,host)
   return {server,db,auth,ticket,dataDir,async close(){
-    clearInterval(interval);clearInterval(heartbeat);nodes.close()
+    clearInterval(interval);clearInterval(heartbeat);nodes.close();chat.abort()
     for(const r of streams.keys())r.end()
     await new Promise<void>((done)=>server.close(()=>done()))
     db.close()

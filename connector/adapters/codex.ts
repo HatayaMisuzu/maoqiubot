@@ -1,4 +1,4 @@
-import {resolve} from 'node:path'
+import {relative,resolve} from 'node:path'
 import {createHash} from 'node:crypto'
 import {Native} from './base.ts'
 import type {Input,Run,Adapter} from '../types.ts'
@@ -19,7 +19,7 @@ export class Codex extends Native implements Adapter {
   models:ModelOption[]=[]
   sessionModels=new Map<string,string>()
   async identity(){
-    const {account}=await this.rpc.request('account/read',{refreshToken:false},5000)
+    const {account}=await this.rpc.request('account/read',{refreshToken:false},10000)
     if(account?.type!=='chatgpt')throw Error('请在本机使用官方 Codex 登录 ChatGPT')
     return createHash('sha256').update(String(account.email??'local-chatgpt')).digest('hex')
   }
@@ -38,13 +38,42 @@ export class Codex extends Native implements Adapter {
       catch(e:any) {return e.code===-32602 || (e.code===-32600 && /missing field.*threadId/.test(e.message))}
     }
     const [steer,cancel,history]=await Promise.all(['turn/steer','turn/interrupt','thread/read'].map(supported))
-    return {availableActions:['run','prepare','answer',...(steer?['steer']:[]),...(cancel?['cancel']:[])],version:hello.userAgent,resume:true,history,models:this.models}
+    let sessionList=false
+    if(history)try{await this.catalog({limit:1});sessionList=true}catch{}
+    return {availableActions:['run','prepare','answer',...(steer?['steer']:[]),...(cancel?['cancel']:[])],
+      version:hello.userAgent,resume:true,history,sessionList,models:this.models}
+  }
+  private async catalog(options:object){
+    const result=await this.rpc.request('thread/list',{...options,cwd:this.instance.workspaceRef,currentAccountOnly:true,useStateDbOnly:true},5000)
+    if(!Array.isArray(result?.data))throw Error('Codex 未提供可核对的会话目录')
+    return {...result,data:result.data.filter((thread:any)=>typeof thread.id==='string'&&typeof thread.cwd==='string'&&
+      relative(this.instance.workspaceRef,thread.cwd)===''&&!thread.ephemeral&&!thread.parentThreadId)}
+  }
+  async listSessions(cursor?:string){
+    const result=await this.catalog({limit:35,sortKey:'updated_at',cursor})
+    return {items:result.data.map((thread:any)=>({id:thread.id,title:String(thread.name||thread.preview||'Codex 话题').slice(0,140),
+      updatedAt:Number(thread.updatedAt)||0,active:thread.status?.type==='active'||this.active.has(thread.id)})),
+      nextCursor:typeof result.nextCursor==='string'?result.nextCursor:null}
+  }
+  async importSession(sessionId:string){
+    const {data}=await this.catalog({includedThreadIds:[sessionId],limit:1})
+    if(!data.some((thread:any)=>thread.id===sessionId))throw Error('找不到当前工作区、账号和 profile 下的外部会话')
+    const {thread}=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
+    if(thread?.id!==sessionId||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!=='')
+      throw Error('外部会话的工作区不匹配')
+    if(!['idle','notLoaded'].includes(thread.status?.type)||this.active.has(sessionId))throw Error('原生会话仍在运行或状态不可核对，请先在原客户端检查')
+    try{return await this.open(sessionId)}
+    catch(e){
+      if(/already has an active writer/i.test((e as Error).message))
+        throw Error('该原生会话仍被其他客户端占用，请在原客户端释放会话后再导入')
+      throw e
+    }
   }
   async open(sessionId?:string) {
     if(sessionId && this.sessions.has(sessionId)) return sessionId
     const method=sessionId?'thread/resume':'thread/start'
     const {thread,model}=await this.rpc.request(method,{cwd:this.instance.workspaceRef,...(sessionId?{threadId:sessionId,excludeTurns:true}:{})})
-    if(!thread?.id || (sessionId && thread.id!==sessionId) || resolve(thread.cwd)!==resolve(this.instance.workspaceRef))
+    if(!thread?.id || (sessionId && thread.id!==sessionId) || relative(resolve(thread.cwd),this.instance.workspaceRef)!=='')
       throw new Error('原生工作区或线程不符')
     this.sessions.add(thread.id)
     if(typeof model==='string')this.sessionModels.set(thread.id,model)

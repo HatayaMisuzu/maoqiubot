@@ -4,6 +4,6 @@
   "stateDir": "./data/node-local",
   "instances": [
     {"id":"codex-local","name":"Codex","adapterKey":"codex","workspaceRef":".","command":"codex","args":["app-server"]},
-    {"id":"dsh-local","name":"DSH","adapterKey":"dsh","workspaceRef":".","command":"D:/DeepSeekHarness/resources/runtime/cli/bin/dsh.cmd","args":["--profile","acp"]}
+    {"id":"dsh-local","name":"DSH","adapterKey":"dsh","workspaceRef":".","command":"dsh.cmd","args":["--profile","acp"]}
   ]
 }

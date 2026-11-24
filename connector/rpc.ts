@@ -15,8 +15,7 @@ export class Rpc extends EventEmitter {
     const codex=instance.adapterKey==='codex'
     if(codex && instance.args.join(' ')!=='app-server') throw Error('Codex 实例只接受官方 app-server stdio 入口')
     const env = codex?codexEnvironment({...process.env,...instance.env}):{...process.env,...instance.env}
-    delete env.NODE_TOKEN
-    delete env.OWNER_TOKEN
+    for(const key of Object.keys(env))if(/^(?:(?:NODE|OWNER)_TOKEN$|MAOQIU_MODEL_KEY_)/i.test(key))delete env[key]
     const args=codex?['app-server','--listen','stdio://',...codexServiceArgs]:instance.args
     const batch=process.platform==='win32'&&instance.adapterKey==='dsh'&&/\.cmd$/i.test(instance.command)
     // Windows requires cmd.exe for the vendor-provided dsh.cmd launcher.

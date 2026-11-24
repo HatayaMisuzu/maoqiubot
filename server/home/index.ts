@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import { fail, iso, list, now, obj, one, parse, projectAccess, revision, rows, run, str, strings, uid } from './common.ts';
 import type { DB, Context, Principal } from './common.ts';
 import { initSpaces, createSpace, spaceApi } from './spaces.ts';
-import { search } from './search.ts';
+import { memoryCandidates, search } from './search.ts';
+import { resetChatContext, sharedRecordSql } from './visibility.ts';
 
 const recordTypes = ['requirement','decision','preference','note','conclusion','handoff','comment','reply','todo','result','progress','start','artifact','verified','next','blocked','failure','stopped','partial','completed'];
 const maxAttachmentBytes=16*1024*1024;
@@ -117,7 +118,15 @@ function recordValues(b:any) {
   const confirmation = b.confirmation ?? 'unconfirmed';
   if (!['user','confirmed','unconfirmed','inferred','observed'].includes(confirmation)) fail(400,'无效确认性质');
   return {body:str(b.body,'body'),extra:obj(b.extra ?? {},'extra'),confirmation,validFrom,validUntil,
-    refs:strings(b.refs ?? [],'refs'),factKey:b.factKey == null ? null : str(b.factKey,'factKey')};
+    refs:strings(b.refs ?? [],'refs'),factKey:b.factKey == null ? null : str(b.factKey,'factKey'),
+    shareDerived:b.shareDerived!==false,independentKnowledge:b.independentKnowledge===true};
+}
+function checkSharing(p:Principal,projectId:string|null,b:any){
+  if(!['shareDerived','independentKnowledge'].some(k=>Object.hasOwn(b,k)))return
+  if(!p.owner||!projectId)fail(403,'只有所有者可管理项目派生知识共享')
+  for(const key of ['shareDerived','independentKnowledge'])
+    if(Object.hasOwn(b,key)&&typeof b[key]!=='boolean')fail(400,'派生知识选项须为布尔值')
+  if(b.independentKnowledge===true&&b.confirmation!=='user')fail(400,'独立项目知识需要所有者确认')
 }
 function assertUnblocked(db:DB,sourceId:string|null,kind:string,v:any,projectId:string|null) {
   if (!sourceId) return;
@@ -130,7 +139,7 @@ function toRecord(row:any) {
 }
 const recordSelect='SELECT r.*, v.snapshot FROM records r JOIN record_revisions v ON v.record_id=r.id AND v.rev=r.revision';
 function record(db:DB,p:Principal,id:string) {
-  const r=one(db,recordSelect+' WHERE r.id=? AND r.forgotten=0',id);
+  const r=one(db,recordSelect+` WHERE r.id=? AND r.forgotten=0 AND (? OR ${sharedRecordSql()})`,id,Number(p.owner));
   if (!r) fail(404,'记录不存在');
   projectAccess(db,p,r.project_id);
   return toRecord(r);
@@ -169,13 +178,15 @@ function forgetRecord(db:DB,r:any) {
   }
   const at=now();
   for(const id of forgotten) run(db,'UPDATE records SET forgotten=1,updated_at=? WHERE id=?',at,id);
+  resetChatContext(db,r.projectId);
   return {id:r.id,forgotten:true,affectedIds:[...forgotten]};
 }
 export function addTaskRecord(db:DB,projectId:string|null,taskId:string,type:string,body:string,extra:object={}) {
-  if (projectId) insertRecord(db,projectId,taskId,type,'工作台','server',null,{body,extra,confirmation:'observed'});
+  if (projectId) return insertRecord(db,projectId,taskId,type,'工作台','server',null,{body,extra,confirmation:'observed'});
 }
 function userRecord(db:DB,p:Principal,projectId:string|null,b:any) {
   projectAccess(db,p,projectId);
+  checkSharing(p,projectId,b);
   const kind=str(b.type ?? 'note','type');
   if (!recordTypes.includes(kind)) fail(400,'未知记录类型');
   if(p.runPermission && kind==='verified') fail(403,'运行令牌不能提交验收结论');
@@ -217,11 +228,9 @@ function writeSubmission(db:DB,ctx:Context) {
 }
 function current(r:any, at=now()) { return (!r.validFrom || r.validFrom<=at) && (!r.validUntil || r.validUntil>at); }
 function timeline(db:DB,p:Principal,id:string,strictSources=false) {
-  return rows(db,recordSelect+' WHERE r.project_id=? AND r.forgotten=0 ORDER BY r.created_at DESC,r.rowid DESC',id)
-    .flatMap(row=>{
-      const original=toRecord(row),visible=visibleRecord(db,p,original);
-      return strictSources&&original.sourceId&&!visible.sourceId?[]:[visible];
-    });
+  return rows(db,recordSelect+` WHERE r.project_id=? AND r.forgotten=0 AND (? OR ${sharedRecordSql()})
+    ORDER BY r.created_at DESC,r.rowid DESC`,id,Number(p.owner&&!strictSources))
+    .map(row=>visibleRecord(db,p,toRecord(row)));
 }
 function brief(db:DB,p:Principal,id:string,strictSources=false) {
   const project=getProject(db,id),records=timeline(db,p,id,strictSources).filter(r=>current(r));
@@ -300,38 +309,45 @@ export function prepareProjectContext(db:DB,id:string) {
   // The context follows the project ACL even when assembled for an owner action.
   const p:Principal={id:'',owner:false,projects:[id]};
   const data=brief(db,p,id,true);
-  let backgroundBudget=8000;
+  let factBudget=12000;
   const facts=effectiveFacts([...data.requirements,...data.decisions,...data.preferences]).flatMap(r=>{
-    if(confirmed(r)&&r.type!=='preference')return [factRecord(r)];
-    if(backgroundBudget<=0)return [];
-    const body=r.body.slice(0,Math.min(backgroundBudget,1200));
-    backgroundBudget-=body.length;
+    if(factBudget<=0)return [];
+    const body=r.body.slice(0,Math.min(factBudget,confirmed(r)?1800:1000));
+    factBudget-=body.length+100;
     return [factRecord({...r,body})];
   });
   const superseded=new Set(data.handoffs.flatMap(r=>r.refs));
   const handoffs=data.handoffs.filter(r=>!superseded.has(r.id)).slice(0,3).map(r=>({
     ...factRecord(r),body:r.body.slice(0,1800),version:r.extra?.version,
-    remaining:Array.isArray(r.extra?.remaining)?r.extra.remaining.slice(0,15):[]
+    remaining:Array.isArray(r.extra?.remaining)?r.extra.remaining.slice(0,8).filter((v:any)=>typeof v==='string').map((v:string)=>v.slice(0,400)):[]
   }));
-  return {project:{id,name:data.project.name},facts,handoffs,openItems:data.openItems.slice(0,20),
-    pendingVerification:data.pendingVerification.slice(0,10)};
+  return {project:{id,name:data.project.name},facts,handoffs,openItems:data.openItems.slice(0,12).map(item=>item.slice(0,500)),
+    pendingVerification:data.pendingVerification.slice(0,6).map(r=>({...r,criteria:r.criteria.slice(0,6).map((s:string)=>s.slice(0,400))})),
+    ...(factBudget<=0?{moreFacts:true}:{})};
 }
 export function recallMemory(db:DB,projectId:string|null,text:string){
-  const words=text.toLowerCase().slice(0,2000).match(/[\p{L}\p{N}]+/gu)??[];
+  const words=text.toLowerCase().slice(0,600).match(/\p{Script=Han}+|[\w.-]{2,}/gu)??[];
   const terms=[...new Set(words.flatMap(word=>{
-    const chars=Array.from(word);
-    return /\p{Script=Han}/u.test(word)?chars.slice(1).map((c,i)=>chars[i]+c):word.length>=3?[word]:[];
-  }))].slice(0,80);
+    const chars=Array.from(word)
+    if(!/\p{Script=Han}/u.test(word)||chars.length<=2)return [word]
+    return chars.flatMap((_,i)=>[chars.slice(i,i+3).join(''),chars.slice(i,i+2).join('')]).filter(term=>term.length>=2)
+  }))].slice(0,36);
   if(!terms.length)return [];
-  const candidates=rows(db,recordSelect+` WHERE r.project_id IS ? AND r.forgotten=0
-    AND r.kind IN ('note','preference','decision','conclusion')
-    ORDER BY r.updated_at DESC,r.rowid DESC LIMIT 100`,projectId).map(toRecord);
-  const visible=candidates.filter(r=>current(r)&&(!projectId||!r.sourceId||canReferenceAsset(db,{id:'',owner:false,projects:[projectId]},'sources',r.sourceId,projectId)));
-  return effectiveFacts(visible).map(r=>{
-    const body=r.body.toLowerCase(),score=terms.filter(term=>body.includes(term)).length;
-    return {r,score};
-  }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0,6)
-    .map(({r})=>factRecord({...r,body:r.body.slice(0,800)}));
+  const candidates=memoryCandidates(db,projectId,terms).map(toRecord);
+  const p:Principal=projectId?{id:'main',owner:false,projects:[projectId]}:{id:'owner',owner:true,projects:[]};
+  const winners=new Map<string,string>();
+  return candidates.filter(r=>{
+    if(!r.factKey)return true
+    const key=r.type+'\0'+extractKey(r.factKey)
+    if(!winners.has(key)){
+      const alternatives=rows(db,recordSelect+` WHERE r.project_id IS ? AND r.kind=? AND r.forgotten=0
+        AND lower(trim(json_extract(v.snapshot,'$.factKey')))=? AND (? OR ${sharedRecordSql()})
+        ORDER BY r.updated_at DESC,r.rowid DESC`,projectId,r.type,r.factKey.trim().toLowerCase(),Number(!projectId))
+        .map(toRecord).filter(candidate=>current(candidate))
+      winners.set(key,effectiveFacts(alternatives)[0]?.id??r.id)
+    }
+    return winners.get(key)===r.id
+  }).slice(0,6).map(r=>({...factRecord({...visibleRecord(db,p,r),body:r.body.slice(0,800)}),projectId:r.projectId}));
 }
 export function homeApi(db:DB,ctx:Context):any {
   const {path,method,principal:p}=ctx, b=ctx.body ?? {};
@@ -366,6 +382,8 @@ export function homeApi(db:DB,ctx:Context):any {
         }
       }
       run(db,`UPDATE ${area} SET acl=? WHERE id=?`,JSON.stringify(a),id);
+      for(const projectId of (parse(original.acl) as ACL).projects)
+        if(!a.projects.includes(projectId))resetChatContext(db,projectId);
     }
     if(method==='GET' || method==='PATCH'){
       const projectId=area==='sources' && method==='GET'?ctx.query.get('projectId'):null;
@@ -378,7 +396,9 @@ export function homeApi(db:DB,ctx:Context):any {
     const r=record(db,p,id);
     const visible=visibleRecord(db,p,r);
     if (method==='GET') {
-      if(ctx.query.get('history')==='1') return {...visible,history:rows(db,'SELECT rev,snapshot,created_at FROM record_revisions WHERE record_id=? ORDER BY rev DESC',id).map(h=>({revision:h.rev,createdAt:h.created_at,...parse(h.snapshot)}))};
+      if(ctx.query.get('history')==='1') return {...visible,history:rows(db,`SELECT v.rev,v.snapshot,v.created_at
+        FROM record_revisions v JOIN records r ON r.id=v.record_id WHERE r.id=? AND (? OR ${sharedRecordSql()})
+        ORDER BY v.rev DESC`,id,Number(p.owner)).map(h=>({revision:h.rev,createdAt:h.created_at,...parse(h.snapshot)}))};
       return visible;
     }
     const protectedRecord=r.submitter==='server' || r.type==='verified'&&r.submitter==='owner' ||
@@ -386,15 +406,19 @@ export function homeApi(db:DB,ctx:Context):any {
     if (method==='PATCH') {
       revision(r.revision,b.expectedRevision,visible);
       if(!p.owner && protectedRecord) fail(403,'此记录由工作台或所有者维护');
+      checkSharing(p,r.projectId,b);
       const confirmation=p.runPermission && ['user','confirmed','observed'].includes(b.confirmation??r.confirmation)?'unconfirmed':b.confirmation??r.confirmation;
       const confirmationBy=p.owner&&!Object.hasOwn(b,'confirmation')?(r.confirmationBy??r.submitter):p.id;
-      const v={...recordValues({...r,...b,confirmation}),confirmationBy};
+      const changedBody=b.body!==undefined&&b.body!==r.body
+      const independentKnowledge=b.independentKnowledge??(changedBody?false:r.independentKnowledge);
+      const v={...recordValues({...r,...b,confirmation,independentKnowledge}),confirmationBy};
       for (const ref of v.refs) if (record(db,p,ref).projectId!==r.projectId) fail(400,'引用范围不一致');
       assertUnblocked(db,r.sourceId,r.type,v,r.projectId);
       const n=r.revision+1,at=now();
       run(db,'UPDATE records SET revision=?,updated_at=? WHERE id=?',n,at,id);
       run(db,'INSERT INTO record_revisions VALUES(?,?,?,?)',id,n,JSON.stringify(v),at);
-      return visibleRecord(db,p,record(db,p,id));
+      resetChatContext(db,r.projectId);
+      return visibleRecord(db,p,{...r,...v,revision:n,updatedAt:at} as ReturnType<typeof toRecord>);
     }
     if (method==='DELETE') {
       if(!p.owner && protectedRecord) fail(403,'此记录由工作台或所有者维护');
@@ -406,7 +430,8 @@ export function homeApi(db:DB,ctx:Context):any {
     openSource:sourceId=>source(db,p,sourceId,projectId),
     writeHandoff:record=>userRecord(db,p,projectId,{...record,type:'handoff'}),
     canReference:(kind,ref)=>kind==='record'
-      ? Boolean(one(db,'SELECT 1 FROM records WHERE id=? AND (? IS NULL OR project_id=?) AND forgotten=0',ref,projectId,projectId))
+      ? Boolean(one(db,recordSelect+` WHERE r.id=? AND r.project_id IS ? AND r.forgotten=0
+        AND (? IS NULL OR ${sharedRecordSql()})`,ref,projectId,projectId))
       : canReferenceAsset(db,p,kind==='source'?'sources':'attachments',ref,projectId)
   }));
 }

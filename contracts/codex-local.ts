@@ -9,7 +9,7 @@ export const codexServiceArgs = [
 export function codexEnvironment(source: NodeJS.ProcessEnv) {
   const env = { ...source }
   for (const key of Object.keys(env)) {
-    if (/^(NODE_TOKEN|OWNER_TOKEN|OPENAI_BASE_URL|OPENAI_API_BASE|CHATGPT_BASE_URL|CODEX_ACCESS_TOKEN|CODEX_API_KEY|OPENAI_API_KEY|ACCESS_TOKEN)$/i.test(key)) delete env[key]
+    if (/^(?:(?:NODE_TOKEN|OWNER_TOKEN|OPENAI_BASE_URL|OPENAI_API_BASE|CHATGPT_BASE_URL|CODEX_ACCESS_TOKEN|CODEX_API_KEY|OPENAI_API_KEY|ACCESS_TOKEN)$|MAOQIU_MODEL_KEY_)/i.test(key)) delete env[key]
   }
   return env
 }

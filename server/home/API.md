@@ -76,14 +76,24 @@ $restored = Write-Maoqiu "/spaces/$($space.id)/restore" @{ expectedRevision = $a
 | `POST /submissions` | 个人投递省略项目。留在节点的原件可用 `source.localRef = {nodeId,workspaceRef,path}` 标记，服务仅保存定位描述。 |
 | `PATCH /sources/:id`、`PATCH /attachments/:id` | 所有者用 `{projectIds:[...],endpointIds:[...]}` 替换完整授权范围。分享含附件的来源前先授权相关附件。 |
 | `GET /search` | 支持 `q`、`projectId`、`sourceId`、`platform`、`from`、`to`、`kind` 和 `scope=personal`。可重复传 `ref` 优先显示明确引用。默认 50 条，`limit` 上限 100，将返回的 `nextCursor` 作为下一次请求的 `cursor`。 |
-| `PATCH /records/:id` | 传 `{expectedRevision,body?,extra?,validFrom?,validUntil?,confirmation?,refs?}`。当前读取用 `GET`；显式查历史加 `?history=1`。 |
-| `DELETE /records/:id` | JSON 中传 `expectedRevision`。遗忘移除这条提炼的检索入口和简报引用。相同原件、类型与规范化陈述，或同一 `factKey` 的再提取会得到 409。原始来源可继续按原有访问范围查阅。 |
+| `PATCH /records/:id` | 传 `{expectedRevision,body?,extra?,validFrom?,validUntil?,confirmation?,refs?}`。所有者还可在项目中设置 `shareDerived` 与 `independentKnowledge`。当前读取用 `GET`，查历史加 `?history=1`。 |
+| `DELETE /records/:id` | JSON 中传 `expectedRevision`。遗忘从检索、简报和自动召回排除记录，并使相关主聊摘要失效。相同原件、类型与规范化陈述，或同一 `factKey` 的再提取会得到 409。原始来源可继续按原有访问范围查阅。 |
 | `GET /spaces/personal`、`POST /spaces` | 读取个人空间，或以 `{projectId?,name,templateSpaceId?}` 新建空间。模板复制页面和字段，重新建立集合与项目绑定。 |
 | `GET /modules`、`POST /spaces/:id/changes` | 查询已注册模块。通过 `{op:'toggleModule',type:'source-card',enabled:false}` 停用出处卡片渲染，原件仍可经稳定来源 ID 打开。 |
 | `POST /spaces/:id/actions/:actionId` | `writeHandoff` 动作接收 `body`、`refs?`、`sourceId?`、`confirmation?`、`extra?` 和 `requestId?`。版本与未完成事项可填入 `extra.version` 和 `extra.remaining`。来源及上一条交接引用沿用项目权限。 |
 
-项目空间可引用授权给本项目的来源和附件，以及本项目的记录。撤回授权或遗忘记录后，页面与集合停止显示相应引用，原有布局修订和条目的其他值仍可读取。
+原件授权、派生知识共享和遗忘分别操作。项目空间只引用本项目可见的记录和已授权原件。撤回来源授权后，通过直接引用或经其他记录依赖该来源的派生记录退出项目读取、历史、检索、简报、空间和 Bot 上下文。所有者仍可查看未遗忘的记录。需要保留某个版本的知识时，所有者提交 `{expectedRevision,independentKnowledge:true,shareDerived:true,confirmation:"user"}` 明确确认。再次修改正文时需重新确认该版本；项目成员仍需原件授权才能访问原件。设置 `shareDerived:false` 关闭该记录及依赖它的派生记录的项目共享。
+
+收回附件只改变其访问权；引用该附件的受控通信交接也退出后续项目上下文。页面布局和条目中的其他可见值会保留。撤权、修订和遗忘不会追回已经发送到原生会话或模型服务的内容。暂存待发和断线重发会重新核对材料、版本和授权。发出的内容无法核对时状态为「送达待核对」。
+
+### Bot 通信与原生会话
+
+运行中可使用该运行的项目令牌调用 `POST /runs/:id/communication`。支持 `question`、`progress`、`blocked`、`request`、`handoff` 和 `delivery`，传入 `kind`、`text`、唯一 `requestId`，可加同一工作话题的 `replyTo`、当前项目的生成材料 `refs`。交接或协作请求可指定已绑定的 `recipientInstanceId`，由主聊协调；报告送入后不会自行唤起其他 Bot。交接或交付可附 `version`、`completed`、`remaining`、`paths`、`checks`、`risks`，返回归档记录 ID。宿主从运行绑定生成发送者，报告和路径属于执行方自述。
+
+所有者通过 `GET /tasks/:id/communication` 查询任务关系。可向对应工作话题提交 `{text,replyTo}` 记录直接回应。针对待核对运行，向 `POST /runs/:id/recovery` 提交 `{action:"inspect"}` 请求原节点核对，或用 `{action:"abandon",acknowledge:true,reason}` 停止工作台等待。后者可能留下仍在原生端执行的任务。
+
+本机所有者可以读取 `GET /instances/:id/sessions?projectId=<id>&cursor=<cursor>`。实例须宣告可核对的会话目录。用 `POST /instances/:id/sessions` 提交 `{sessionId,projectId?,title?}`，查询返回的话题等待原生绑定回执。会话已绑定时返回既有话题。工作台继续使用原生线程，历史保留在原客户端。
 
 ### 对话与事件
 
-`GET /threads/:id?messageLimit=60` 返回最新一页和 `nextBefore`。用 `GET /threads/:id/messages?before=<nextBefore>&limit=60` 读取此前消息。保留无分页参数的旧快照接口。首次连接可先读取 `GET /events/latest`，载入所需快照，再用 `GET /events?after=<cursor>` 接收更新。断线可用最后接收的事件 ID 续读。
+`GET /threads/:id?messageLimit=60` 返回最新一页和 `nextBefore`。用 `GET /threads/:id/messages?before=<nextBefore>&limit=60` 读取此前消息。保留无分页参数的旧快照接口。首次连接可先读取 `GET /events/latest`，载入所需快照，再用 `GET /events?after=<cursor>` 接收更新。断线可用最后接收的事件 ID 续读。纯文本主聊可产生临时 `chat_delta`，完成后的正式答复从话题消息读取。

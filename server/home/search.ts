@@ -1,5 +1,6 @@
 import { fail, iso, projectAccess, one, now } from './common.ts'
 import type { Context, DB } from './common.ts'
+import { sharedRecordSql } from './visibility.ts'
 
 export function initSearch(db:DB) {
   db.exec(`
@@ -109,6 +110,7 @@ export function search(db:DB,ctx:Context) {
       LEFT JOIN sources s ON s.id=r.source_id AND (r.project_id IS NULL OR r.project_id IN (SELECT value FROM json_each(s.acl,'$.projects')))
       WHERE ($kind IS NULL OR $kind='record') AND r.forgotten=0
         AND ($owner OR r.project_id IN allowed_projects)
+        AND ($owner OR ${sharedRecordSql()})
         AND ($project IS NULL OR r.project_id=$project)
         AND (NOT $personal OR r.project_id IS NULL)
         AND ($from IS NULL OR r.updated_at >= $from) AND ($to IS NULL OR r.updated_at <= $to)
@@ -144,4 +146,31 @@ export function search(db:DB,ctx:Context) {
     })),
     nextCursor:last?Buffer.from(JSON.stringify([last.pinned,last.at,last.kind,last.id])).toString('base64url'):null
   }
+}
+
+export function memoryCandidates(db:DB,projectId:string|null,words:string[]){
+  const terms=words.map(word=>word.toLowerCase())
+  if(!terms.length)return []
+  const fts=terms.filter(term=>Array.from(term).length>=3)
+  const indexed=fts.length&&one(db,"SELECT 1 FROM sqlite_schema WHERE name='archive_search'")
+  const eligible=`r.project_id IS $project AND r.forgotten=0
+    AND r.kind IN ('note','preference','decision','requirement','conclusion') AND ($project IS NULL OR ${sharedRecordSql()})
+    AND COALESCE(json_extract(v.snapshot,'$.validFrom'),'') <= $now
+    AND COALESCE(json_extract(v.snapshot,'$.validUntil'),'9999') > $now`
+  const confirmed=`(COALESCE(json_extract(v.snapshot,'$.confirmationBy'),r.submitter) IN ('owner','server')
+    AND json_extract(v.snapshot,'$.confirmation') IN ('user','confirmed','observed'))`
+  const matches=indexed?`SELECT k.objectId FROM archive_search JOIN archive_search_keys k ON k.key=archive_search.rowid
+      WHERE k.kind='record' AND archive_search MATCH $fts`:'SELECT NULL WHERE 0'
+  const score=`SELECT sum(CASE WHEN instr(lower(COALESCE(json_extract(v.snapshot,'$.factKey'),'')),value)>0 THEN 4
+    WHEN instr(lower(json_extract(v.snapshot,'$.body')),value)>0 THEN 1 ELSE 0 END) FROM terms`
+  const bind={$project:projectId,$now:now(),$terms:JSON.stringify(terms),
+    ...(indexed?{$fts:fts.map(term=>'"'+term.replaceAll('"','""')+'"').join(' OR ')}:{})}
+  return db.prepare(`WITH terms AS (SELECT value FROM json_each($terms)), fts AS (${matches}),
+    ranked AS (SELECT r.*, v.snapshot,(${score}) AS score,${confirmed} AS trusted
+      FROM records r JOIN record_revisions v ON r.id=v.record_id AND r.revision=v.rev
+      WHERE ${eligible} ${indexed?`AND (r.id IN fts OR EXISTS(SELECT 1 FROM terms WHERE
+        length(value)<3 AND instr(lower(json_extract(v.snapshot,'$.body')),value)>0
+        OR instr(lower(COALESCE(json_extract(v.snapshot,'$.factKey'),'')),value)>0))`:''})
+    SELECT * FROM ranked WHERE score>0
+    ORDER BY trusted DESC,COALESCE(json_extract(snapshot,'$.extra.important'),0) DESC,score DESC,updated_at DESC,id DESC LIMIT 80`).all(bind)
 }

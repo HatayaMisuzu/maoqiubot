@@ -67,6 +67,11 @@ export function openDatabase(dir: string) {
       WHERE EXISTS(SELECT 1 FROM records r JOIN messages m ON m.taskId=r.task_id AND m.kind='review' AND m.role='user'
         WHERE r.id=v.record_id AND r.submitter='server' AND m.text=json_extract(v.snapshot,'$.body')
           AND json_extract(m.data,'$.runId')=json_extract(v.snapshot,'$.extra.runId'));
+    `),db=>db.exec(`
+      CREATE TABLE thread_context_resets(threadId TEXT PRIMARY KEY REFERENCES threads(id),
+        throughMessageId TEXT NOT NULL REFERENCES messages(id),version INTEGER NOT NULL DEFAULT 1);
+      CREATE INDEX msg_recovery_thread ON messages(threadId) WHERE kind='recovery';
+      CREATE INDEX chat_job_thread_status ON chat_jobs(threadId,status);
     `)])
     db.exec('UPDATE instances SET online=0')
     return db

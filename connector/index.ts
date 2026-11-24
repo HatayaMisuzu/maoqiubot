@@ -57,7 +57,13 @@ async function input(c:Command):Promise<Input> {
     writeFileSync(path,bytes,{mode:0o600})
     files.push({id,name,path,mime:file.contentType||'application/octet-stream'})
   }
-  return {text:String(c.payload.text??''),files}
+  const communication=c.payload.communication
+  const prefix=communication?'工作台通信 '+JSON.stringify({
+    from:communication.sender,to:communication.recipient,type:communication.type,taskId:c.taskId,runId:c.runId,
+    projectId:c.projectId??null,replyTo:communication.replyTo,sourceMessageId:communication.sourceMessageId,
+    userOriginal:communication.sender.kind==='user'&&communication.type==='user_message'
+  })+'\n\n':''
+  return {text:prefix+String(c.payload.text??''),files}
 }
 const helper=fileURLToPath(new URL('../scripts/project-api.ts',import.meta.url))
 function grant(c:Command,i:Input) {
@@ -75,6 +81,7 @@ function grant(c:Command,i:Input) {
     grantCleanups.add(cleanup)
     const permission=access.permission??'read'
     i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限（'+permission+'）。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。请勿读取或输出凭据文件内容。'
+    if(c.taskId)i.text+='\n与小毛球沟通可用同一个工具 POST /runs/'+encodeURIComponent(c.runId)+'/communication ，提交 kind（question、progress、blocked、handoff、delivery 或 request）、text 和唯一 requestId。工作台记录报告来源，报告不会直接触发其他 Bot 或用户验收。'
   } catch(e){cleanup();throw e}
   return cleanup
 }
@@ -98,7 +105,9 @@ async function handle(c:Command) {
       const runtimeKey=await runtimeIdentity(inst)
       const bound=store.binding(c,inst.config.workspaceRef,runtimeKey)
       if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
-      const sessionId=await adapter.open(bound)
+      const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
+      if(incoming&&(bound&&bound!==incoming||!inst.caps.sessionList||!adapter.importSession))throw Error('当前绑定或原生协议无法导入此会话')
+      const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
       store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
       const run:Run={command:c,sessionId,emit:(kind,data)=>emit(c,kind,data)}
       if(c.kind==='prepare'){
@@ -225,13 +234,17 @@ for(const instance of config.instances as Instance[]) {
   if(instances.has(instance.id)) throw new Error('实例 ID 重复')
   instance.workspaceRef=resolve(instance.workspaceRef)
   instance.profileId=instance.profileId??'default'
+  if(instance.adapterKey==='dsh'&&!isAbsolute(instance.command)&&/^dsh(?:\.cmd|\.exe)?$/i.test(instance.command)){
+    const configured=process.env.MAOQIU_DSH_EXECUTABLE
+    if(configured&&isAbsolute(configured)&&/^dsh(?:\.cmd|\.exe)?$/i.test(basename(configured)))instance.command=configured
+  }
   instances.set(instance.id,{config:instance,caps:offline()})
 }
 function connect(){
   if(stopping) return
   ws=new WebSocket(url,{headers:{Authorization:'Bearer '+token,'X-Node-Id':config.nodeId},maxPayload:4*1024*1024,handshakeTimeout:15000})
   ws.on('open',()=>{
-    send({type:'hello',nodeId:config.nodeId,instances:[...instances.values()].map(({config:i,caps,error})=>({
+    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,instances:[...instances.values()].map(({config:i,caps,error})=>({
       id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,...caps,error,online:!error}))})
     for(const row of store.db.prepare('SELECT event FROM outbox ORDER BY rowid').iterate()) send({type:'event',event:JSON.parse(String(row.event))})
     for(const row of store.db.prepare('SELECT c.id,c.status,c.detail FROM commands c LEFT JOIN receipt_acks a ON c.id=a.id WHERE c.status IS NOT a.status ORDER BY c.rowid').iterate()) send({type:'receipt',commandId:row.id,status:row.status,detail:row.detail})
@@ -240,6 +253,30 @@ function connect(){
     try{
       const frame=JSON.parse(bytes.toString())
       if(frame.type==='command') await handle(frame.command)
+      else if(frame.type==='list_sessions'&&typeof frame.id==='string'){
+        const entry=instances.get(frame.instanceId)
+        if(!entry?.caps.sessionList||!entry.adapter?.listSessions||entry.config.workspaceRef!==frame.workspaceRef||entry.config.profileId!==frame.profileId){
+          send({type:'sessions',id:frame.id,error:true});return
+        }
+        const socket=ws
+        try{
+          const result=await entry.adapter.listSessions(frame.cursor)
+          if(ws===socket)send({type:'sessions',id:frame.id,...result})
+        }catch{if(ws===socket)send({type:'sessions',id:frame.id,error:true})}
+      }
+      else if(frame.type==='inspect_command'&&typeof frame.commandId==='string'){
+        let saved=store.saved(frame.commandId)
+        if(!saved){send({type:'receipt_missing',commandId:frame.commandId});return}
+        const command:Command=JSON.parse(saved.body)
+        const entry=instances.get(command.instanceId)
+        if(saved.status==='uncertain'&&entry?.adapter&&!handling.has(command.id)){
+          await recover(entry)
+          saved=store.saved(command.id)!
+        }
+        for(const row of store.db.prepare("SELECT event FROM outbox WHERE json_extract(event,'$.commandId')=? ORDER BY rowid").all(command.id))
+          send({type:'event',event:JSON.parse(String(row.event))})
+        send({type:'receipt',commandId:command.id,status:saved.status,detail:saved.detail})
+      }
       else if(frame.type==='ack' && typeof frame.key==='string') store.db.prepare('DELETE FROM outbox WHERE key=?').run(frame.key)
       else if(frame.type==='receipt_ack' && typeof frame.commandId==='string' && typeof frame.status==='string')
         store.db.prepare('INSERT OR REPLACE INTO receipt_acks SELECT id,status FROM commands WHERE id=? AND status=?').run(frame.commandId,frame.status)

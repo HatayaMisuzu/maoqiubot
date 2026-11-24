@@ -101,10 +101,13 @@ async function openWorkDraft(id,refs){
 }
 function openHome(id,page){return go('#home'+(id?'?project='+url(id)+(page?'&page='+url(page):''):''))}
 window.addEventListener('hashchange',navigate);
-function scheduleRefresh(){
+let refreshLists=false;
+function scheduleRefresh(lists){
+  refreshLists||=lists;
   if(refreshTimer)return;
   refreshTimer=setTimeout(async()=>{refreshTimer=null;
-    try{await load();side();await refresh()}catch(e){if(e.status===401)unauthorized();else notice(e.message)}
+    const listsChanged=refreshLists;refreshLists=false;
+    try{if(listsChanged){await load();side()}await refresh()}catch(e){if(e.status===401)unauthorized();else notice(e.message)}
   },180);
 }
 async function subscribe(){
@@ -119,11 +122,13 @@ async function subscribe(){
         const frame=buffer.slice(0,match.index);buffer=buffer.slice(match.index+match[0].length);
         const lines=frame.split(/\r?\n/);const data=lines.filter(x=>x.startsWith('data:')).map(x=>x.slice(5).trimStart()).join('\n');
         if(!data)continue;const event=JSON.parse(data),id=Number(event.cursor||lines.find(x=>x.startsWith('id:'))?.slice(3));
+        if(event.kind==='chat_delta'){chats.preview(event);continue}
         if(Number.isSafeInteger(id)&&id>cursor)cursor=id;
-        if(['presence','thread'].includes(event.kind) ||
+        const listsChanged=['presence','thread'].includes(event.kind)||event.kind==='home'&&event.path==='/projects';
+        if(listsChanged ||
           (state.view==='home' && (event.kind==='home'||event.taskId)) ||
           (state.view==='chat' && event.threadId===state.thread) ||
-          event.taskId && state.snapshot?.linkedTasks?.[event.taskId])scheduleRefresh();
+          event.taskId && state.snapshot?.linkedTasks?.[event.taskId])scheduleRefresh(listsChanged);
       }
     }
   }catch(e){if(controller.signal.aborted)return}

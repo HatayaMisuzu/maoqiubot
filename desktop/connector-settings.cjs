@@ -1,6 +1,28 @@
 const { existsSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
-const { basename, isAbsolute, join, resolve } = require('node:path')
+const { basename, delimiter, isAbsolute, join, resolve } = require('node:path')
 const { randomUUID } = require('node:crypto')
+const officialNames = {
+  codex: /^codex(?:\.exe)?$/i,
+  dsh: /^dsh(?:\.exe|\.cmd)?$/i
+}
+function detectedCommand(adapterKey, command) {
+  if (!officialNames[adapterKey]?.test(basename(command))) return null
+  const names = adapterKey === 'dsh' && process.platform === 'win32' ? ['dsh.exe', 'dsh.cmd'] :
+    adapterKey === 'codex' && process.platform === 'win32' ? ['codex.exe'] : [adapterKey]
+  const pathDirs = (process.env.Path ?? process.env.PATH ?? '').split(delimiter)
+    .map(dir => dir.replace(/^"|"$/g, '')).filter(dir => isAbsolute(dir))
+  const installs = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA,'Programs')]
+    .filter(Boolean).map(dir => join(dir,'DeepSeekHarness','resources','runtime','cli','bin'))
+  const candidates = isAbsolute(command) ? [command] : [
+    ...(adapterKey === 'dsh' && process.env.MAOQIU_DSH_EXECUTABLE ? [process.env.MAOQIU_DSH_EXECUTABLE] : []),
+    ...[...pathDirs,...(adapterKey==='dsh'?installs:[])].flatMap(dir => names.map(name => join(dir,name)))
+  ]
+  for (const path of candidates) {
+    if (!isAbsolute(path) || !officialNames[adapterKey].test(basename(path))) continue
+    if (statSync(path,{throwIfNoEntry:false})?.isFile()) return path
+  }
+  return null
+}
 
 function connectorSettings({ root, workspace, dataDir }) {
   const override = process.env.MAOQIU_CONNECTOR_CONFIG
@@ -11,6 +33,8 @@ function connectorSettings({ root, workspace, dataDir }) {
   if (editable && !existsSync(file)) {
     const config = JSON.parse(readFileSync(join(root, 'connector', 'config.example.json'), 'utf8'))
     config.stateDir = join(dataDir, 'node-local')
+    for (const instance of config.instances) if (instance.adapterKey === 'dsh')
+      instance.command = detectedCommand('dsh','dsh') ?? (process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
     write(file, config)
   }
   return { file, editable, workspace }
@@ -34,7 +58,7 @@ function write(file, config) {
 
 function settingsView(settings) {
   const instances = configFrom(settings.file).instances.map(({ id, name, adapterKey, profileId, workspaceRef, command }) =>
-    ({ id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command }))
+    ({ id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, detectedCommand:detectedCommand(adapterKey,command) }))
   return { file: settings.file, editable: settings.editable, workspace: settings.workspace, instances }
 }
 
@@ -51,7 +75,7 @@ function saveInstance(settings, db, input) {
   }
   const id = required('id'), name = required('name'), profileId = required('profileId'), command = required('command')
   if (!/^[\w-]{1,64}$/.test(id) || id === 'main' || !/^[\w.-]{1,64}$/.test(profileId)) throw Error('请使用有效的实例 ID 和 profile 标识')
-  const basenamePattern = adapterKey === 'codex' ? /^codex(?:\.exe)?$/i : /^dsh(?:\.exe|\.cmd)?$/i
+  const basenamePattern = officialNames[adapterKey]
   if (!basenamePattern.test(basename(command)) || (!isAbsolute(command) && command !== basename(command))) {
     throw Error('请填写官方可执行程序名或完整路径')
   }

@@ -1,13 +1,19 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { homeApi } from '../home/index.ts'
 import { id, required, changed, fail, one, must, unpack } from '../db/index.ts'
-import { createThread, draftDelegate, delegate, sendInput, control, getThread, latestRun, messages, messagePage, hasRunArtifacts, taskView, reviewDelivery, modelView, selectModel, prepareModels } from '../tasks/index.ts'
+import { createThread, draftDelegate, delegate, sendInput, control, reconcileRun, reportCommunication, taskCommunications, getThread, latestRun, message, messages, messagePage, hasRunArtifacts, taskView, reviewDelivery, modelView, selectModel, prepareModels, importNativeSession } from '../tasks/index.ts'
 import { hash,secret } from './auth.ts'
 import { persona, savePersona } from '../chat/persona.ts'
+import { modelSettings, updateModelSettings } from '../chat/model-settings.ts'
+import { chatPolicy, saveChatPolicy } from '../chat/tools.ts'
 
 export function route(db:DatabaseSync,ctx:any){
   const {method,path,body:b,dataDir,principal,localRequest,query}=ctx
   const [,area,key,sub]=path.split('/')
+  if(area==='runs'&&key&&sub==='communication'&&method==='POST'){
+    if(!principal.runPermission||principal.id!=='run:'+key)fail('仅本运行的工作 Bot 可提交此通信',403)
+    return reportCommunication(db,dataDir,key,principal.projects[0],b)
+  }
   if(area==='projects'&&key&&sub==='workspaces'){
     if(!principal.owner)fail('仅所有者可配置执行工作区',403)
     must(db,'SELECT id FROM projects WHERE id=?',key)
@@ -43,9 +49,28 @@ export function route(db:DatabaseSync,ctx:any){
     if(!localRequest)fail('主聊人格限本机配置',403)
     return method==='GET'?persona(dataDir):savePersona(dataDir,b)
   }
+  if(['/chat/models','/chat/policy'].includes(path)&&['GET','POST'].includes(method)){
+    if(!localRequest)fail('主聊配置限本机所有者操作',403)
+    if(path==='/chat/models')return method==='GET'?modelSettings(dataDir):updateModelSettings(dataDir,b)
+    return method==='GET'?chatPolicy(dataDir):saveChatPolicy(dataDir,b)
+  }
+  if(path==='/chat/cancel'&&method==='POST'){
+    if(!localRequest)fail('主聊控制限本机',403)
+    const job=must(db,"SELECT * FROM chat_jobs WHERE messageId=? AND status IN ('queued','working')",required(b.messageId,'messageId'))
+    db.prepare("UPDATE chat_jobs SET status='cancelled' WHERE id=?").run(job.id)
+    const prior=one(db,`SELECT 1 FROM messages WHERE threadId=? AND kind='tool'
+      AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.ok')=1`,job.threadId,job.messageId)
+    message(db,job.threadId,'system','activity',prior?'已停止主聊生成。请查看本轮已执行的工具操作。':'已取消主聊生成。',{replyTo:job.messageId})
+    changed(db,'chat',{threadId:job.threadId,messageId:job.messageId,status:'cancelled'})
+    return {jobId:job.id,messageId:job.messageId,status:'cancelled'}
+  }
   function executionAccess(instanceId:string){
     const adapter=one(db,'SELECT adapterKey FROM instances WHERE id=?',instanceId)?.adapterKey
     if(!localRequest && (adapter==='codex'||instanceId==='main'))fail('个人 ChatGPT 登录只支持同机使用工作台',403)
+  }
+  if(area==='instances'&&key&&sub==='sessions'&&method==='POST'){
+    if(!localRequest)fail('外部会话导入限本机所有者',403)
+    return importNativeSession(db,dataDir,key,b)
   }
   if(path==='/grants'&&method==='POST'){
     const projectId=required(b.projectId,'projectId')
@@ -70,7 +95,12 @@ export function route(db:DatabaseSync,ctx:any){
       const taskData=thread.taskId?taskView(db,thread.taskId):{run:latestRun(db,key),commands:db.prepare('SELECT * FROM commands WHERE threadId=? ORDER BY rowid').all(key).map(c=>unpack(c,['payload']))}
       const page=query.has('messageLimit')?messagePage(db,key,null,query.get('messageLimit')):{messages:messages(db,key)}
       const submittedArtifacts=!!taskData.run&&hasRunArtifacts(db,key,taskData.run.id)
-      return {thread,...page,...taskData,submittedArtifacts,model:modelView(db,thread),cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
+      const settings=thread.instanceId==='main'?modelSettings(dataDir):null
+      const mainChat=settings?{
+        pending:db.prepare("SELECT messageId,status FROM chat_jobs WHERE threadId=? AND status IN ('queued','working') ORDER BY id").all(thread.id),
+        model:settings.models.find(m=>m.id===settings.activeId)?.name
+      }:undefined
+      return {thread,...page,...taskData,submittedArtifacts,mainChat,model:modelView(db,thread),cursor:one(db,'SELECT COALESCE(MAX(cursor),0) c FROM events').c}
     }
     if(sub==='messages'&&method==='GET')return messagePage(db,key,query.get('before'),query.get('limit'))
     if(sub==='messages'&&method==='POST'){executionAccess(thread.instanceId);return sendInput(db,dataDir,thread,b)}
@@ -82,7 +112,9 @@ export function route(db:DatabaseSync,ctx:any){
   if(path==='/tasks/draft'&&method==='POST'){executionAccess(required(b.instanceId,'instanceId'));return draftDelegate(db,dataDir,b)}
   if(path==='/tasks'&&method==='POST'){executionAccess(required(b.instanceId,'instanceId'));return delegate(db,dataDir,b)}
   if(area==='tasks'&&key&&sub==='review'&&method==='POST')return reviewDelivery(db,key,b)
+  if(area==='tasks'&&key&&sub==='communication'&&method==='GET')return taskCommunications(db,key)
   if(area==='tasks'&&key&&method==='GET')return taskView(db,key)
+  if(area==='runs'&&key&&sub==='recovery'&&method==='POST')return reconcileRun(db,key,b)
   if(area==='runs'&&key&&sub==='commands'&&method==='POST'){
     executionAccess(must(db,'SELECT instanceId FROM runs WHERE id=?',key).instanceId)
     return control(db,dataDir,key,b)

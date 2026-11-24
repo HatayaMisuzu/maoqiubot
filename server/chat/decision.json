@@ -8,7 +8,8 @@
         "delegate",
         "progress",
         "steer",
-        "cancel"
+        "cancel",
+        "tool"
       ]
     },
     "text": {
@@ -37,6 +38,12 @@
     },
     "summary": {
       "type": "string"
+    },
+    "tool": {
+      "type": "string"
+    },
+    "arguments": {
+      "type": "string"
     }
   },
   "required": [
@@ -47,7 +54,9 @@
     "goal",
     "constraints",
     "doneWhen",
-    "summary"
+    "summary",
+    "tool",
+    "arguments"
   ],
   "additionalProperties": false
 }

@@ -30,7 +30,7 @@ for await (const line of createInterface({input:process.stdin})) {
     setTimeout(()=>reply(config(params.value)),800)
   }
   if(method==='session/prompt') {
-    const text=params.prompt[0].text
+    const text=params.prompt[0].text.replace(/^工作台通信 [^\n]*\n\n/,'')
     log('prompt',params.sessionId,text)
     if(text==='wait-for-cancel') {turn={id,sessionId:params.sessionId};continue}
     write({method:'session/update',params:{sessionId:params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'original output'}}}})

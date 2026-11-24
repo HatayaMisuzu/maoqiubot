@@ -2,14 +2,15 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import type { DatabaseSync } from 'node:sqlite'
 import { transaction, changed, now, required, one, must, fail } from '../db/index.ts'
-import { applyEvent, addProjectContext, checkQueuedInput } from '../tasks/index.ts'
-import type { NodeCommand } from '../../contracts/node.ts'
+import { applyEvent, addProjectContext, checkQueuedInput, markUncertain } from '../tasks/index.ts'
+import type { NativeSession, NodeCommand } from '../../contracts/node.ts'
 import { secret,hash } from './auth.ts'
 import { isLocal } from './local.ts'
 
 export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined){
   const wss=new WebSocketServer({noServer:true,maxPayload:4*1024*1024})
-  const online=new Map<string,{ws:WebSocket,sent:Set<string>,alive:boolean,instances:Set<string>}>()
+  const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,alive:boolean,instances:Set<string>}>()
+  const catalogs=new Map<string,{ws:WebSocket; respond:(frame:any)=>void}>()
   server.on('upgrade',(req,socket,head)=>{
     const nodeId=authenticate((req.headers.authorization??'').replace(/^Bearer /,''))
     if(!nodeId || req.url?.split('?')[0]!=='/api/v1/node'){socket.destroy();return}
@@ -37,7 +38,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                 if(key==='main'|| (old && (old.nodeId!==nodeId || old.workspaceRef!==i.workspaceRef || old.adapterKey!==i.adapterKey || old.profileId!==profileId))) fail('实例绑定冲突，请用新实例 ID')
                 if(!Array.isArray(i.availableActions)) fail('缺少实例能力')
                 const blocked=i.adapterKey==='codex'&&!isLocal(req)
-                const caps={version:i.version,resume:i.resume,history:i.history,error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
+                const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
                 db.prepare('INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,availableActions=excluded.availableActions,lastSeen=excluded.lastSeen,online=excluded.online,capabilities=excluded.capabilities').run(key,nodeId,required(i.name,'name'),required(i.adapterKey,'adapterKey'),required(i.workspaceRef,'workspaceRef'),JSON.stringify(i.availableActions),now(),blocked||i.online===false?0:1,JSON.stringify(caps),profileId)
               }
               changed(db,'presence',{nodeId,online:true})
@@ -45,7 +46,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
             registered=true
             const previous=online.get(nodeId)
             const ids=db.prepare('SELECT id FROM instances WHERE nodeId=? AND online=1').all(nodeId).map(r=>String(r.id))
-            online.set(nodeId,{ws,sent:new Set(),alive:true,instances:new Set(ids)})
+            online.set(nodeId,{ws,sent:new Set(),lookups:new Map(),missing:new Set(),receiptLookup:m.receiptLookup===true,alive:true,instances:new Set(ids)})
             previous?.ws.terminate()
             flush()
             return
@@ -54,24 +55,28 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           if(m.type==='event'){
             transaction(db,()=>applyEvent(db,nodeId,m.event))
             ws.send(JSON.stringify({type:'ack',key:m.event.key}))
+          }else if(m.type==='sessions'){
+            const request=catalogs.get(m.id)
+            if(request?.ws===ws)request.respond(m)
+          }else if(m.type==='receipt_missing'){
+            const link=online.get(nodeId)!
+            if(link.lookups.delete(m.commandId))link.missing.add(m.commandId)
           }else if(m.type==='receipt'){
+            const link=online.get(nodeId)!
+            if(link.lookups.delete(m.commandId))link.sent.add(m.commandId)
             transaction(db,()=>{
               const c=must(db,'SELECT c.* FROM commands c JOIN instances i ON c.instanceId=i.id WHERE c.id=? AND i.nodeId=?',m.commandId,nodeId)
               if(!['received','done','uncertain','failed'].includes(m.status))fail('无效回执')
               if(['done','failed','withdrawn'].includes(c.status)||m.status===c.status||c.status==='uncertain'&&m.status==='received')return
               db.prepare('UPDATE commands SET status=?,detail=? WHERE id=?').run(m.status,m.detail?String(m.detail):null,c.id)
-              if(['run','prepare'].includes(c.kind) && m.status==='uncertain'){
-                db.prepare("UPDATE runs SET status='uncertain',pendingRequest=NULL WHERE id=? AND status IN ('queued','running','waiting_input','cancelling')").run(c.runId)
-                db.prepare("UPDATE tasks SET status='uncertain' WHERE id=? AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status='uncertain')").run(c.taskId,c.runId)
-                db.prepare("UPDATE commands SET status='held' WHERE runId=? AND status='waiting' AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status='uncertain')").run(c.runId,c.runId)
-                db.prepare('DELETE FROM run_grants WHERE runId=?').run(c.runId)
-              }
+              if(['run','prepare'].includes(c.kind) && m.status==='uncertain')markUncertain(db,c,m.detail?'原生运行待核对：'+String(m.detail).slice(0,1200):'原生运行待核对')
               if(m.status==='done' && c.kind==='answer') {
                 db.prepare("UPDATE runs SET status=CASE WHEN status='waiting_input' THEN 'running' ELSE status END,pendingRequest=NULL WHERE id=? AND status IN ('waiting_input','cancelling') AND json_extract(pendingRequest,'$.requestId')=?").run(c.runId,JSON.parse(c.payload).requestId)
                 db.prepare("UPDATE tasks SET status='running' WHERE id=? AND status='waiting_input' AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status='running')").run(c.taskId,c.runId)
               }
               if(m.status==='failed' && c.kind==='cancel'){
-                const run=db.prepare("UPDATE runs SET status=CASE WHEN pendingRequest IS NOT NULL THEN 'waiting_input' ELSE 'running' END WHERE id=? AND status='cancelling' RETURNING status").get(c.runId)
+                const prior=JSON.parse(c.payload).priorStatus==='uncertain'?'uncertain':'running'
+                const run=db.prepare("UPDATE runs SET status=CASE WHEN pendingRequest IS NOT NULL THEN 'waiting_input' ELSE ? END WHERE id=? AND status='cancelling' RETURNING status").get(prior,c.runId)
                 if(run)db.prepare('UPDATE tasks SET status=? WHERE id=?').run(run.status,c.taskId)
               }
               changed(db,'receipt',{threadId:c.threadId,runId:c.runId,commandId:c.id,status:m.status})
@@ -89,19 +94,84 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     for(const c of online.values()){if(!c.alive)c.ws.terminate();else{c.alive=false;c.ws.ping()}}
   },30000)
   timer.unref()
+  function reject(c:any,detail:string){
+    const uncertain=c.status!=='queued'
+    db.prepare("UPDATE commands SET status=?,detail=? WHERE id=?").run(uncertain?'uncertain':'failed',detail,c.id)
+    if(uncertain && ['run','prepare','steer'].includes(c.kind))markUncertain(db,c,detail)
+    else if(!uncertain&&['run','prepare'].includes(c.kind)){
+      db.prepare("UPDATE runs SET status='blocked',pendingRequest=NULL WHERE id=?").run(c.runId)
+      db.prepare("UPDATE tasks SET status='blocked' WHERE id=?").run(c.taskId)
+      db.prepare("UPDATE commands SET status='held' WHERE runId=? AND status='waiting'").run(c.runId)
+      db.prepare('DELETE FROM run_grants WHERE runId=?').run(c.runId)
+    }
+    changed(db,'receipt',{threadId:c.threadId,runId:c.runId,commandId:c.id,status:uncertain?'uncertain':'failed'})
+  }
+  function freeze(c:any):NodeCommand{
+    const {dispatch:previous,attachmentIds,modelId,requestId,choice,text,inputText,communication,importSessionId,...rest}=JSON.parse(c.payload)
+    const input=['run','steer','prepare'].includes(c.kind)
+    const projectRun=c.kind==='run'&&c.projectId
+    const binding=projectRun?one(db,'SELECT agentPermission FROM project_workspaces WHERE projectId=? AND instanceId=? AND allowAgentAccess=1',c.projectId,c.instanceId)?.agentPermission??null:null
+    if(input)checkQueuedInput(db,c,{...rest,attachmentIds})
+    if(c.status!=='queued'&&!previous)fail('旧版本发送记录缺少冻结材料，需人工核对',409)
+    if(previous&&['run','prepare'].includes(c.kind)&&
+      (c.runStatus!=='queued'||c.nativeRunId||c.sessionId!==previous.sessionId))
+      fail('工作台已有原生会话或运行回执，停止重发并核对节点记录',409)
+    if(previous && previous.binding!==binding)fail('实例资料授权已变化，停止重发',409)
+    const fullText=binding?addProjectContext(db,c,text??'',!previous):text
+    if(previous && previous.text!==fullText)fail('已发送的项目上下文发生变化，停止重发',409)
+    const dispatch=previous??{sessionId:c.sessionId,nativeRunId:c.nativeRunId,text:fullText,binding}
+    let grant=binding&&one(db,'SELECT token,projectId,permission FROM run_grants WHERE runId=? AND expiresAt>? AND permission=?',c.runId,now(),binding)
+    if(binding&&!grant){
+      if(previous)fail('原运行令牌已过期或撤销，停止重发',409)
+      const token=secret(),expiresAt=new Date(Date.now()+24*3600000).toISOString()
+      db.prepare('INSERT INTO run_grants(runId,tokenHash,token,projectId,instanceId,expiresAt,permission) VALUES(?,?,?,?,?,?,?)')
+        .run(c.runId,hash(token),token,c.projectId,c.instanceId,expiresAt,binding)
+      grant={token,projectId:c.projectId,permission:binding}
+    }
+    if(!previous)db.prepare("UPDATE commands SET payload=json_set(payload,'$.dispatch',json(?)),status='sent' WHERE id=?")
+      .run(JSON.stringify(dispatch),c.id)
+    return {id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,projectId:c.projectId,
+      profileId:c.profileId,workspaceRef:c.workspaceRef,kind:c.kind,payload:{text:dispatch.text,sessionId:dispatch.sessionId,nativeRunId:dispatch.nativeRunId,
+        attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,communication,importSessionId,...(grant?{homeAccess:grant}:{})}}
+  }
   function flush(){
     for(const [nodeId,link] of online){
       if(link.ws.readyState!==WebSocket.OPEN) continue
-      const rows=db.prepare(`SELECT c.*,t.sessionId,t.projectId,r.nativeRunId,i.adapterKey,i.profileId,i.workspaceRef FROM commands c JOIN instances i ON i.id=c.instanceId JOIN threads t ON t.id=c.threadId JOIN runs r ON r.id=c.runId
-        WHERE i.nodeId=? AND c.status IN ('queued','sent','received') AND r.status NOT IN ('completed','cancelled','blocked','failed','uncertain')
+      const rows=db.prepare(`SELECT c.*,t.sessionId,t.projectId,r.nativeRunId,r.status AS runStatus,i.adapterKey,i.profileId,i.workspaceRef FROM commands c JOIN instances i ON i.id=c.instanceId JOIN threads t ON t.id=c.threadId JOIN runs r ON r.id=c.runId
+        WHERE i.nodeId=? AND (c.status IN ('queued','sent','received') OR c.status='uncertain' AND c.kind IN ('run','prepare'))
+          AND (r.status NOT IN ('completed','cancelled','blocked','failed','uncertain') OR r.status='uncertain' AND c.kind IN ('run','prepare','cancel'))
         ORDER BY c.rowid`).all(nodeId) as any[]
       const activeIds=new Set(rows.map(c=>c.id))
       for(const id of link.sent)if(!activeIds.has(id))link.sent.delete(id)
+      for(const id of link.lookups.keys())if(!activeIds.has(id))link.lookups.delete(id)
+      for(const id of link.missing)if(!activeIds.has(id))link.missing.delete(id)
       const pending=new Set<string>()
       for(const c of rows){
-        if(!link.instances.has(c.instanceId)||pending.has(c.threadId))continue
-        if(c.status!=='received')pending.add(c.threadId)
+        if(!link.instances.has(c.instanceId)||pending.has(c.threadId)&&c.kind!=='cancel')continue
+        if(c.status==='queued')pending.add(c.threadId)
         if(link.sent.has(c.id))continue
+        const fresh=one(db,'SELECT c.status,r.status AS runStatus FROM commands c JOIN runs r ON r.id=c.runId WHERE c.id=?',c.id)
+        if(fresh?.status!==c.status||fresh?.runStatus!==c.runStatus)continue
+        if(c.status!=='queued'){
+          const at=link.lookups.get(c.id)
+          if(!link.missing.delete(c.id)){
+            if(link.receiptLookup && at===undefined){
+              link.lookups.set(c.id,Date.now())
+              link.ws.send(JSON.stringify({type:'inspect_command',commandId:c.id}))
+              continue
+            }
+            if(at!==undefined&&Date.now()-at<10000)continue
+            link.lookups.delete(c.id)
+            link.sent.add(c.id)
+            if(c.status!=='uncertain')transaction(db,()=>reject(c,'节点没有可核对的持久回执，已停止重发'))
+            continue
+          }
+          if(c.status!=='sent'||c.runStatus==='uncertain'&&c.kind!=='cancel'){
+            link.sent.add(c.id)
+            if(c.status!=='uncertain')transaction(db,()=>reject(c,'节点缺少此前已接收的命令记录，需人工核对'))
+            continue
+          }
+        }
         if(!['run','prepare'].includes(c.kind)&&!c.nativeRunId){
           // ACP controls address the session. A session binding can predate prompt submission.
           const ready=c.adapterKey==='dsh'&&c.sessionId&&one(db,`SELECT 1 FROM messages
@@ -109,45 +179,49 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
               AND json_extract(data,'$.controlReady')=1 LIMIT 1`,c.threadId,c.runId)
           if(!ready)continue
         }
-        const command:NodeCommand={id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,projectId:c.projectId,profileId:c.profileId,workspaceRef:c.workspaceRef,kind:c.kind,payload:{...JSON.parse(c.payload),sessionId:c.sessionId,nativeRunId:c.nativeRunId}}
-        if(c.projectId&&c.status==='queued'&&['run','steer','prepare'].includes(c.kind)){
-          try{checkQueuedInput(db,c,command.payload)}
-          catch(e){
-            if(!(e as {status?:number}).status)throw e
-            const detail=(e as Error).message
-            transaction(db,()=>{
-              db.prepare("UPDATE commands SET status='failed',detail=? WHERE id=?").run(detail,c.id)
-              if(c.kind!=='steer'){
-                db.prepare("UPDATE runs SET status='blocked' WHERE id=?").run(c.runId)
-                db.prepare("UPDATE tasks SET status='blocked' WHERE id=?").run(c.taskId)
-                db.prepare("UPDATE commands SET status='held' WHERE runId=? AND status='waiting'").run(c.runId)
-                db.prepare('DELETE FROM run_grants WHERE runId=?').run(c.runId)
-              }
-              changed(db,'receipt',{threadId:c.threadId,runId:c.runId,commandId:c.id,status:'failed'})
-            })
-            continue
-          }
+        try {
+          const command=transaction(db,()=>freeze(c))
+          link.sent.add(c.id)
+          link.ws.send(JSON.stringify({type:'command',command}),err=>{if(err)link.ws.terminate()})
+        }catch(e){
+          const detail=(e as {status?:number,message:string}).status?(e as Error).message:'命令材料或发送快照无效，请重新提交'
+          transaction(db,()=>reject(c,detail))
         }
-        if(c.kind==='run' && c.projectId){
-          const binding=one(db,'SELECT agentPermission FROM project_workspaces WHERE projectId=? AND instanceId=? AND allowAgentAccess=1',c.projectId,c.instanceId)
-          let grant=binding&&one(db,'SELECT token,projectId,permission FROM run_grants WHERE runId=? AND expiresAt>? AND permission=?',c.runId,now(),binding.agentPermission)
-          if(binding&&!grant&&c.status==='queued'){
-            const token=secret(),expiresAt=new Date(Date.now()+24*3600000).toISOString()
-            db.prepare('INSERT INTO run_grants(runId,tokenHash,token,projectId,instanceId,expiresAt,permission) VALUES(?,?,?,?,?,?,?)').run(c.runId,hash(token),token,c.projectId,c.instanceId,expiresAt,binding.agentPermission)
-            grant={token,projectId:c.projectId,permission:binding.agentPermission}
-          }
-          if(grant){
-            command.payload.homeAccess=grant
-            command.payload.text=addProjectContext(db,c,command.payload.text??'')
-          }
-        }
-        link.sent.add(c.id)
-        db.prepare("UPDATE commands SET status='sent' WHERE id=? AND status='queued'").run(c.id)
-        link.ws.send(JSON.stringify({type:'command',command}),err=>{if(err)link.ws.terminate()})
       }
     }
   }
-  return {flush,close(){
+  function listSessions(inst:any,cursor:string|null){
+    const link=online.get(inst.nodeId)
+    if(!link?.instances.has(inst.id)||link.ws.readyState!==WebSocket.OPEN)fail('原生节点离线',409)
+    const {ws}=link
+    if(catalogs.size>=10)fail('读取原生会话的请求过多，请稍后重试',429)
+    return new Promise<{items:NativeSession[];nextCursor:string|null}>((resolve,reject)=>{
+      const id=secret()
+      function cleanup(){catalogs.delete(id);clearTimeout(timeout);ws.off('close',disconnected)}
+      function error(text:string){cleanup();reject(Object.assign(Error(text),{status:502}))}
+      const disconnected=()=>error('读取原生会话时节点断开')
+      const timeout=setTimeout(()=>error('读取原生会话超时'),6500)
+      ws.once('close',disconnected)
+      catalogs.set(id,{ws,respond(frame){
+        if(frame.error||!Array.isArray(frame.items)){error('原生实例无法返回当前工作区的会话');return}
+        cleanup()
+        const items=frame.items.slice(0,35).filter((item:any)=>typeof item?.id==='string'&&/^[\w-]{1,128}$/.test(item.id))
+          .map((item:any)=>({id:item.id,title:String(item.title??'').slice(0,140),updatedAt:Number(item.updatedAt)||0,active:item.active===true}))
+        resolve({items,nextCursor:typeof frame.nextCursor==='string'&&frame.nextCursor.length<=2000?frame.nextCursor:null})
+      }})
+      ws.send(JSON.stringify({type:'list_sessions',id,instanceId:inst.id,workspaceRef:inst.workspaceRef,profileId:inst.profileId,cursor:cursor??undefined}),
+        failure=>{if(failure)error('原生节点未能接收会话查询')})
+    })
+  }
+  return {flush,listSessions,inspect(runId:string){
+    for(const command of db.prepare(`SELECT c.id,i.nodeId FROM commands c JOIN instances i ON i.id=c.instanceId
+      WHERE c.runId=? AND c.status IN ('sent','received','uncertain')`).all(runId)){
+      const link=online.get(String(command.nodeId)),id=String(command.id)
+      link?.sent.delete(id)
+      link?.lookups.delete(id)
+    }
+    flush()
+  },close(){
     clearInterval(timer)
     online.clear()
     for(const ws of wss.clients)ws.terminate()

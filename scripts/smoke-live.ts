@@ -1,11 +1,13 @@
 import { startServer } from '../server/index.ts'
 import { once } from 'node:events'
-import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync } from 'node:fs'
+import { mkdtempSync,mkdirSync,writeFileSync,readFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
+import { Codex } from '../connector/adapters/codex.ts'
 
 const temp=mkdtempSync(join(tmpdir(),'maoqiu-live-')), workspace=join(temp,'workspace')
 mkdirSync(workspace)
@@ -20,6 +22,7 @@ const file=join(temp,'node.json')
 writeFileSync(file,JSON.stringify(config))
 const child=spawn(process.execPath,['connector/index.ts',file],{env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local},stdio:['ignore','inherit','inherit','ipc'],windowsHide:true})
 const exit=once(child,'exit')
+const closed=once(child,'close')
 async function api(path:string,body?:any){
   const res=await fetch(url+'/api/v1'+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'},body:body?JSON.stringify({...body,requestId:crypto.randomUUID()}):undefined})
   const data:any=await res.json()
@@ -45,9 +48,11 @@ try{
   await api('/threads/'+t.id+'/messages',{text:'请实际派活，明确委派给 codex-local。在工作话题只回复 MAOQIU_WORKER_OK，无需调用任何工具，不读写文件。'})
   const card=await wait('主聊真实委派',async()=>{
     const s=await api('/threads/'+t.id)
+    const card=s.messages.find((m:any)=>m.kind==='task_card')
+    if(card)return card
     const err=s.messages.find((m:any)=>m.kind==='error'||m.role==='assistant'&&m.kind==='message')
     if(err)throw Error('主聊没有产生委派：'+err.text)
-    return s.messages.find((m:any)=>m.kind==='task_card')
+    return null
   })
   const task=(await api('/tasks/'+card.taskId)).task, path='/threads/'+task.workThreadId
   console.log('主聊已生成任务卡，等待 Codex 原生回帖')
@@ -71,9 +76,14 @@ try{
   await api('/threads/'+follow.id+'/messages',{text:'请只读查询刚才派给 codex-local 的任务当前进度，在这个新话题回报已有结果。'})
   const update=await wait('新话题查询旧任务',async()=>{
     const s=await api('/threads/'+follow.id)
-    const error=s.messages.find((m:any)=>m.kind==='error'||m.kind==='task_card'||m.role==='assistant'&&m.kind==='message')
+    const error=s.messages.find((m:any)=>m.kind==='error'||m.kind==='task_card')
     if(error)throw Error('主聊未返回已有任务状态：'+error.text)
-    return s.messages.find((m:any)=>m.kind==='task_update')
+    const update=s.messages.find((m:any)=>m.kind==='task_update')
+    if(update)return update
+    const lookup=s.messages.find((m:any)=>m.kind==='tool'&&m.data.tool==='task_progress'&&m.data.ok&&m.data.resultId===card.taskId)
+    const reply=s.messages.find((m:any)=>m.role==='assistant'&&m.kind==='message')
+    if(reply&&!lookup)throw Error('主聊没有查询实际任务：'+reply.text)
+    return lookup&&reply?{...reply,taskId:lookup.data.resultId}:null
   })
   assert.equal(update.taskId,card.taskId)
   assert.ok(update.text.includes('MAOQIU_FOLLOWUP_OK'))
@@ -81,11 +91,32 @@ try{
   const timeline=await api('/projects/'+p.id+'/timeline')
   assert.ok(timeline.items.find((r:any)=>r.body.includes('MAOQIU_FOLLOWUP_OK')))
   console.log('已验证同一原生线程的两个 turn、三次只读查看、新话题查询旧任务和项目结果')
+  const registered=(await api('/instances')).find((i:any)=>i.id==='codex-local')
+  if(!registered.capabilities.sessionList)throw Error('本机 Codex 未声明可核对的会话目录')
+  const existing=await wait('读取本次原生会话',async()=>{
+    const catalog=await api('/instances/codex-local/sessions?projectId='+p.id)
+    return catalog.items.find((item:any)=>item.id===second.thread.sessionId)
+  })
+  const duplicate=await api('/instances/codex-local/sessions',{projectId:p.id,sessionId:existing.id})
+  assert.equal(duplicate.thread.id,second.thread.id)
+  child.disconnect()
+  await Promise.race([exit,sleep(4000)])
+  assert.notEqual(child.exitCode,null,'原导入前须释放该线程的写入客户端')
+  const independent=new Codex(config.instances[0])
+  const nativeClosed=once(independent.rpc.process,'close')
+  try{
+    assert.equal((await independent.probe()).sessionList,true)
+    assert.equal(await independent.importSession(existing.id),existing.id)
+  }finally{
+    independent.close()
+    await Promise.race([nativeClosed,sleep(2500)]).catch(()=>{})
+  }
+  console.log('已验证官方 Codex 会话目录、独立原生进程核对并接续会话、工作台重复导入指向原话题')
 }finally{
   if(child.connected)child.disconnect()
-  await Promise.race([exit,sleep(2500)])
+  await Promise.race([closed,sleep(2500)])
   if(child.exitCode===null)child.kill()
   await app.close()
-  try{rmSync(temp,{recursive:true,force:true,maxRetries:4,retryDelay:200})}
+  try{await rm(temp,{recursive:true,force:true,maxRetries:5,retryDelay:200})}
   catch(e){console.warn('临时验收目录仍被原生进程占用',temp,(e as Error).message)}
 }

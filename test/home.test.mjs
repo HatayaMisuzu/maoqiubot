@@ -148,11 +148,24 @@ test('项目空间校验引用范围，撤回资料后保留布局和条目并�
   const block=readPage().blocks.find(b=>b.id==='source-card');
   assert.equal(block.config.sourceId,undefined);
   assert.deepEqual(block.actions,[]);
-  assert.equal(api('GET','/records/'+record.id,{},reader).sourceId,null);
+  assert.throws(()=>api('GET','/records/'+record.id,{},reader),{status:404});
+  assert.equal(api('GET','/projects/'+p.id+'/brief',{},reader).records.some(item=>item.id===record.id),false);
+  assert.equal(api('GET','/search?q=保留结论',{},reader).items.length,0);
+  assert.deepEqual(api('GET',url,{},reader).items[0].values,{title:'观测',attachment:[]});
+  assert.throws(()=>api('PATCH','/records/'+record.id,{expectedRevision:1,independentKnowledge:true}),{status:400});
+  api('PATCH','/records/'+record.id,{expectedRevision:1,independentKnowledge:true,confirmation:'user'});
+  const independent=api('GET','/records/'+record.id+'?history=1',{},reader);
+  assert.equal(independent.sourceId,null);
+  assert.deepEqual(independent.history.map(item=>item.revision),[2]);
   assert.equal(api('GET','/projects/'+p.id+'/brief',{},reader).records[0].body,'保留结论');
+  assert.equal(api('GET','/search?q=保留结论',{},reader).items[0].id,record.id);
   assert.equal(api('GET','/search?sourceId='+sourceId,{},reader).items.length,0);
+  assert.equal(api('GET',url,{},reader).items[0].values.record,record.id);
+  api('PATCH','/records/'+record.id,{expectedRevision:2,shareDerived:false});
+  assert.throws(()=>api('GET','/records/'+record.id,{},reader),{status:404});
+  assert.equal(api('GET','/search?q=保留结论',{},reader).items.length,0);
 
-  api('DELETE','/records/'+record.id,{expectedRevision:1});
+  api('DELETE','/records/'+record.id,{expectedRevision:3});
   const values=api('GET',url,{},reader).items[0].values;
   assert.deepEqual(values,{title:'观测',attachment:[]});
   assert.throws(()=>api('PATCH',url+'/'+e.id,{expectedRevision:0,values:{title:'旧版本'}},reader),e=>e.status===409 && JSON.stringify(e.current.values)===JSON.stringify(values));
@@ -189,6 +202,30 @@ test('项目接手简报展示验收证据和剩余条件',t=>{
   addTaskRecord(db,p.id,'task-1','result','下一轮待核验',{runId:'run-2',status:'awaiting_review'});
   assert.equal(brief().latestWork[0].extra.artifacts,undefined);
 });
+
+test('撤回项目资料沿记录引用传递，独立确认可切断依赖',t=>{
+  const {api,project:p}=setup(t)
+  const reader={id:'reader',owner:false,projects:[p.id]}
+  const path='/projects/'+p.id
+  const {sourceId,records:[origin]}=api('POST','/submissions',{
+    projectId:p.id,source:{title:'项目原件'},records:[{body:'原件结论'}]
+  })
+  const first=api('POST',path+'/records',{type:'conclusion',body:'首层结论',refs:[origin.id]})
+  const second=api('POST',path+'/records',{type:'handoff',body:'待交接结论',
+    extra:{refs:[{type:'record',id:first.id}]}})
+  const pathToRecord='/records/'+second.id
+  api('PATCH','/records/'+first.id,{expectedRevision:1,refs:[origin.id,second.id]})
+  assert.equal(api('GET',pathToRecord,{},reader).id,second.id)
+  api('PATCH','/sources/'+sourceId,{projectIds:[]})
+  assert.throws(()=>api('GET',pathToRecord,{},reader),{status:404})
+  assert.equal(api('GET','/search?q=待交接结论',{},reader).items.length,0)
+  assert.equal(api('GET',path+'/brief',{},reader).handoffs.some(item=>item.id===second.id),false)
+  assert.equal(api('GET',pathToRecord).id,second.id)
+  api('PATCH','/records/'+first.id,{expectedRevision:2,independentKnowledge:true,confirmation:'user'})
+  assert.equal(api('GET',pathToRecord,{},reader).id,second.id)
+  api('PATCH','/records/'+first.id,{expectedRevision:3,shareDerived:false})
+  assert.throws(()=>api('GET',pathToRecord,{},reader),{status:404})
+})
 
 test('公共 HTTP 链路：两端用邀请令牌接手，重试不重复写档，访问范围变更即时生效',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'xiaomaoqiu-home-http-'));

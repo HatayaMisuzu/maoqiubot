@@ -27,7 +27,15 @@ export function iconBtn(label,fn,symbol) {
   const b=btn('',fn,'icon-btn',symbol);b.title=label;b.setAttribute('aria-label',label);return b;
 }
 let noticeTimer;
-export function notice(msg){const n=$('notice');n.textContent=msg;n.hidden=false;clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>n.hidden=true,6000)}
+export function notice(msg){
+  const dialog=$('dialog');
+  let n=dialog?.open?dialog.querySelector('.dialog-notice'):$('notice');
+  if(!n){
+    n=el('p','dialog-notice muted');n.setAttribute('role','status');
+    dialog.querySelector('h2')?.after(n);
+  }
+  n.textContent=msg;n.hidden=false;clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>n.hidden=true,6000);
+}
 export function headers(){const token=sessionStorage.getItem('mao-token');return token?{Authorization:'Bearer '+token}:{}}
 export async function api(path,body,method=body?'POST':'GET') {
   const response=await fetch('/api/v1'+path,{method,headers:{...headers(),...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify({requestId:crypto.randomUUID(),...body}):undefined});

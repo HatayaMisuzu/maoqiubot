@@ -36,6 +36,7 @@ export async function desktopSettings(){
       const status=registered?.online?'在线 · 已握手':registered?.capabilities?.error||'离线 · 等待登记';
       return el('div','record',el('strong','',instance.name),el('p','muted',status),
         el('small','muted',[instance.id,instance.profileId,instance.workspaceRef].join(' · ')),
+        el('p','muted',instance.detectedCommand||'未检测到已配置的官方可执行文件，可手填绝对路径。'),
         settings.editable?el('div','actions',btn('编辑配置',()=>instanceForm(settings,instance),'ghost'),
           btn('复制为新实例',()=>instanceForm(settings,instance,true),'ghost')):null);
     }));
