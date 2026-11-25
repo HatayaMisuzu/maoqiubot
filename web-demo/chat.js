@@ -1,4 +1,4 @@
-import {$,el,api,at,btn,iconBtn,phase,form,upload,download,notice,state,url} from './lib.js';
+import {$,el,api,at,banner,btn,iconBtn,phase,form,upload,download,notice,state,url} from './lib.js';
 import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
 import {daily,mainModels,mainPermissions,memories} from './main-settings.js';
 import {extensions} from './extensions.js';
@@ -363,6 +363,20 @@ export const chat = actions=>{
         btn('撤回',async()=>{await controls(commandRun,{kind:'withdraw',commandId:cmd.id});await actions.refresh()},'ghost'))))}
     return root;
   }
+  function chatSettings(thread){
+    const dialog=$('dialog');
+    const entries=[
+      ['主聊模型','chat',()=>mainModels(actions.refresh)],
+      ['主聊权限','key',mainPermissions],
+      ['主聊人格','edit',editPersona],
+      ['插件与 Skill','layers',extensions],
+      ...(thread?[['记忆候选','file',()=>memories(thread.id)],['事项提醒','task',()=>daily(thread.id)]]:[])
+    ];
+    dialog.replaceChildren(el('h2','','对话设置'),el('div','settings-list',
+      ...entries.map(([label,symbol,run])=>btn(label,run,'settings-row',symbol))),
+      el('div','dialog-foot',btn('关闭',()=>dialog.close(),'secondary')));
+    dialog.showModal();
+  }
   function drawContent(){
     const snap=state.snapshot, content=$('content'), prev=content.scrollTop, nearBottom=content.scrollHeight-content.clientHeight-prev<60;
     const isNew=content.dataset.topic!==draftKey();content.dataset.topic=draftKey();
@@ -370,15 +384,12 @@ export const chat = actions=>{
     $('heading').textContent=t?.title||agent?.name||'小毛球';
     $('subhead').textContent=[t?.projectId&&state.projects.find(p=>p.id===t.projectId)?.name,snap?.mainChat?.model,agent&&agent.id!=='main'?(agent.online?'节点在线':'节点离线'):null].filter(Boolean).join(' · ');
     const model=modelPicker(snap,agent);
-    $('tools').replaceChildren(...(main()?[btn('主聊模型',()=>mainModels(actions.refresh),'ghost'),
-      btn('主聊权限',mainPermissions,'ghost'),btn('主聊人格',editPersona,'ghost'),btn('插件与 Skill',extensions,'ghost'),
-      ...(t?[btn('记忆候选',()=>memories(t.id),'ghost'),btn('事项提醒',()=>daily(t.id),'ghost')]:[]),
-      btn('委派任务',delegate,'secondary','task')]:model?[model]:[]));
+    $('tools').replaceChildren(...(main()?[btn('委派任务',delegate,'secondary','task'),
+      btn('设置',()=>chatSettings(t),'secondary','sliders')]:model?[model]:[]));
     if(!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup&&snap.run.status!=='uncertain')){
-      const seed=text=>{const n=$('input');n.value=text;n.dispatchEvent(new Event('input'));n.focus()};
-      content.replaceChildren(el('div','welcome',el('h2','',main()?'今天想一起做什么？':'和'+(agent?.name||'工作 Bot')+'聊聊'),
-        agent?.capabilities?.error?el('p','form-err',agent.capabilities.error):null,
-        el('div','actions',btn('开始新对话',()=>newThread(agent?.id),'outline','edit'),btn('整理一个想法',()=>seed('帮我整理一个想法：'),'outline','file'),btn('写一段代码',()=>seed('帮我写一段代码：'),'outline','code'))));return;
+      const greeting=main()?banner('今天想一起','做什么？'):banner('和'+(agent?.name||'工作 Bot')+'聊聊');
+      content.replaceChildren(el('div','chat-start',greeting,
+        agent?.capabilities?.error?el('p','form-err',agent.capabilities.error):null));return;
     }
     const stream=el('div','stream'),box=runBox(snap);
     if(agent?.capabilities?.error)stream.append(el('p','form-err',agent.capabilities.error));
@@ -465,8 +476,9 @@ export const chat = actions=>{
     const files=el('div','chips'),picker=el('input');picker.type='file';picker.multiple=true;picker.hidden=true;
     const renderFiles=()=>files.replaceChildren(...draft.refs.map((r,i)=>btn('引用 · '+r.excerpt+' ×',()=>{draft.refs.splice(i,1);renderFiles()},'chip')),...draft.files.map((f,i)=>btn(f.name+' ×',()=>{draft.files.splice(i,1);renderFiles()},'chip')));
     picker.onchange=()=>{draft.files.push(...Array.from(picker.files));picker.value='';renderFiles()};
-    input.oninput=()=>{draft.text=input.value;input.style.height='auto';input.style.height=Math.min(140,input.scrollHeight)+'px'};
-      let busy=false;
+    function resizeInput(){input.style.height='auto';input.style.height=Math.min(140,input.scrollHeight)+'px'}
+    input.oninput=()=>{draft.text=input.value;resizeInput()};
+    let busy=false;
     const send=btn('',async()=>{if(busy)return;const text=input.value.trim();if(!text){if(draft.files.length)notice('请说明希望怎样处理附件。');input.focus();return}
       const risk=state.snapshot?.run?.recovery?.action==='abandon'&&!state.snapshot.run.modelSetup;
       if(risk && !confirm('原生运行可能仍在执行。确认在当前会话发送？'))return;
@@ -476,11 +488,20 @@ export const chat = actions=>{
         const refs=draft.refs.map(({type,id})=>({type,id}));
         const fingerprint=JSON.stringify([text,attachmentIds,refs]);if(draft.fingerprint!==fingerprint){draft.fingerprint=fingerprint;draft.requestId=crypto.randomUUID()}
         await api('/threads/'+url(id)+'/messages',{text,refs,attachmentIds,requestId:draft.requestId,acknowledge:risk||undefined});drafts.delete(key);
-        if(state.view==='chat'&&state.thread===initialId&&key===draftKey()){$('compose').dataset.key='';await actions.load();await actions.openThread(id)}
+        if(state.view==='chat'&&state.thread===initialId&&key===draftKey()){
+          await actions.load();
+          if(state.view==='chat'&&state.thread===initialId&&key===draftKey()){
+            $('compose').dataset.key='';await actions.openThread(id);
+            if(state.thread===id&&!$('dialog').open)$('input')?.focus({preventScroll:true});
+          }
+        }
       }finally{busy=false;input.readOnly=false;picker.disabled=false;files.inert=false}
     },'primary send','send');send.title='发送';send.setAttribute('aria-label','发送');
     input.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();send.click()}};
-    renderFiles();$('compose').replaceChildren(files,el('div','composer',iconBtn('添加附件',()=>picker.click(),'plus'),picker,input,send));
+    renderFiles();
+    $('compose').replaceChildren(el('div','composer',files,input,el('div','composer-bar',
+      iconBtn('添加附件',()=>picker.click(),'clip'),picker,el('small','key-hint','Shift + Enter 换行'),send)));
+    if(draft.text)resizeInput();
   }
   return {draw:()=>{drawComposer();drawContent()},newThread,preview,
     seedReferences:(id,refs)=>drafts.set(id,{text:'',files:[],refs:[...refs]})};

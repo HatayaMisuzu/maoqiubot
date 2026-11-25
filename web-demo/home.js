@@ -1,4 +1,4 @@
-import {$,api,at,el,btn,items,url,state,upload,download,form,notice} from './lib.js';
+import {$,api,at,el,btn,icon,items,url,state,upload,download,form,notice} from './lib.js';
 import { spaceEditor } from './space-editor.js';
 const labels={requirement:'项目要求',decision:'决定',handoff:'交接',comment:'留言',todo:'待办',start:'开始工作',result:'工作结果',progress:'进度',preference:'偏好',note:'笔记',verified:'已验证',next:'下一步'};
 const options=keys=>keys.map(id=>({id,name:labels[id]||id}));
@@ -256,9 +256,19 @@ export const home = actions=>{
   async function draw(serial){
     const pid=state.project,personal=pid==='personal',project=personal?{spaceId:'personal',name:'个人空间'}:state.projects.find(p=>p.id===pid);
     $('compose').replaceChildren();$('compose').dataset.key='';
-    if(!pid){$('heading').textContent='毛球之家';$('subhead').textContent='';$('tools').replaceChildren(btn('建立项目',createProject,'secondary','plus'));
-      const rows=state.projects.map(p=>btn(p.name,()=>actions.openHome(p.id),'project-link','layers'));
-      $('content').replaceChildren(el('div','page',el('h2','','项目目录'),...(rows.length?rows:[empty('建立第一个项目后，可以在这里保存资料和交接。')]),el('div','actions',btn('个人空间',()=>actions.openHome('personal'),'secondary','layers'),btn('检索资料',()=>search(null),'secondary','file'),btn('保存个人资料',()=>addSource(null),'secondary'))));return}
+    if(!pid){
+      $('heading').textContent='毛球之家';$('subhead').textContent='';
+      $('tools').replaceChildren(btn('检索资料',()=>search(null),'secondary','file'),btn('建立项目',createProject,'primary','plus'));
+      const rows=state.projects.map(p=>{
+        const row=btn('',()=>actions.openHome(p.id),'project-link');
+        row.append(el('span','folder-tile',icon('folder')),el('strong','',p.name),icon('chevron'));
+        return row;
+      });
+      $('content').replaceChildren(el('div','page directory',
+        el('div','personal-shelf',el('div','',el('h2','','个人空间'),el('p','muted','收藏原件，整理个人资料。')),
+          el('div','actions',btn('打开空间',()=>actions.openHome('personal'),'primary','arrow'),btn('保存个人资料',()=>addSource(null),'secondary','file'))),
+        el('h2','','项目目录'),el('div','project-list',...(rows.length?rows:[empty('建立第一个项目后，可以在这里保存资料和交接。')]))));return;
+    }
     if(!project)throw new Error('找不到此项目。');
     const [space,brief,timeline,workspaces]=await Promise.all([api('/spaces/'+url(project.spaceId)),personal?null:api('/projects/'+url(pid)+'/brief'),personal?[]:api('/projects/'+url(pid)+'/timeline'),personal?null:api('/projects/'+url(pid)+'/workspaces')]);
     const page=space.structure.pages.find(p=>p.id===state.page)||space.structure.pages[0];
@@ -267,13 +277,17 @@ export const home = actions=>{
     $('heading').textContent=project.name;
     $('subhead').textContent=personal?'':items(workspaces).map(i=>i.name+' · '+i.workspaceRef).join(' / ');
     $('tools').replaceChildren(btn('检索资料',()=>search(personal?null:pid,personal),'secondary','file'),...(!personal?[btn('绑定工作区',()=>bindWorkspace(pid),'secondary')]:[]));
-    const pages=el('nav','pages',...space.structure.pages.map(p=>btn(p.title,()=>actions.openHome(pid,p.id),page.id===p.id?'active secondary':'ghost')));
+    const pages=el('nav','pages',...space.structure.pages.map(p=>btn(p.title,()=>actions.openHome(pid,p.id),page.id===p.id?'active':'ghost')));
+    pages.setAttribute('aria-label','空间页面');
+    pages.querySelector('.active')?.setAttribute('aria-current','page');
     const grid=el('div','blocks',...blocks);grid.style.setProperty('--columns',page.columns||1);
-    const useTheme=space.structure.theme;const holder=el('div','page',pages,el('div','actions',
-      btn('写记录',()=>newRecord(personal?null:pid),'secondary','edit'),btn('保存资料',()=>addSource(personal?null:pid),'secondary','file'),
-      btn('编辑页面',()=>editor.page(space,page),'ghost'),btn('新建页面',()=>editor.page(space),'ghost'),
-      btn('管理集合',()=>editor.collections(space),'ghost'),btn('管理模块',()=>editor.modules(space),'ghost'),
-      space.revision>1?btn('恢复布局',()=>editor.restore(space),'ghost'):null),grid);
+    const manage=()=>display('空间设置',el('div','settings-list',
+      btn('编辑页面',()=>editor.page(space,page),'settings-row','edit'),btn('新建页面',()=>editor.page(space),'settings-row','plus'),
+      btn('管理集合',()=>editor.collections(space),'settings-row','folder'),btn('管理模块',()=>editor.modules(space),'settings-row','layers'),
+      space.revision>1?btn('恢复布局',()=>editor.restore(space),'settings-row','task'):null));
+    const useTheme=space.structure.theme;const holder=el('div','page',pages,el('div','space-actions actions',
+      btn('写记录',()=>newRecord(personal?null:pid),'primary','edit'),btn('保存资料',()=>addSource(personal?null:pid),'secondary','file'),
+      btn('空间设置',manage,'ghost','sliders')),grid);
     if(/^#[0-9a-f]{6}$/i.test(useTheme))grid.style.borderTop='3px solid '+useTheme;
     if(space.structure.cover)holder.prepend(el('p','muted',space.structure.cover));
     $('content').replaceChildren(holder);

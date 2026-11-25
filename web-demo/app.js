@@ -1,4 +1,4 @@
-import {$,api,btn,el,form,headers,icon,iconBtn,items,notice,state,url} from './lib.js';
+import {$,api,banner,btn,el,form,headers,icon,iconBtn,items,notice,state,url} from './lib.js';
 import {chat} from './chat.js';
 import {home} from './home.js';
 import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
@@ -6,10 +6,23 @@ let revision=0, cursor=0, subscription, refreshTimer, retryTimer, connection='�
 const actions={load,openThread,openWorkDraft,openHome,refresh,loadOlder,current:id=>revision===id};
 const chats=chat(actions),house=home(actions);
 $('mark').append(icon('yarn'));$('menu').append(icon('menu'));$('menu').onclick=()=>sidebar(true);$('shade').onclick=()=>sidebar(false);
-function sidebar(open){document.body.classList.toggle('open',open);$('shade').hidden=!open;$('menu').setAttribute('aria-expanded',String(open))}
+const narrow=matchMedia('(max-width: 760px)');
+function sidebar(open){
+  const wasOpen=document.body.classList.contains('open');
+  document.body.classList.toggle('open',open);
+  $('side').inert=narrow.matches&&!open;
+  document.querySelector('main').inert=open;
+  $('shade').hidden=!open;
+  $('menu').setAttribute('aria-expanded',String(open));
+  if(open)$('side').querySelector('button:not(:disabled)')?.focus();
+  else if(wasOpen&&narrow.matches)$('menu').focus();
+}
+narrow.addEventListener('change',()=>sidebar(false));
+window.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('dialog').open&&document.body.classList.contains('open'))sidebar(false)});
+sidebar(false);
 function session(){
   $('session').replaceChildren(el('small','',el('i','dot '+(connection==='实时连接'?'live':'')),connection),
-    ...(hasDesktopSettings()?[btn('Agent 设置',desktopSettings,'ghost')]:[]),btn('访问凭据',login,'ghost'));
+    el('div','session-actions',...(hasDesktopSettings()?[btn('Agent 设置',desktopSettings,'ghost','sliders')]:[]),btn('访问凭据',login,'ghost','key')));
 }
 function login(){
   form('连接工作台',[{key:'token',label:'访问令牌',type:'password',required:true}],'连接',async({token})=>{
@@ -21,14 +34,16 @@ function login(){
 function unauthorized(){
   subscription?.abort();connection='需要登录';session();$('nav').replaceChildren();$('side-list').replaceChildren();
   $('heading').textContent='小毛球';$('tools').replaceChildren();$('subhead').textContent='';$('compose').replaceChildren();
-  $('content').replaceChildren(el('div','welcome',el('h2','','连接你的工作台'),el('div','actions',btn('使用访问令牌',login,'outline','chat'))));
+  $('content').replaceChildren(el('div','connection-view',banner('连接你的工作台'),
+    el('div','login-panel',el('p','muted','使用访问令牌打开你的对话与项目。'),btn('使用访问令牌',login,'primary','key'))));
 }
 function row(title,fn,active,symbol,online){
   const b=btn('',fn,'row-btn'+(active?' active':''),symbol);b.append(el('span','title',title));b.title=title;
   if(online!=null){const d=el('i','dot '+(online?'live':''));d.title=online?'在线':'离线';b.append(d)}return b;
 }
 function side(){
-  $('nav').replaceChildren(btn('对话',()=>go('#chat'),'chat'===state.view?'active':'','chat'),btn('项目',()=>openHome(),'home'===state.view?'active':'','layers'));
+  $('nav').replaceChildren(btn('对话',()=>go('#chat'),'chat'===state.view?'active':'','chat'),btn('项目',()=>openHome(),'home'===state.view?'active':'','folder'));
+  $('nav').querySelector('.active')?.setAttribute('aria-current','page');
   const list=$('side-list');list.replaceChildren();
   if(state.view==='home'){list.append(el('div','group-title','项目目录',iconBtn('建立项目',house.createProject,'plus')));
     for(const p of state.projects)list.append(row(p.name,()=>openHome(p.id),p.id===state.project,'layers'));return}
@@ -85,6 +100,13 @@ async function loadOlder(){
 }
 async function navigate(){
   sidebar(false);route();side();const routeKey=location.hash;
+  if($('content').dataset.route!==routeKey){
+    $('content').dataset.route=routeKey;
+    $('heading').textContent=state.view==='home'?'毛球之家':'小毛球';
+    $('subhead').textContent='';
+    $('tools').replaceChildren();$('compose').replaceChildren();
+    $('content').replaceChildren(el('p','page muted','正在打开…'));
+  }
   try{await refresh()}catch(e){
     if(location.hash!==routeKey)return;
     if(e.status===401)return unauthorized();

@@ -1,4 +1,9 @@
 const paths = {
+  folder:'M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+  clip:'m8 13 7-7a3 3 0 0 1 4 4l-9 9a5 5 0 0 1-7-7l9-9 M7 15l8-8',
+  sliders:'M3 7h4m4 0h10 M3 17h10m4 0h4 M11 7a2 2 0 1 1-4 0 2 2 0 0 1 4 0 M17 17a2 2 0 1 1-4 0 2 2 0 0 1 4 0',
+  key:'M15 3a6 6 0 1 1-3 11l-6 6H3v-3l6-6a6 6 0 0 1 6-8z M16 7h.01',
+  chevron:'m9 5 7 7-7 7',
   chat:'M20 15a3 3 0 0 1-3 3H8l-5 3V6a3 3 0 0 1 3-3h11a3 3 0 0 1 3 3z',
   layers:'m2 8 10-5 10 5-10 5z M3 12l9 5 9-5 M3 16l9 5 9-5',
   menu:'M3 6h18 M3 12h18 M3 18h18',plus:'M12 4v16 M4 12h16',close:'m6 6 12 12 M18 6 6 18',
@@ -8,6 +13,9 @@ const paths = {
   yarn:'M17 16a8.8 8.8 0 1 1 1.5-4.7c0 3.8-2.8 5.9-1.5 7.4 1.1 1.3 3.5.8 5 .8 M5 7a17 17 0 0 1 10 12 M3.5 10a14 14 0 0 1 8 9 M7 4.7a18 18 0 0 1 7 5 M11 3.2l5 3.1 M9 8c2.3-2 4.3-3 6.5-3.1 M11.4 10c2.1-1.9 4.1-3.2 6.3-3.6 M13.2 12.8c2.2-2.1 4.1-3.3 5.5-3.6 M15 15.3l3-2.4'
 };
 export const $ = id => document.getElementById(id);
+export function banner(...phrases) {
+  return el('div','garden-banner',el('h2','',...phrases.map(text=>el('span','',text))));
+}
 export function el(tag, cls='', ...children) {
   const n=document.createElement(tag); if(cls)n.className=cls;
   for(const child of children.flat()) if(child!=null)n.append(child);

@@ -1,0 +1,138 @@
+/* One reading column ties the welcome, message stream, and pinned composer together. */
+.chat-start, .stream, .page, .connection-view, #compose {
+  width: min(calc(100% - 2 * var(--gutter)), var(--reading-width));
+  margin-inline: auto;
+}
+.chat-start, .connection-view { padding-top: clamp(24px, 5vh, 58px); }
+.garden-banner {
+  display: flex;
+  align-items: center;
+  min-height: clamp(160px, 22vw, 276px);
+  padding: clamp(18px, 3.3vw, 48px);
+  border-radius: 14px;
+  background: #e2e5c9 url("./assets/yarn-garden.webp") center right / cover no-repeat;
+}
+.garden-banner h2 {
+  max-width: 56%;
+  font-size: clamp(27px, 3vw, 44px);
+  line-height: 1.45;
+  color: #2b3b25;
+  text-wrap: balance;
+}
+.garden-banner h2 span { display: inline-block; max-width: 100%; }
+.chat-start .form-err { margin-top: 12px; }
+.login-panel { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 20px 0; }
+#compose { flex: none; padding: 12px 0 max(20px, env(safe-area-inset-bottom)); }
+#compose:empty { display: none; }
+.composer {
+  padding: 14px 15px 10px;
+  background: var(--surface);
+  border: 1px solid #bcc4b2;
+  border-radius: 14px;
+  box-shadow: 0 4px 16px #29392209;
+  transition: border-color .16s, box-shadow .16s;
+}
+.composer:focus-within { border-color: #708761; box-shadow: 0 0 0 3px #788a6714; }
+.composer textarea {
+  display: block;
+  width: 100%;
+  min-height: 47px;
+  max-height: 140px;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  line-height: 1.6;
+  padding: 1px 5px 6px;
+}
+.composer textarea::placeholder { color: #74796d; }
+.composer-bar { display: flex; align-items: center; gap: 12px; }
+.composer-bar .icon-btn { color: var(--muted); }
+.key-hint { margin-left: auto; font-size: 11px; }
+.send { width: 42px; height: 35px; padding: 8px; }
+.chips:not(:empty) { padding: 0 3px 8px; }
+.chip { max-width: 100%; padding: 3px 7px; font-size: 12px; overflow-wrap: anywhere; background: var(--hover); }
+.stream { padding-block: 20px 12px; }
+.msg { padding: 14px 0; }
+.msg-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; margin-bottom: 6px; color: var(--green); font-size: 13px; font-weight: 600; }
+.msg-meta small { font-size: 11px; font-weight: 400; }
+.text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg > .text { line-height: 1.8; }
+.msg.user { margin-left: auto; width: fit-content; max-width: 85%; }
+.msg.user .msg-meta, .msg.user .message-tools { justify-content: flex-end; }
+.msg.user > .text { background: #eaf0e3; border-radius: 13px 3px 13px 13px; padding: 10px 15px; }
+.message-tools { display: flex; gap: 4px; margin-top: 3px; }
+.message-tools button { padding: 3px 6px; font-size: 12px; color: var(--muted); }
+.activity { padding-left: 12px; border-left: 2px solid #b4c1a4; color: var(--muted); font-size: 14px; }
+.task-card { display: flex; justify-content: flex-start; width: min(100%, 520px); margin-top: 8px; padding: 12px; background: var(--surface); border-color: var(--line); }
+.status, .pending { display: flex; gap: 9px; flex-wrap: wrap; align-items: center; margin: 8px 0; padding: 11px 14px; background: #edf1e6; border-radius: 9px; }
+.status, .inline { justify-content: space-between; }
+.pending > .text { flex-basis: 100%; }
+.reference-list { display: grid; gap: 3px; margin-top: 6px; }
+.reference-list:empty { display: none; }
+.model-tool span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-caption { overflow-wrap: anywhere; }
+summary { cursor: pointer; }
+details > summary { font-size: 14px; }
+details[open] > summary { margin-bottom: 8px; }
+
+/* Project directory, configurable pages, and underlying records. */
+.page { padding-block: 24px 40px; }
+.personal-shelf {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 30px;
+  padding: clamp(20px, 3vw, 34px);
+  border-radius: var(--radius);
+  background: #e7ebdb;
+}
+.personal-shelf p { margin-top: 4px; font-size: 14px; }
+.directory > h2 { font-size: 21px; }
+.project-list { margin-top: 12px; }
+.project-link {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  gap: 14px;
+  padding: 13px 10px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 4px;
+  text-align: left;
+}
+.project-link > svg { margin-left: auto; width: 15px; }
+.folder-tile { display: grid; place-items: center; width: 38px; height: 38px; flex: none; background: #ece9d8; color: #746242; border-radius: 8px; }
+.pages { display: flex; gap: 6px; overflow-x: auto; border-bottom: 1px solid var(--line); }
+.pages button { flex: none; padding: 8px 12px; border-radius: 0; border-width: 0 0 2px; }
+.pages .active { color: var(--green); border-color: var(--green); font-weight: 650; }
+.page > .muted { margin-bottom: 12px; }
+.space-actions { padding: 16px 0 20px; }
+.blocks { display: grid; grid-template-columns: repeat(var(--columns, 1), minmax(0, 1fr)); gap: 14px; align-items: start; }
+.blocks > section { min-width: 0; padding: 17px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); }
+.blocks h3 { margin: 0 0 10px; }
+.blocks h4 { margin: 12px 0 4px; font-size: 14px; }
+.blocks .actions, .record .actions { margin-top: 7px; }
+.record { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.record:last-child { border-bottom: 0; }
+.empty { padding: 13px 0; color: var(--muted); font-size: 14px; }
+.table-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; text-align: left; font-size: 14px; }
+td, th { border-bottom: 1px solid var(--line); padding: 9px; }
+th { background: var(--paper); white-space: nowrap; }
+
+@media (max-width: 760px) {
+  .chat-start, .connection-view { padding-top: 20px; }
+  .garden-banner { min-height: 135px; padding: 17px; background-position: right center; }
+  .garden-banner h2 { max-width: 48%; font-size: clamp(23px, 4.8vw, 32px); }
+  #compose { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .composer { padding: 11px 10px 7px; }
+  .composer textarea { min-height: 42px; font-size: 16px; }
+  .blocks { grid-template-columns: 1fr; }
+  .page { padding-top: 18px; }
+}
+@media (pointer: coarse) {
+  .key-hint { display: none; }
+  .send { margin-left: auto; }
+}
