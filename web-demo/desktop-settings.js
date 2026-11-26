@@ -87,7 +87,7 @@ function instanceForm(settings, instance, copy = false, onUpdated) {
       .find(id => !settings.instances.some(i => i.id === id))
     : instance?.id;
   const ui = form(copy ? '复制执行实例' : instance ? '编辑执行实例' : '新增执行实例', [
-    { key: 'adapterKey', label: 'Agent', options: [{ id: 'codex', name: 'Codex' }, { id: 'dsh', name: 'DSH' }], value: instance?.adapterKey },
+    { key: 'adapterKey', label: 'Agent', options: [{ id: 'codex', name: 'Codex' }, { id: 'dsh', name: 'DSH' }, { id: 'hermes', name: 'Hermes' }], value: instance?.adapterKey },
     { key: 'id', label: '实例 ID', value: nextId, required: true },
     { key: 'name', label: '显示名称', value: instance?.name, required: true },
     { key: 'command', label: '官方可执行程序名或完整路径', value: instance?.command, required: true },

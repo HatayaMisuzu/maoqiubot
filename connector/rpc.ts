@@ -13,14 +13,16 @@ export class Rpc extends EventEmitter {
   constructor(instance: Instance) {
     super()
     const codex=instance.adapterKey==='codex'
+    const hermes=instance.adapterKey==='hermes'
     if(codex && instance.args.join(' ')!=='app-server') throw Error('Codex 实例只接受官方 app-server stdio 入口')
+    if(hermes && (instance.args.length!==1||instance.args[0]!=='acp'))throw Error('Hermes 实例只接受官方 acp stdio 入口')
     const env = codex?codexEnvironment({...process.env,...instance.env}):{...process.env,...instance.env}
     for(const key of Object.keys(env))if(/^(NODE_OPTIONS|NODE_PATH|ELECTRON_RUN_AS_NODE)$/i.test(key))delete env[key]
     for(const key of Object.keys(env))if(/^(?:(?:NODE|OWNER)_TOKEN$|MAOQIU_MODEL_KEY_)/i.test(key))delete env[key]
     const args=codex?['app-server','--listen','stdio://',...codexServiceArgs]:instance.args
-    const batch=process.platform==='win32'&&instance.adapterKey==='dsh'&&/\.cmd$/i.test(instance.command)
-    // Windows requires cmd.exe for the vendor-provided dsh.cmd launcher.
-    if(batch && [instance.command,...args].some(arg=>/[%!&|^"<>\r\n]/.test(arg)))throw Error('DSH 批处理启动参数包含不支持的字符')
+    const batch=process.platform==='win32'&&(instance.adapterKey==='dsh'||hermes)&&/\.cmd$/i.test(instance.command)
+    // Windows requires cmd.exe for native batch launchers.
+    if(batch && [instance.command,...args].some(arg=>/[%!&|^"<>\r\n]/.test(arg)))throw Error('ACP 批处理启动参数包含不支持的字符')
     const executable=batch?(process.env.ComSpec||'cmd.exe'):instance.command
     const argv=batch?['/d','/s','/c','"'+[instance.command,...args].map(x=>'"'+x+'"').join(' ')+'"']:args
     this.process = spawn(executable, argv, {

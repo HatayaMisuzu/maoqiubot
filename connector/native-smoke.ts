@@ -2,7 +2,7 @@ import {readFileSync} from 'node:fs'
 import {randomUUID} from 'node:crypto'
 import {basename,isAbsolute,resolve} from 'node:path'
 import {registry} from './adapters/index.ts'
-import {Dsh} from './adapters/dsh.ts'
+import {Acp} from './adapters/acp.ts'
 import type {Instance,Run} from './types.ts'
 const [filename,id,...prompts]=process.argv.slice(2)
 const config=JSON.parse(readFileSync(filename,'utf8'))
@@ -34,7 +34,7 @@ try {
       console.log(JSON.stringify({sessionId,...adapter.describeModels?.(sessionId)}))
       continue
     }
-    if(prompt.startsWith('--select-model-index=') && adapter instanceof Dsh){
+    if(prompt.startsWith('--select-model-index=') && adapter instanceof Acp){
       const option=adapter.describeModels(sessionId).options?.[Number(prompt.split('=')[1])]
       if(!option)throw Error('模型列表序号不存在')
       await adapter.setModel(sessionId,option.id)

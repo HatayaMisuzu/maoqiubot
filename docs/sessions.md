@@ -30,6 +30,7 @@ SQLite 主库升级为版本 7。在迁移事务内，从个人范围中选取�
 | --- | --- | --- | --- |
 | 本机 Codex App Server | 原生 thread ID | 按账号、profile、cwd 核对目录；绑定后可读原生文本分页 | start/resume、turn、steer/interrupt，以及运行时探测到的 fork/archive/unarchive |
 | DSH / ACP v1 | ACP session ID | 只在握手声明 list 时查询对应 cwd 的分页目录；没有只读完整消息回放时显示工作台缓存 | new、声明的 resume/load、prompt、cancel；fork/delete 只按握手声明开放 |
+| Hermes / ACP v1 | ACP session ID | 按 Hermes profile 和当前工作区查询目录，显示工作台收到的消息 | new、prompt、cancel 和权限答复；导入及重连通过目录核查后 load，fork 按握手声明开放 |
 | 独立 API 工作 Bot | 工作台本地话题与消息 | 本地分页；当前请求和获准的近期历史送到选定模型 | 复用模型配置，普通文本生成或模型支持的图片输入；没有原生工作目录、会话 ID 或内部工具 |
 | 旧连接器 | 沿用原有绑定 | 未声明的新能力视为不可用 | 保留既有派发与回执协议 |
 

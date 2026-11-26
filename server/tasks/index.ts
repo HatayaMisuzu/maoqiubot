@@ -451,7 +451,7 @@ export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any)
     AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.threadId=t.id AND m.role='user')
     ORDER BY c.rowid DESC LIMIT 1`,key,projectId,native)
   const thread=previous&&terminal.has(latestRun(db,previous.id)?.status)?previous:
-    createThread(db,dir,{title:required(b.title??(inst.adapterKey==='codex'?'导入的 Codex 话题':'导入的 DSH 话题'),'title').slice(0,120),instanceId:key,projectId,source:'imported'})
+    createThread(db,dir,{title:required(b.title??('导入的 '+inst.name+' 话题'),'title').slice(0,120),instanceId:key,projectId,source:'imported'})
   const run=startRun(db,thread)
   enqueue(db,run,'prepare',{importSessionId:native})
   return {thread,runId:run.id,status:'queued'}
@@ -758,7 +758,7 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
     db.prepare('UPDATE runs SET status=? WHERE id=?').run(kind,run.id)
     changed(db,'model',{threadId:thread.id,instanceId:thread.instanceId,runId:run.id,status:kind})
     if(kind==='completed'&&JSON.parse(run.commandPayload).importSessionId)
-      message(db,thread.id,'system','activity','已绑定选定的 Codex 会话。后续消息在原生线程中继续。',{runId:run.id,sessionId:data.sessionId})
+      message(db,thread.id,'system','activity','已绑定选定的原生会话。后续消息在同一会话中继续。',{runId:run.id,sessionId:data.sessionId})
     if(kind!=='completed'&&JSON.parse(run.commandPayload).nativeOperation?.action!=='release')message(db,thread.id,'system','error',String(data.text??'读取原生模型失败'),{runId:run.id})
     return
   }

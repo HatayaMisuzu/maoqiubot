@@ -133,7 +133,7 @@ export function createCommandPalette(actions) {
         label: 'Agent 设置（原生连接器 / Worktree）',
         meta: '桌面配置',
         symbol: 'terminal',
-        keywords: 'agent codex dsh worktree 连接器',
+        keywords: 'agent codex dsh hermes worktree 连接器',
         run: () => actions.openDesktopSettings()
       });
     }
@@ -203,7 +203,7 @@ export function createCommandPalette(actions) {
 
     const searchInput = el('input', 'palette-input');
     searchInput.type = 'text';
-    searchInput.placeholder = '搜索主会话、侧聊、Codex / DSH、项目或命令…';
+    searchInput.placeholder = '搜索主会话、侧聊、工作 Bot、项目或命令…';
     searchInput.setAttribute('aria-label', '搜索工作台');
 
     const listBox = el('div', 'palette-list scroll-sleek');

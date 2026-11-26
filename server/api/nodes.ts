@@ -211,8 +211,8 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           }
         }
         if(!['run','prepare'].includes(c.kind)&&!c.nativeRunId){
-          // ACP controls address the session. A session binding can predate prompt submission.
-          const ready=c.adapterKey==='dsh'&&c.sessionId&&one(db,`SELECT 1 FROM messages
+          // ACP controls address the session once the node marks it ready for the current run.
+          const ready=['dsh','hermes'].includes(c.adapterKey)&&c.sessionId&&one(db,`SELECT 1 FROM messages
             WHERE threadId=? AND kind='activity' AND json_extract(data,'$.runId')=?
               AND json_extract(data,'$.controlReady')=1 LIMIT 1`,c.threadId,c.runId)
           const preparing= c.kind==='cancel'&&one(db,"SELECT 1 FROM commands WHERE runId=? AND kind='prepare' LIMIT 1",c.runId)

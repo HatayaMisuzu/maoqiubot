@@ -1,24 +1,31 @@
 const { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const { basename, delimiter, isAbsolute, join, relative, resolve, sep } = require('node:path')
 const { randomUUID } = require('node:crypto')
+const { homedir } = require('node:os')
 const { execFile } = require('node:child_process')
 const { promisify } = require('node:util')
 const git = promisify(execFile)
 const officialNames = {
   codex: /^codex(?:\.exe)?$/i,
-  dsh: /^dsh(?:\.exe|\.cmd)?$/i
+  dsh: /^dsh(?:\.exe|\.cmd)?$/i,
+  hermes: /^hermes(?:\.exe|\.cmd)?$/i
 }
 function detectedCommand(adapterKey, command) {
   if (!officialNames[adapterKey]?.test(basename(command))) return null
-  const names = adapterKey === 'dsh' && process.platform === 'win32' ? ['dsh.exe', 'dsh.cmd'] :
+  const names = adapterKey === 'hermes' && command.toLowerCase() !== 'hermes' ? [basename(command)] :
+    ['dsh','hermes'].includes(adapterKey) && process.platform === 'win32' ? [adapterKey+'.exe', adapterKey+'.cmd'] :
     adapterKey === 'codex' && process.platform === 'win32' ? ['codex.exe'] : [adapterKey]
   const pathDirs = (process.env.Path ?? process.env.PATH ?? '').split(delimiter)
     .map(dir => dir.replace(/^"|"$/g, '')).filter(dir => isAbsolute(dir))
   const installs = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA,'Programs')]
     .filter(Boolean).map(dir => join(dir,'DeepSeekHarness','resources','runtime','cli','bin'))
+  const hermesHome = process.env.HERMES_HOME || (process.platform === 'win32' ?
+    join(process.env.LOCALAPPDATA || join(homedir(),'AppData','Local'),'hermes'+(process.env.HERMES_DATA_DIR_SUFFIX || '')) :
+    join(homedir(),'.hermes'+(process.env.HERMES_DATA_DIR_SUFFIX || '')))
   const candidates = isAbsolute(command) ? [command] : [
     ...(adapterKey === 'dsh' && process.env.MAOQIU_DSH_EXECUTABLE ? [process.env.MAOQIU_DSH_EXECUTABLE] : []),
-    ...[...pathDirs,...(adapterKey==='dsh'?installs:[])].flatMap(dir => names.map(name => join(dir,name)))
+    ...[...(adapterKey==='hermes'?[join(hermesHome,'bin')]:[]),...pathDirs,...(adapterKey==='dsh'?installs:[])]
+      .flatMap(dir => names.map(name => join(dir,name)))
   ]
   for (const path of candidates) {
     if (!isAbsolute(path) || !officialNames[adapterKey].test(basename(path))) continue
@@ -72,19 +79,20 @@ function saveInstance(settings, db, input) {
   if (!settings.editable) throw Error('当前使用独立 JSON 配置，请在原文件中修改')
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('实例配置无效')
   const { adapterKey } = input
-  if (!['codex', 'dsh'].includes(adapterKey)) throw Error('请选择 Codex 或 DSH')
+  if (!Object.hasOwn(officialNames, adapterKey)) throw Error('请选择 Codex、DSH 或 Hermes')
   function required(key) {
     if (typeof input[key] !== 'string' || !input[key].trim() || input[key].length > 1000 || /[\r\n\0]/.test(input[key])) {
       throw Error('请填写有效的 ' + key)
     }
     return input[key].trim()
   }
-  const id = required('id'), name = required('name'), profileId = required('profileId'), command = required('command')
+  const id = required('id'), name = required('name'), profileId = required('profileId'), requested = required('command')
   if (!/^[\w-]{1,64}$/.test(id) || id === 'main' || !/^[\w.-]{1,64}$/.test(profileId)) throw Error('请使用有效的实例 ID 和 profile 标识')
   const basenamePattern = officialNames[adapterKey]
-  if (!basenamePattern.test(basename(command)) || (!isAbsolute(command) && command !== basename(command))) {
+  if (!basenamePattern.test(basename(requested)) || (!isAbsolute(requested) && requested !== basename(requested))) {
     throw Error('请填写官方可执行程序名或完整路径')
   }
+  const command = adapterKey === 'hermes' ? detectedCommand(adapterKey,requested) ?? requested : requested
   if (isAbsolute(command) && !statSync(command, { throwIfNoEntry: false })?.isFile()) throw Error('找不到指定的 Agent 可执行程序')
   const workspace = resolve(settings.workspace, required('workspaceRef'))
   if (!statSync(workspace, { throwIfNoEntry: false })?.isDirectory()) throw Error('找不到指定的工作区目录')
@@ -94,7 +102,8 @@ function saveInstance(settings, db, input) {
   const inUse = registered && db.prepare('SELECT 1 FROM threads WHERE instanceId=? LIMIT 1').get(id)
   if (registered && (registered.workspaceRef !== workspaceRef || registered.profileId !== profileId || registered.adapterKey !== adapterKey ||
     (inUse && existing?.command !== command))) throw Error('此实例已登记。修改执行入口、工作区或 profile 时请使用新实例 ID')
-  const args = existing?.adapterKey === adapterKey ? existing.args : adapterKey === 'codex' ? ['app-server'] : ['--profile', 'acp']
+  const args = existing?.adapterKey === adapterKey ? existing.args :
+    adapterKey === 'codex' ? ['app-server'] : adapterKey === 'hermes' ? ['acp'] : ['--profile', 'acp']
   const next = { ...existing, id, name, adapterKey, profileId, workspaceRef, command, args }
   if (workspaceRef !== existing?.workspaceRef || adapterKey !== existing?.adapterKey) delete next.worktree
   config.instances = existing ? config.instances.map(i => i.id === id ? next : i) : [...config.instances, next]
@@ -107,7 +116,7 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
   if (typeof instanceId !== 'string' || !/^[a-zA-Z0-9][\w-]{0,47}$/.test(instanceId) || instanceId === 'main' ||
     /^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])$/i.test(instanceId)) throw Error('请为新实例填写有效且唯一的 ID')
   const source = configFrom(settings.file).instances.find(item => item.id === sourceId)
-  if (!source || !officialNames[source.adapterKey]?.test(basename(source.command))) throw Error('请选择本机 Codex 或 DSH 实例')
+  if (!source || !officialNames[source.adapterKey]?.test(basename(source.command))) throw Error('请选择本机 Agent 实例')
   function available(config) {
     if (config.instances.some(i => i.id.toLowerCase() === instanceId.toLowerCase()) ||
       db.prepare('SELECT id FROM instances WHERE id=? COLLATE NOCASE').get(instanceId)) throw Error('这个实例 ID 已存在，请换一个 ID')

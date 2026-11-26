@@ -511,7 +511,7 @@ export const chat = actions => {
       notice('Bot 设置已保存。');
     });
 
-    if (['codex', 'dsh'].includes(agent.adapterKey)) {
+    if (['codex', 'dsh', 'hermes'].includes(agent.adapterKey)) {
       const usage = el('div', 'muted', '额度未知');
       usage.setAttribute('role', 'status');
       const read = agent.online && agent.capabilities?.usage ? btn('查询原生额度', async () => {
@@ -1086,7 +1086,7 @@ export const chat = actions => {
       );
       quick.children[1].append(
         el('div', 'quick-card-head', icon('task'), el('span', '', '委派给工作 Bot')),
-        el('small', '', '指派 Codex、DSH 或 API Bot 并跟踪通信与交付。')
+        el('small', '', '指派工作 Bot 并跟踪通信与交付。')
       );
       quick.children[2].append(
         el('div', 'quick-card-head', icon('folder'), el('span', '', '打开毛球之家')),

@@ -16,6 +16,7 @@ function projectTag(projectId) {
 function adapterLabel(bot) {
   if (bot.adapterKey === 'codex') return 'Codex';
   if (bot.adapterKey === 'dsh') return 'DSH';
+  if (bot.adapterKey === 'hermes') return 'Hermes';
   if (bot.adapterKey === 'model-api') return 'API';
   return bot.adapterKey || 'Bot';
 }
@@ -225,7 +226,7 @@ export function createSidebar(actions) {
 
     if (!bots.length) {
       listWrap.append(el('div', 'bot-empty-card',
-        el('p', '', '尚未接入工作 Bot（如 Codex / DSH / API Bot）。接入后将在这里独立展示并可查看原生目录。'),
+        el('p', '', '接入工作 Bot 后，可在这里打开工作话题并查看原生会话目录。'),
         hasDesktopSettings()
           ? btn('打开 Agent 设置', () => actions.openDesktopSettings(), 'secondary btn-sm', 'sliders')
           : btn('配置 API 工作 Bot', () => actions.openMainModels(), 'secondary btn-sm', 'bot')

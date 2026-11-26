@@ -158,7 +158,7 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
         if(address){address.username='';address.password='';address.search='';address.hash=''}
         const safe={stateDir:parsed.stateDir,url:address?.href,nodeId:parsed.nodeId,instances:parsed.instances.map((i:any)=>({
           id:i.id,name:i.name,adapterKey:i.adapterKey,workspaceRef:i.workspaceRef,profileId:i.profileId,
-          command:i.command,args:i.adapterKey==='dsh'?['--profile','acp']:i.adapterKey==='codex'?['app-server']:[]}))}
+          command:i.command,args:i.adapterKey==='dsh'?['--profile','acp']:i.adapterKey==='codex'?['app-server']:i.adapterKey==='hermes'?['acp']:[]}))}
         writeFileSync(restore?join(stage,'connector-config.backed-up.json'):join(connectorTarget,'config.json'),JSON.stringify(safe,null,2),{mode:0o600})
       }
     }

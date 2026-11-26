@@ -1,5 +1,4 @@
 import {existsSync,mkdirSync,readFileSync,writeFileSync,realpathSync} from 'node:fs'
-import {homedir} from 'node:os'
 import {basename,isAbsolute,resolve,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
@@ -293,7 +292,7 @@ async function startAdapterOnce(entry:Entry,restarting:boolean,generation:number
     if(isAbsolute(instance.command)&&!existsSync(instance.command))throw Error('找不到配置的 Agent 可执行程序')
     instance.workspaceRef=realpathSync(instance.workspaceRef)
     const key=registration.homeVariable
-    const home=resolve(instance.env?.[key]||process.env[key]||join(homedir(),registration.homeDirectory))
+    const home=resolve(instance.env?.[key]||process.env[key]||registration.defaultHome)
     instance.env={...instance.env,[key]:home}
     instance.runtimeKey=JSON.stringify([instance.profileId,home,instance.command,instance.args])
     adapter=new registration.create(instance)
