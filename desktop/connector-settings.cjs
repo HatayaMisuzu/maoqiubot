@@ -113,8 +113,9 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
       db.prepare('SELECT id FROM instances WHERE id=? COLLATE NOCASE').get(instanceId)) throw Error('这个实例 ID 已存在，请换一个 ID')
   }
   available(configFrom(settings.file))
-  const cwd = realpathSync(resolve(settings.workspace, source.workspaceRef))
-  const destinationParent = realpathSync(parent)
+  // Git can expand Windows short paths even when Node's realpathSync preserves them.
+  const cwd = realpathSync.native(resolve(settings.workspace, source.workspaceRef))
+  const destinationParent = realpathSync.native(parent)
   const workspaceRef = join(destinationParent, instanceId)
   const env = { ...process.env }
   for (const key of Object.keys(env)) if (/^GIT_/i.test(key)) delete env[key]
@@ -129,7 +130,7 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
       throw Error('Git 操作失败：' + String(error.stderr || error.message).trim().slice(0, 700))
     }
   }
-  const root = realpathSync(await run(['rev-parse', '--show-toplevel']))
+  const root = realpathSync.native(await run(['rev-parse', '--show-toplevel']))
   if (relative(root, cwd) !== '') throw Error('请从以仓库根目录为工作区的实例创建 Worktree')
   const inside = relative(root, destinationParent)
   if (!inside || (!isAbsolute(inside) && inside !== '..' && !inside.startsWith('..' + sep))) throw Error('请选择原工作区以外的 Worktree 父目录')
@@ -140,7 +141,7 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
   const dirty = Boolean(await run(['status', '--porcelain']))
   await run(['worktree', 'add', '-b', branch, '--', workspaceRef, baseCommit])
   try {
-    const actual = realpathSync(workspaceRef)
+    const actual = realpathSync.native(workspaceRef)
     if (relative(actual, workspaceRef) !== '' || await run(['branch', '--show-current'], actual) !== branch ||
       await run(['rev-parse', 'HEAD'], actual) !== baseCommit) throw Error('Git 回执与目标目录、分支或基准提交不一致')
     const config = configFrom(settings.file)
