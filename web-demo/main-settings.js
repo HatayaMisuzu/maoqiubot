@@ -11,6 +11,8 @@ const permissions={
   task:'小毛球可按本轮指令委派与控制任务',memory:'小毛球可按本轮指令维护记忆',
   homeContent:'小毛球可按本轮指令保存项目记录和交接',homeSpace:'小毛球可按本轮指令修改当前空间布局',
   personalInProject:'项目聊天可使用相关个人记忆',
+  routineRouting:'允许在已授权范围内委派、续接或追加任务，免逐次确认',
+  projectDirectories:'允许在可写目录下创建独立项目子目录（操作前确认）',
   pluginCreator:'允许主聊生成待审查扩展',
   desktop:'允许主聊提出桌面操作',
   memoryCandidates:'从用户原话提议长期记忆，保存前人工审阅',
@@ -38,6 +40,10 @@ export async function mainModels(refresh){
           await api('/chat/models',{action:'select',id:model.id});await refresh();await mainModels(refresh);
         },'secondary'):null,
         external?btn('编辑',()=>edit(model,refresh),'secondary'):null,
+        external&&!model.disabled?btn('注册为工作 Bot',async()=>{
+          const bot=await api('/instances/api',{modelId:model.id});await refresh();notice('已注册工作 Bot · '+bot.name);
+          await mainModels(refresh);
+        },'secondary'):null,
         external&&!model.disabled?btn('测试连接',async()=>{
           const result=await api('/chat/models/test',{id:model.id});
           notice('模型已响应 · '+result.model);
@@ -147,11 +153,14 @@ export async function mainPermissions(){
   const policy=await api('/chat/policy');
   form('主聊工具权限',[
     ...Object.entries(permissions).map(([key,label])=>toggle(key,label,policy[key])),
+    {key:'toolBudget',label:'本轮起始工具预算',type:'number',value:policy.toolBudget??10,required:true},
+    {key:'toolHardLimit',label:'本轮工具硬上限',type:'number',value:policy.toolHardLimit??100,required:true},
     {key:'readRoots',label:'可读取的资料目录（每行一个绝对路径）',type:'textarea',value:policy.readRoots.join('\n')},
     {key:'writeRoots',label:'可新建文本的目录（每行一个绝对路径）',type:'textarea',value:policy.writeRoots.join('\n')}
   ],'保存',async values=>{
     const roots=key=>values[key].split(/\r?\n/).map(line=>line.trim()).filter(Boolean);
-    await api('/chat/policy',{...flags(permissions,values),readRoots:roots('readRoots'),writeRoots:roots('writeRoots')});
+    await api('/chat/policy',{...flags(permissions,values),toolBudget:Number(values.toolBudget),toolHardLimit:Number(values.toolHardLimit),
+      readRoots:roots('readRoots'),writeRoots:roots('writeRoots')});
     notice('主聊工具权限已保存。');
   });
 }

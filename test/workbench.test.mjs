@@ -100,6 +100,111 @@ test('HTTP → authenticated node → project result → exact retry → restore
   } finally {if(ws?.readyState===1)ws.close();await app.close();rmSync(temp,{recursive:true,force:true})}
 })
 
+test('Bot范围设置跨重连保留，多个任务共享原生线程并按taskId继续',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-task-routing-'))
+  const app=startServer({port:0,dataDir:join(temp,'server'),chat:false})
+  let ws
+  async function request(path,body,expected=200){
+    const res=await fetch('http://127.0.0.1:'+app.server.address().port+'/api/v1'+path,{
+      method:body?'POST':'GET',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'},
+      body:body&&JSON.stringify(body)
+    })
+    const data=await res.json()
+    assert.equal(res.status,expected,JSON.stringify(data))
+    return data
+  }
+  const packets=[]
+  const connect=async()=>{
+    ws=new WebSocket('ws://127.0.0.1:'+app.server.address().port+'/api/v1/node',{headers:{Authorization:'Bearer '+app.auth.cfg.nodes.local}})
+    ws.on('message',raw=>packets.push(JSON.parse(raw)))
+    await once(ws,'open')
+    ws.send(JSON.stringify({type:'hello',nodeId:'local',instances:[{id:'fixture',name:'测试 Bot',adapterKey:'test',workspaceRef:temp,
+      availableActions:['run','cancel','answer'],resume:true,history:false,sessionList:false}]}))
+    await waitFor(async()=> (await request('/instances')).find(instance=>instance.id==='fixture'&&instance.online))
+  }
+  const finishRun=async(task,sessionId,turnId)=>{
+    const command=await waitFor(()=>packets.find(frame=>frame.type==='command'&&frame.command.runId===task.runId)?.command)
+    const event=(seq,kind,data)=>({type:'event',event:{key:turnId+'-'+seq,seq,instanceId:'fixture',runId:task.runId,commandId:command.id,kind,data}})
+    ws.send(JSON.stringify(event(1,'accepted',{sessionId,nativeRunId:turnId})))
+    ws.send(JSON.stringify(event(2,'message',{text:'result '+turnId})))
+    ws.send(JSON.stringify(event(3,'completed',{text:'done'})))
+    return waitFor(async()=>{
+      const status=(await request('/tasks/'+task.taskId)).run?.status
+      return status==='completed'?status:null
+    })
+  }
+  try{
+    await once(app.server,'listening')
+    const project=await request('/projects',{name:'多任务路由项目'})
+    await connect()
+    await request('/projects/'+project.id+'/workspaces',{instanceId:'fixture',workspaceRef:temp})
+    const direct=await request('/threads',{projectId:project.id,instanceId:'fixture'})
+    const botSettings=await request('/instances/fixture/settings',{enabled:false})
+    assert.equal(botSettings.enabled,false)
+    await request('/threads/'+direct.id+'/messages',{text:'不得直聊'},409)
+    ws.close();await once(ws,'close')
+    await connect()
+    assert.equal((await request('/instances')).find(instance=>instance.id==='fixture').enabled,false)
+    await request('/instances/fixture/settings',{enabled:true,allowDirect:true,allowDelegate:true,allowedProjects:[project.id]})
+    await request('/threads',{instanceId:'fixture'},403)
+    const origin=await request('/threads',{projectId:project.id})
+    const first=await request('/tasks',{originThreadId:origin.id,instanceId:'fixture',projectId:project.id,goal:'任务 A',routeReason:'继续既有原生会话'})
+    await finishRun(first,'native-shared','turn-a')
+    const second=await request('/tasks',{originThreadId:origin.id,instanceId:'fixture',projectId:project.id,goal:'任务 B',workThreadId:first.workThreadId,
+      routeReason:'同一工作区的新目标'})
+    assert.notEqual(second.taskId,first.taskId)
+    assert.equal(second.workThreadId,first.workThreadId)
+    await finishRun(second,'native-shared','turn-b')
+    const continuation=await request('/tasks',{originThreadId:origin.id,instanceId:'fixture',projectId:project.id,taskId:first.taskId,
+      goal:'复查任务 A',routeReason:'回到已完成的任务 A'})
+    assert.equal(continuation.taskId,first.taskId)
+    assert.equal(continuation.workThreadId,first.workThreadId)
+    await finishRun(continuation,'native-shared','turn-a2')
+    const viewA=await request('/tasks/'+first.taskId)
+    const viewB=await request('/tasks/'+second.taskId)
+    assert.equal(viewA.run.id,continuation.runId)
+    assert.equal(viewB.run.id,second.runId)
+    assert.deepEqual(app.db.prepare('SELECT relation FROM task_threads WHERE taskId=? ORDER BY relation').all(first.taskId).map(row=>row.relation),['origin','work'])
+    const communications=await request('/tasks/'+first.taskId+'/communication')
+    assert.ok(communications.items.every(message=>app.db.prepare('SELECT taskId FROM messages WHERE id=?').get(message.id)?.taskId===first.taskId))
+    assert.equal((await request('/threads/'+first.workThreadId)).thread.sessionId,'native-shared')
+  } finally {
+    if(ws?.readyState===1)ws.close()
+    await app.close()
+    rmSync(temp,{recursive:true,force:true})
+  }
+})
+
+test('native runtime scope is pinned to a registered instance ID',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-runtime-scope-'))
+  const app=startServer({port:0,dataDir:temp,chat:false})
+  let ws
+  const connect=async runtimeScopeId=>{
+    ws=new WebSocket('ws://127.0.0.1:'+app.server.address().port+'/api/v1/node',{
+      headers:{Authorization:'Bearer '+app.auth.cfg.nodes.local}
+    })
+    await once(ws,'open')
+    ws.send(JSON.stringify({type:'hello',nodeId:'local',instances:[{id:'scope-fixture',name:'scope fixture',adapterKey:'test',
+      workspaceRef:temp,availableActions:['run'],runtimeScopeId}]}))
+  }
+  try{
+    await once(app.server,'listening')
+    const first='a'.repeat(64),second='b'.repeat(64)
+    await connect(first)
+    await waitFor(async()=>app.db.prepare('SELECT 1 FROM instances WHERE id=? AND online=1').get('scope-fixture'))
+    assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('scope-fixture').runtimeScopeId,first)
+    ws.close();await once(ws,'close')
+    await connect(second)
+    const [code]=await once(ws,'close')
+    assert.equal(code,1008)
+    assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('scope-fixture').runtimeScopeId,first)
+    assert.equal(app.db.prepare('SELECT online FROM instances WHERE id=?').get('scope-fixture').online,0)
+  }finally{
+    if(ws?.readyState===WebSocket.OPEN)ws.close()
+    await app.close();rmSync(temp,{recursive:true,force:true})
+  }
+})
+
 test('native model setup and dispatch reuse one scoped session, and held input resumes explicitly',async()=>{
   const temp=mkdtempSync(join(tmpdir(),'maoqiu-model-'))
   const app=startServer({port:0,dataDir:temp,chat:false})

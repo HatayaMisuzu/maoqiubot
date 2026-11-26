@@ -37,7 +37,9 @@ npm.cmd run package:desktop
 
 实例 ID 固定对应节点、适配器、工作区和 profile。修改这些绑定时配置新实例 ID。连接器记录工作话题对应的原生会话，控制命令同时校验本次运行。在同一项目登记多个不同工作区时，绑定它们的具体实例。资料可以通过项目 ID 接续，原生消息仍归原来的话题。
 
-主聊顶部的「设置」集中放置模型、权限、人格和插件。打开「主聊人格」即可保存或恢复默认，也可编辑数据目录的 `persona.md`，下一轮生效。侧栏「最近对话」旁的加号可新建话题。对话默认加载最近 60 条，可点击「加载更早消息」。
+点击小毛球联系人会打开固定主聊。想单独讨论一件事，可以新建侧聊，或选中已有消息分享到另一条会话。点击工作 Bot 可查看它自己的最近会话，在空白会话首次发言时才建立工作话题。对话默认加载最近 60 条，可点击「加载更早消息」。
+
+主聊顶部的「设置」集中放置模型、权限、人格和插件。打开「主聊人格」即可保存或恢复默认，也可编辑数据目录的 `persona.md`，下一轮生效。工作 Bot 的名称、描述、直聊、委派及项目范围在 Agent 设置中修改。[会话与 Bot 使用指南](docs/sessions.md) · [升级验收报告](docs/session-upgrade-report.md)
 
 毛球之家支持中文检索分页、来源与附件分享、记录修订和遗忘。页面和集合可通过表单编辑并预览版本变更。恢复空间默认恢复历史页面布局并保留当前集合字段及条目，也可显式转换不兼容的值后恢复历史字段定义。
 
@@ -55,8 +57,8 @@ npm.cmd run package:desktop
 
 ## 原生接入
 
-- **Codex** 通过本机官方 CLI 和私有 stdio App Server 使用个人 ChatGPT 登录。支持会话目录的实例可在「开始新对话」选择「导入已有会话」，核对本机账号、工作区及 profile 后绑定。原客户端仍占用会话时须先释放。重复导入打开已有话题，既有历史在原客户端查看。 [Codex App Server 认证文档](https://developers.openai.com/codex/app-server/)
-- **DSH** 通过桌面安装包里的官方 `dsh --profile acp` 运行。模型目录由 ACP 提供，工作台可续接已绑定的原生会话。当前 DSH 实例没有可核对的外部会话目录。 [DSH 会话模型](connector/DSH.md)
+- **Codex** 通过本机官方 CLI 和私有 stdio App Server 使用个人 ChatGPT 登录。导入前核对账号、工作区及 profile；重复导入打开已有话题。支持的实例可以读取原生聊天文本、分支、归档和恢复。原客户端仍占用会话时须先释放。[Codex App Server 认证文档](https://developers.openai.com/codex/app-server/)
+- **DSH** 通过桌面安装包里的官方 `dsh --profile acp` 运行。工作台根据 ACP 握手开放模型目录、工作区会话列表及续接。没有原生历史接口时可以查看工作台已收到的消息。[DSH 会话模型](connector/DSH.md)
 - **Antigravity** 消费版由用户在官方客户端使用。Google 官方明确说明消费版不支持把 CLI 封装进第三方应用。接入 Gemini 或业务版时采用相应的公开 API 和授权流程。 [Antigravity FAQ](https://antigravity.google/docs/faq/)
 
 ## HTTP、SSE 和备份

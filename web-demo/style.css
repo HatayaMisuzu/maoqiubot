@@ -60,6 +60,9 @@ a { color: var(--green); text-underline-offset: 3px; }
 .ghost { color: var(--green); }
 .icon-btn, #menu { width: 36px; height: 36px; padding: 8px; flex: none; }
 .actions, #tools, .inline, .chips, .dialog-foot { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.project-access { display: grid; gap: 8px; max-height: 220px; overflow: auto; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; }
+.check-field { display: flex; align-items: center; gap: 9px; font-size: 14px; }
+.check-field input { width: 17px; height: 17px; accent-color: var(--green); }
 [hidden] { display: none !important; }
 
 /* Frame and navigation */

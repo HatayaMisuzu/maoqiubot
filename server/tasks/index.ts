@@ -1,7 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite'
+import { budgetOverride } from '../chat/budget.ts'
 import type { NodeEvent, Actor, Audience, Communication } from '../../contracts/node.ts'
 import { id, now, fail, required, changed, must, one, unpack, owner } from '../db/index.ts'
 import { addTaskRecord, homeApi, prepareProjectContext } from '../home/index.ts'
+import {assertBotAllowed,assertBotProjectAllowed} from './bots.ts'
+import {markSharesSent,pendingShareRefs,readShareMaterial} from '../sessions.ts'
 
 export const terminal = new Set(['completed','failed','cancelled','blocked'])
 export const getThread = (db: DatabaseSync, key: string) => must(db,'SELECT * FROM threads WHERE id=?',key)
@@ -15,7 +18,9 @@ export const latestRun = (db: DatabaseSync,key:string) => unpack(one(db,`SELECT 
   EXISTS(SELECT 1 FROM commands c WHERE c.runId=r.id AND c.kind='prepare') AS modelSetup,
   (SELECT data FROM messages m WHERE r.status='cancelled' AND m.threadId=r.threadId AND m.kind='recovery'
     AND json_extract(m.data,'$.runId')=r.id ORDER BY rowid DESC LIMIT 1) AS recovery
-  FROM runs r WHERE threadId=? ORDER BY r.rowid DESC LIMIT 1`,key),['pendingRequest','recovery'])
+  FROM runs r WHERE threadId=? AND (r.status NOT IN ('completed','failed','cancelled','blocked') OR NOT EXISTS(
+    SELECT 1 FROM commands c WHERE c.runId=r.id AND json_extract(c.payload,'$.nativeOperation.action') IS NOT NULL))
+    ORDER BY r.rowid DESC LIMIT 1`,key),['pendingRequest','recovery'])
 export function modelView(db:DatabaseSync,thread:any){
   const saved=unpack(one(db,'SELECT selected,current,options FROM thread_models WHERE threadId=?',thread.id),['options'])
   const caps=thread.instanceId==='main'?null:unpack(instance(db,thread.instanceId),['capabilities']).capabilities
@@ -43,8 +48,14 @@ export function createThread(db: DatabaseSync,dir:string,b:any) {
   const key=id(), instanceId=required(b.instanceId ?? 'main','instanceId')
   if (instanceId !== 'main') instance(db,instanceId)
   if (b.projectId) homeRead(db,dir,'/projects/'+required(b.projectId,'projectId')+'/brief')
+  if(instanceId!=='main')assertBotProjectAllowed(db,instanceId,b.projectId??null)
   projectWorkspace(db,b.projectId??null,instanceId)
-  db.prepare('INSERT INTO threads VALUES(?,?,?,?,?,?,?)').run(key,String(b.title || '新话题'),instanceId,b.projectId||null,null,null,now())
+  const source=b.source??(instanceId==='main'?'local':'direct')
+  const kind=instanceId==='main'?'side':instance(db,instanceId).adapterKey==='model-api'?'api':'native'
+  if(!['local','direct','delegated','imported'].includes(source))fail('会话来源无效')
+  const created=now()
+  db.prepare('INSERT INTO threads(id,title,instanceId,projectId,taskId,sessionId,createdAt,kind,state,source,lastActivity) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+    .run(key,String(b.title || '新话题'),instanceId,b.projectId||null,null,null,created,kind,'active',source,created)
   changed(db,'thread',{threadId:key})
   const thread=getThread(db,key)
   if(b.modelId!=null)selectModel(db,thread,b.modelId)
@@ -85,7 +96,11 @@ export function hasRunArtifacts(db:DatabaseSync,threadId:string,runId:string){
   return !!one(db,"SELECT 1 FROM messages WHERE threadId=? AND kind='artifact' AND json_extract(data,'$.runId')=? LIMIT 1",threadId,runId)
 }
 export function taskView(db:DatabaseSync,key:string) {
-  const task=getTask(db,key),run=latestRun(db,task.workThreadId)
+  const task=getTask(db,key),run=unpack(one(db,`SELECT r.*,
+    EXISTS(SELECT 1 FROM commands c WHERE c.runId=r.id AND c.kind='prepare') AS modelSetup,
+    (SELECT data FROM messages m WHERE r.status='cancelled' AND m.threadId=r.threadId AND m.kind='recovery'
+      AND json_extract(m.data,'$.runId')=r.id ORDER BY m.rowid DESC LIMIT 1) AS recovery
+    FROM runs r WHERE r.taskId=? AND r.threadId=? ORDER BY r.rowid DESC LIMIT 1`,key,task.workThreadId),['pendingRequest','recovery'])
   const commands=db.prepare('SELECT * FROM commands WHERE taskId=? ORDER BY rowid').all(key).map(x=>unpack(x,['payload']))
   const review=run&&unpack(one(db,`SELECT createdAt,data FROM messages WHERE threadId=? AND kind='review'
     AND json_extract(data,'$.runId')=? ORDER BY rowid DESC LIMIT 1`,task.workThreadId,run.id),['data'])
@@ -94,8 +109,8 @@ export function taskView(db:DatabaseSync,key:string) {
 export function taskCommunications(db:DatabaseSync,taskId:string){
   const task=getTask(db,taskId)
   const rows=db.prepare(`SELECT id,kind,text,createdAt,data,refs FROM messages
-    WHERE threadId=? AND kind IN ('brief','communication','input_required','message','artifact','completed','failed','blocked','review')
-    ORDER BY rowid DESC LIMIT 40`).all(task.workThreadId)
+    WHERE threadId=? AND taskId=? AND kind IN ('brief','communication','input_required','message','artifact','completed','failed','blocked','review')
+    ORDER BY rowid DESC LIMIT 40`).all(task.workThreadId,taskId)
   return {taskId,items:rows.reverse().map(r=>{
     const entry=unpack(r,['data','refs'])
     return {id:entry.id,kind:entry.kind,text:String(entry.text).slice(0,1200),createdAt:entry.createdAt,
@@ -151,7 +166,20 @@ export function reportCommunication(db:DatabaseSync,dir:string,runId:string,home
   }
   return {id:msg,taskId:run.taskId,runId,sender,recipient:botAudience('main'),status:'recorded',recordId:archive?.id}
 }
-export function checkQueuedInput(db:DatabaseSync,c:any,payload:any){
+export function checkQueuedInput(db:DatabaseSync,dir:string,c:any,payload:any){
+  const thread=getThread(db,c.threadId)
+  const op=payload.nativeOperation
+  if(op){
+    const source=getThread(db,required(op.sourceThreadId,'原生来源话题 ID'))
+    if(source.instanceId!==thread.instanceId||source.projectId!==thread.projectId||source.sessionId!==op.sourceSessionId||
+      !['active','archived','deleted'].includes(source.state)||(!['delete','unarchive'].includes(op.action)&&source.state==='deleted')||
+      (op.action==='fork'?source.id===thread.id:source.id!==thread.id))fail('原生操作来源或绑定已变化',409)
+  }
+  if(thread.nativeInvalid||thread.state!=='active'&&!['delete','unarchive'].includes(op?.action))fail('话题已归档、删除或原生绑定失效，已阻止新的执行',409)
+  if(c.instanceId!=='main'){
+    const action=payload.communication?.sender?.kind==='main_bot'?'delegate':'direct'
+    assertBotAllowed(db,c.instanceId,action,c.projectId??thread.projectId)
+  }
   projectWorkspace(db,c.projectId,c.instanceId)
   if(payload.coordination){
     const {taskId,revision}=payload.coordination
@@ -163,6 +191,14 @@ export function checkQueuedInput(db:DatabaseSync,c:any,payload:any){
   const first=c.taskId&&!payload.materials&&one(db,"SELECT id FROM commands WHERE taskId=? AND kind='run' ORDER BY rowid LIMIT 1",c.taskId)
   const materials=payload.materials??(first?.id===c.id?getTask(db,c.taskId).brief.materials:[])
   for(const ref of materials??[]){
+    if(ref.type==='message')messageMaterial(db,required(ref.id,'消息引用 ID'),c.projectId??thread.projectId)
+    if(ref.type==='share'){
+      const current=readShareMaterial(db,dir,thread.id,required(ref.id,'分享 ID'))
+      if(current.text!==ref.text||JSON.stringify(current.attachmentIds)!==JSON.stringify(ref.attachmentIds))
+        fail('分享资料快照已变化，请重新提交',409)
+      for(const attachmentId of current.attachmentIds)
+        homeRead(db,'','/attachments/'+encodeURIComponent(attachmentId),c.projectId??thread.projectId,'meta=1')
+    }
     if(!['source','record'].includes(ref.type))continue
     const found=homeRead(db,'','/'+ref.type+'s/'+encodeURIComponent(ref.id),c.projectId)
     if(ref.type==='record'&&(ref.revision!==found.revision||ref.sourceId!==found.sourceId||
@@ -222,16 +258,18 @@ function checkManualRetry(db:DatabaseSync,run:any,b:any){
     fail('原生运行可能仍在执行。确认过风险再继续，或另开工作话题',409)
   }
 }
-function makeInput(db:DatabaseSync,dir:string,b:any,projectId:string|null,target?:{nodeId:string,workspaceRef:string}) {
+function makeInput(db:DatabaseSync,dir:string,b:any,projectId:string|null,target?:{nodeId:string,workspaceRef:string},threadId?:string) {
   const attachmentIds=b.attachmentIds ?? [], refs=b.materialRefs ?? b.refs ?? []
   if (!Array.isArray(attachmentIds)||!Array.isArray(refs)) fail('附件和引用须为数组')
   const materials=refs.map((r:any)=>{
     if (typeof r!=='object'||!r) fail('引用须含 type 和 id')
     const key=required(r.id,'引用 ID')
+    if(r.type==='share'){
+      if(!threadId)fail('分享资料须在目标会话中使用',409)
+      return readShareMaterial(db,dir,threadId,key)
+    }
     if(r.type==='message'){
-      const m=must(db,'SELECT m.text,m.threadId,m.role,m.createdAt,t.projectId FROM messages m JOIN threads t ON t.id=m.threadId WHERE m.id=?',key)
-      if(m.projectId!==projectId)fail('引用的原话属于其他项目或个人话题，请先归档到目标项目',403)
-      return {type:'message',id:key,text:m.text,threadId:m.threadId,author:m.role,createdAt:m.createdAt}
+      return messageMaterial(db,key,projectId)
     }
     if(!['source','record','attachment'].includes(r.type)) fail('未知引用类型')
     if(r.type==='attachment') {return {type:r.type,id:key}}
@@ -249,12 +287,27 @@ function makeInput(db:DatabaseSync,dir:string,b:any,projectId:string|null,target
     }
     return material
   })
-  const ids=[...new Set<string>([...attachmentIds,...materials.filter((r:any)=>r.type==='attachment').map((r:any)=>r.id)].map(a=>required(a,'attachmentId')))]
+  const referencedIds=materials.flatMap((r:any)=>r.type==='share'?r.attachmentIds:r.type==='attachment'?[r.id]:[])
+  const ids=[...new Set<string>([...attachmentIds,...referencedIds].map(a=>required(a,'attachmentId')))]
   for(const a of ids)homeRead(db,dir,'/attachments/'+encodeURIComponent(a),projectId,'meta=1')
   return {attachmentIds:ids,materials}
 }
+function messageMaterial(db:DatabaseSync,key:string,projectId:string|null){
+  const m=must(db,`SELECT m.text,m.threadId,m.role,m.kind,m.createdAt,m.data,t.projectId,t.state,
+      (SELECT boundary.rowid FROM thread_context_resets reset JOIN messages boundary ON boundary.id=reset.throughMessageId
+        WHERE reset.threadId=t.id) AS resetRow
+    FROM messages m JOIN threads t ON t.id=m.threadId WHERE m.id=?`,key)
+  const rowid=one(db,'SELECT rowid FROM messages WHERE id=?',key)?.rowid
+  const data=JSON.parse(m.data||'{}')
+  const visibility=data.communication?.visibility
+  if(m.projectId!==projectId)fail('引用的原话属于其他项目或个人话题，请先归档到目标项目',403)
+  if(m.state==='deleted'||!['user','assistant'].includes(m.role)||
+    !['message','brief','delivery','completed'].includes(m.kind)||visibility==='bot_internal'||visibility==='system'||
+    (m.resetRow&&rowid<=m.resetRow))fail('引用的消息已删除、重置或不对当前会话开放',409)
+  return {type:'message',id:key,text:m.text,threadId:m.threadId,author:m.role,createdAt:m.createdAt}
+}
 export function validateChatMaterials(db:DatabaseSync,dir:string,current:any,projectId:string|null){
-  return makeInput(db,dir,{refs:current.refs,attachmentIds:current.data?.attachmentIds},projectId)
+  return makeInput(db,dir,{refs:current.refs,attachmentIds:current.data?.attachmentIds},projectId,undefined,current.threadId)
 }
 function inputPayload(text:string,attachmentIds:string[],materials:any[]){
   if(!materials.length)return {text,attachmentIds}
@@ -277,11 +330,21 @@ function enqueue(db:DatabaseSync,run:any,kind:string,payload:any,status='queued'
 function startRun(db:DatabaseSync,thread:any){
   const key=id()
   db.prepare('INSERT INTO runs VALUES(?,?,?,?,?,?,?,?)').run(key,thread.id,thread.taskId,thread.instanceId,'queued',null,null,now())
-  if(thread.taskId) db.prepare("UPDATE tasks SET status='queued' WHERE id=?").run(thread.taskId)
+  if(thread.taskId){
+    db.prepare("UPDATE tasks SET status='queued' WHERE id=?").run(thread.taskId)
+    const task=getTask(db,thread.taskId)
+    linkTaskThread(db,task.id,thread.id,task.originThreadId===task.workThreadId?'direct':task.originThreadId===thread.id?'origin':'work')
+  }
   return latestRun(db,thread.id)
+}
+function linkTaskThread(db:DatabaseSync,taskId:string,threadId:string,relation:'origin'|'work'|'direct'){
+  db.prepare('INSERT OR IGNORE INTO task_threads(taskId,threadId,relation,createdAt) VALUES(?,?,?,?)')
+    .run(taskId,threadId,relation,now())
 }
 export function prepareModels(db:DatabaseSync,thread:any){
   if(thread.taskId||thread.instanceId==='main'||!JSON.parse(instance(db,thread.instanceId).availableActions).includes('prepare'))fail('这个话题无法预读原生模型',409)
+  assertBotAllowed(db,thread.instanceId,'direct',thread.projectId)
+  if(thread.state!=='active'||thread.nativeInvalid)fail('已归档、删除或失效的话题不能继续执行',409)
   projectWorkspace(db,thread.projectId,thread.instanceId)
   const active=latestRun(db,thread.id)
   if(active&&!terminal.has(active.status))fail('话题正在运行',409)
@@ -290,8 +353,16 @@ export function prepareModels(db:DatabaseSync,thread:any){
 }
 export function nativeSessionTarget(db:DatabaseSync,instanceId:string,projectId:string|null){
   const inst=instance(db,instanceId)
-  projectWorkspace(db,projectId,instanceId)
-  if(inst.adapterKey!=='codex'||JSON.parse(inst.capabilities).sessionList!==true)fail('此实例未声明可核对的原生会话导入能力',409)
+  assertBotAllowed(db,instanceId,'direct',projectId)
+  return checkNativeCatalogTarget(db,inst,projectId)
+}
+export function nativeSessionCatalogTarget(db:DatabaseSync,instanceId:string,projectId:string|null){
+  const inst=instance(db,instanceId)
+  return checkNativeCatalogTarget(db,inst,projectId)
+}
+function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null){
+  projectWorkspace(db,projectId,inst.id)
+  if(JSON.parse(inst.capabilities).sessionList!==true)fail('此实例未声明可核对的原生会话目录能力',409)
   if(!inst.online)fail('原生实例离线',409)
   return inst
 }
@@ -301,13 +372,17 @@ export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any)
   if(!/^[\w-]{1,128}$/.test(native))fail('原生会话 ID 格式无效')
   const inst=nativeSessionTarget(db,key,projectId)
   const existing=one(db,`SELECT t.* FROM threads t JOIN instances i ON i.id=t.instanceId
-    WHERE i.nodeId=? AND i.profileId=? AND i.workspaceRef=? AND i.adapterKey=? AND t.sessionId=?`,
-    inst.nodeId,inst.profileId,inst.workspaceRef,inst.adapterKey,native)
+    WHERE t.sessionId=? AND i.workspaceRef=? AND i.adapterKey=? AND
+      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
+       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
+    native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId)
   if(existing)return {thread:existing,status:'bound'}
   const pending=one(db,`SELECT c.threadId,c.runId FROM commands c JOIN runs r ON r.id=c.runId JOIN instances i ON i.id=c.instanceId
-    WHERE i.nodeId=? AND i.profileId=? AND i.workspaceRef=? AND i.adapterKey=? AND c.kind='prepare'
-    AND json_extract(c.payload,'$.importSessionId')=? AND r.status IN ('queued','running','uncertain')`,
-    inst.nodeId,inst.profileId,inst.workspaceRef,inst.adapterKey,native)
+    WHERE i.workspaceRef=? AND i.adapterKey=? AND c.kind='prepare' AND json_extract(c.payload,'$.importSessionId')=?
+      AND r.status IN ('queued','running','uncertain') AND
+      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
+       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
+    inst.workspaceRef,inst.adapterKey,native,inst.runtimeScopeId,inst.nodeId,inst.profileId)
   if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending'}
   const previous=one(db,`SELECT t.* FROM threads t JOIN commands c ON t.id=c.threadId
     WHERE t.instanceId=? AND t.projectId IS ? AND t.sessionId IS NULL AND c.kind='prepare'
@@ -315,7 +390,7 @@ export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any)
     AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.threadId=t.id AND m.role='user')
     ORDER BY c.rowid DESC LIMIT 1`,key,projectId,native)
   const thread=previous&&terminal.has(latestRun(db,previous.id)?.status)?previous:
-    createThread(db,dir,{title:required(b.title??'导入的 Codex 话题','title').slice(0,120),instanceId:key,projectId})
+    createThread(db,dir,{title:required(b.title??'导入的 Codex 话题','title').slice(0,120),instanceId:key,projectId,source:'imported'})
   const run=startRun(db,thread)
   enqueue(db,run,'prepare',{importSessionId:native})
   return {thread,runId:run.id,status:'queued'}
@@ -327,13 +402,14 @@ function delegationTarget(db:DatabaseSync,b:any){
   const projectId=b.projectId==null?origin.projectId:required(b.projectId,'projectId')
   if(origin.projectId && projectId!==origin.projectId)fail('发起话题属于另一项目，请从对应项目开启话题',409)
   projectWorkspace(db,projectId,inst.id)
+  assertBotAllowed(db,inst.id,'delegate',projectId)
   return {origin,inst,projectId}
 }
 export function draftDelegate(db:DatabaseSync,dir:string,b:any){
   const {origin,inst,projectId}=delegationTarget(db,b)
   const existing=one(db,'SELECT t.* FROM task_drafts d JOIN threads t ON t.id=d.threadId WHERE d.originThreadId=? AND t.instanceId=? AND t.projectId IS ?',origin.id,inst.id,projectId)
   if(existing)return existing
-  const thread=createThread(db,dir,{instanceId:inst.id,projectId,title:'委派草稿'})
+  const thread=createThread(db,dir,{instanceId:inst.id,projectId,title:'委派草稿',source:'delegated'})
   db.prepare('INSERT INTO task_drafts VALUES(?,?)').run(thread.id,origin.id)
   return thread
 }
@@ -364,24 +440,40 @@ type CoordinationApproval={taskId:string;revision:number}
 export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:string,coordination?:CoordinationApproval) {
   const {origin,inst,projectId}=delegationTarget(db,b)
   const goal=required(b.goal,'goal'),title=goal.slice(0,70)
+  const reason=typeof b.routeReason==='string'?b.routeReason.trim().slice(0,1000):''
+  if(b.taskId!=null)return continueTask(db,dir,origin,inst,projectId,required(b.taskId,'taskId'),goal,b,sourceMessageId,reason)
   const {attachmentIds,materials}=makeInput(db,dir,b,projectId,inst)
   let thread
+  let reusedDraft=false
   if(b.workThreadId!=null){
     const key=required(b.workThreadId,'workThreadId')
     thread=one(db,'SELECT t.* FROM task_drafts d JOIN threads t ON t.id=d.threadId WHERE t.id=? AND d.originThreadId=? AND t.instanceId=? AND t.projectId IS ? AND t.taskId IS NULL',key,origin.id,inst.id,projectId)
-    if(!thread)fail('委派草稿与发起话题、项目或执行实例不匹配',409)
-    const run=latestRun(db,key)
-    if(run&&(!run.modelSetup||!terminal.has(run.status)))fail('正在读取此会话的模型，请稍候',409)
-    if(Object.hasOwn(b,'modelId'))selectModel(db,thread,b.modelId)
-    db.prepare('UPDATE threads SET title=? WHERE id=?').run(title,key)
-    db.prepare('DELETE FROM task_drafts WHERE threadId=?').run(key)
-  }else thread=createThread(db,dir,{instanceId:inst.id,projectId,title,modelId:b.modelId})
+    if(thread){
+      reusedDraft=true
+      const run=latestRun(db,key)
+      if(run&&(!run.modelSetup||!terminal.has(run.status)))fail('正在读取此会话的模型，请稍候',409)
+      if(Object.hasOwn(b,'modelId'))selectModel(db,thread,b.modelId)
+      db.prepare('UPDATE threads SET title=? WHERE id=?').run(title,key)
+      db.prepare('DELETE FROM task_drafts WHERE threadId=?').run(key)
+    }else{
+      thread=one(db,`SELECT * FROM threads WHERE id=? AND instanceId=? AND projectId IS ? AND kind IN ('native','api') AND state='active'
+        AND NOT EXISTS(SELECT 1 FROM task_drafts d WHERE d.threadId=threads.id)`,key,inst.id,projectId)
+      if(!thread||thread.kind==='native'&&(!thread.sessionId||thread.nativeInvalid))fail('目标工作话题不属于选定 Bot/项目或没有有效原生会话',409)
+      const run=latestRun(db,key)
+      if(run&&!terminal.has(run.status))fail('目标原生会话仍有运行，不能并行启动另一个任务',409)
+      if(run?.status==='uncertain')fail('目标运行送达待核对，不能启动另一个任务',409)
+      if(Object.hasOwn(b,'modelId'))selectModel(db,thread,b.modelId)
+    }
+  }else thread=createThread(db,dir,{instanceId:inst.id,projectId,title,modelId:b.modelId,source:'delegated'})
   const lines=(v:any)=>(v==null?[]:Array.isArray(v)?v:[v]).map((s:any)=>required(s,'条件'))
   const scope=origin.instanceId==='main'?coordinationScope(db,projectId,b,sourceMessageId?'notify':'off'):undefined
   const taskId=id(),brief={goal,constraints:lines(b.constraints),doneWhen:lines(b.doneWhen),materials,attachmentIds,projectId,workspaceRef:inst.workspaceRef,
+    routing:{action:reusedDraft?'new_session_from_draft':b.workThreadId?'reuse_native_session':'new_native_session',reason,sourceMessageId:sourceMessageId??null},
     ...(scope?{coordination:{...scope,parentTaskId:coordination?.taskId}}:{})}
   const prompt=JSON.stringify(brief,null,2)
   db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)').run(taskId,origin.id,thread.id,inst.id,projectId,goal,JSON.stringify(brief),'queued',now())
+  linkTaskThread(db,taskId,origin.id,origin.id===thread.id?'direct':'origin')
+  linkTaskThread(db,taskId,thread.id,origin.id===thread.id?'direct':'work')
   db.prepare('UPDATE threads SET taskId=? WHERE id=?').run(taskId,thread.id)
   const run=startRun(db,{...thread,taskId})
   const communication:Communication={sender:sourceMessageId?mainBot:user,recipient:botAudience(inst.id),type:'assignment',visibility:'bot_internal',
@@ -392,11 +484,47 @@ export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:strin
   addTaskRecord(db,projectId,taskId,'start',goal,{instanceId:inst.id,runId:run.id,workThreadId:thread.id,workspaceRef:inst.workspaceRef,doneWhen:brief.doneWhen})
   return {taskId,workThreadId:thread.id,runId:run.id,status:'queued'}
 }
+function continueTask(db:DatabaseSync,dir:string,origin:any,inst:any,projectId:string|null,taskId:string,goal:string,b:any,
+  sourceMessageId:string|undefined,reason:string){
+  const task=getTask(db,taskId)
+  if(task.instanceId!==inst.id||task.projectId!==projectId)fail('指定任务与 Bot 或项目不匹配',409)
+  const thread=getThread(db,task.workThreadId)
+  if(thread.instanceId!==inst.id||thread.projectId!==projectId||thread.state!=='active'||
+    thread.kind==='native'&&(thread.nativeInvalid||!thread.sessionId)||!['native','api'].includes(thread.kind))
+    fail('指定任务没有可继续的有效原生工作话题',409)
+  const active=latestRun(db,thread.id)
+  if(active&&!terminal.has(active.status))fail('目标原生会话仍有运行，不能并行继续任务',409)
+  const previous=one(db,'SELECT * FROM runs WHERE taskId=? AND threadId=? ORDER BY rowid DESC LIMIT 1',task.id,thread.id)
+  if(previous?.status==='uncertain')fail('目标任务送达待核对，不能重复运行',409)
+  checkManualRetry(db,previous,b)
+  const {attachmentIds,materials}=makeInput(db,dir,b,projectId,inst,thread.id)
+  const run=startRun(db,{...thread,taskId:task.id})
+  const communication:Communication={sender:sourceMessageId?mainBot:user,recipient:botAudience(inst.id),type:'task_continue',
+    visibility:'bot_internal',sourceMessageId,runId:run.id,taskId:task.id,threadId:thread.id,projectId}
+  const text=JSON.stringify({taskId:task.id,goal,constraints:task.brief.constraints??[],doneWhen:task.brief.doneWhen??[],
+    materials,attachmentIds,continuation:true,routeReason:reason})
+  const mid=message(db,thread.id,'user','brief',text,{goal,continuation:true,routeReason:reason},materials,task.id,communication)
+  linkTaskThread(db,task.id,origin.id,origin.id===thread.id?'direct':'origin')
+  db.prepare('UPDATE threads SET taskId=? WHERE id=?').run(task.id,thread.id)
+  enqueue(db,run,'run',{text,attachmentIds,materials,communication:{...communication,messageId:mid}})
+  message(db,origin.id,'assistant','task_card',goal,{workThreadId:thread.id,instanceId:inst.id,continuation:true},[],task.id,
+    {sender:system,type:'task_continuation'})
+  addTaskRecord(db,projectId,task.id,'resume',goal,{runId:run.id,instanceId:inst.id,workThreadId:thread.id,reason,sourceMessageId:sourceMessageId??null})
+  return {taskId:task.id,workThreadId:thread.id,runId:run.id,status:'queued',continued:true}
+}
 export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMessageId?:string,coordination?:CoordinationApproval){
   if(one(db,'SELECT 1 FROM task_drafts WHERE threadId=?',thread.id))fail('请通过委派表单提交此草稿',409)
+  if(thread.state!=='active')fail('已归档或删除的话题不能继续执行',409)
+  if(thread.instanceId!=='main')assertBotAllowed(db,thread.instanceId,sourceMessageId?'delegate':'direct',thread.projectId)
   projectWorkspace(db,thread.projectId,thread.instanceId)
   const target=thread.instanceId==='main'?undefined:instance(db,thread.instanceId)
-  const {attachmentIds,materials}=makeInput(db,dir,b,thread.projectId,target)
+  const pendingShares=pendingShareRefs(db,thread.id)
+  const requestedRefs=b.materialRefs??b.refs??[]
+  if(!Array.isArray(requestedRefs))fail('引用须为数组')
+  const requestedShares=requestedRefs.filter((ref:any)=>ref?.type==='share')
+  const shareRefs=[...requestedShares,...pendingShares.filter(ref=>!requestedShares.some((requested:any)=>requested.id===ref.id))]
+  const refs=[...requestedRefs.filter((ref:any)=>ref?.type!=='share'),...shareRefs]
+  const {attachmentIds,materials}=makeInput(db,dir,{...b,materialRefs:refs},thread.projectId,target,thread.id)
   const text=required(b.text || (attachmentIds.length?'请查看随附材料':''),'text')
   const payload={...inputPayload(text,attachmentIds,materials),coordination}
   const active=latestRun(db,thread.id)
@@ -406,6 +534,7 @@ export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMess
   if(thread.instanceId!=='main' && thread.projectId && !thread.taskId){
     const taskId=id(),brief={goal:text,doneWhen:[],constraints:[],attachmentIds,materials,projectId:thread.projectId,workspaceRef:target.workspaceRef}
     db.prepare('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?)').run(taskId,thread.id,thread.id,thread.instanceId,thread.projectId,text,JSON.stringify(brief),'queued',now())
+    linkTaskThread(db,taskId,thread.id,'direct')
     db.prepare('UPDATE threads SET taskId=? WHERE id=?').run(taskId,thread.id)
     thread.taskId=taskId
     addTaskRecord(db,thread.projectId,taskId,'start',text,{instanceId:thread.instanceId,workThreadId:thread.id,workspaceRef:target.workspaceRef})
@@ -415,7 +544,9 @@ export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMess
   const communication:Communication={sender:sourceMessageId?mainBot:user,recipient:botAudience(thread.instanceId),
     type:sourceMessageId?(replyTo?'reply':'bot_message'):'user_message',visibility:sourceMessageId?'bot_internal':'user_visible',
     sourceMessageId,replyTo,threadId:thread.id,projectId:thread.projectId}
-  const mid=message(db,thread.id,'user','message',text,{attachmentIds,replyTo},materials,thread.taskId,communication)
+  const budget=thread.instanceId==='main'?budgetOverride(dir,b.toolBudget):null
+  const mid=message(db,thread.id,'user','message',text,{attachmentIds,replyTo,...(budget?{toolBudget:budget}:{})},materials,thread.taskId,communication)
+  markSharesSent(db,thread.id,shareRefs,mid)
   if(thread.instanceId==='main'){
     db.prepare("INSERT INTO chat_jobs(threadId,messageId,status) VALUES(?,?,'queued')").run(thread.id,mid)
     return {messageId:mid,status:'queued'}
@@ -437,6 +568,12 @@ export function control(db:DatabaseSync,dir:string,key:string,b:any,sourceMessag
     if(b.kind==='resume'){
       const active=latestRun(db,thread.id)
       if(cmd.status!=='held'||!terminal.has(run.status)||!active||!terminal.has(active.status))fail('请等待当前运行结束后再发送挂起输入',409)
+      if(thread.state!=='active')fail('已归档或删除的话题不能继续执行',409)
+      if(thread.instanceId!=='main'){
+        const queuedPayload=JSON.parse(cmd.payload)
+        const action=queuedPayload.communication?.sender?.kind==='main_bot'?'delegate':'direct'
+        assertBotAllowed(db,thread.instanceId,action,thread.projectId)
+      }
       checkManualRetry(db,active,b)
       projectWorkspace(db,thread.projectId,thread.instanceId)
       const next=startRun(db,thread),payload=nextModel(db,thread.id,JSON.parse(cmd.payload))
@@ -470,16 +607,16 @@ export function control(db:DatabaseSync,dir:string,key:string,b:any,sourceMessag
       db.prepare("UPDATE runs SET status='cancelled' WHERE id=?").run(key)
       const {modelId}=JSON.parse(unsent.payload)
       if(modelId)db.prepare('UPDATE thread_models SET selected=? WHERE threadId=? AND selected IS NULL').run(modelId,thread.id)
-      if(thread.taskId){
-        db.prepare("UPDATE tasks SET status='cancelled' WHERE id=?").run(thread.taskId)
-        addTaskRecord(db,thread.projectId,thread.taskId,'result',text,{runId:key,instanceId:thread.instanceId,status:'cancelled'})
+      if(run.taskId){
+        db.prepare("UPDATE tasks SET status='cancelled' WHERE id=?").run(run.taskId)
+        addTaskRecord(db,thread.projectId,run.taskId,'result',text,{runId:key,instanceId:thread.instanceId,status:'cancelled'})
       }
-      message(db,thread.id,'system','activity',text,{runId:key,commandId:unsent.id},[],thread.taskId)
-      changed(db,'run',{taskId:thread.taskId,runId:key,threadId:thread.id,status:'cancelled'})
+      message(db,thread.id,'system','activity',text,{runId:key,commandId:unsent.id},[],run.taskId)
+      changed(db,'run',{taskId:run.taskId,runId:key,threadId:thread.id,status:'cancelled'})
       return {commandId:unsent.id,runId:key,status:'cancelled'}
     }
     db.prepare("UPDATE runs SET status='cancelling' WHERE id=?").run(key)
-    if(thread.taskId)db.prepare("UPDATE tasks SET status='cancelling' WHERE id=?").run(thread.taskId)
+    if(run.taskId)db.prepare("UPDATE tasks SET status='cancelling' WHERE id=?").run(run.taskId)
   } else {
     if(run.status!=='waiting_input')fail('原生运行当前未等待授权',409)
     const q=run.pendingRequest
@@ -528,6 +665,15 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   }
   if(run.commandKind==='prepare'){
     if(!terminal.has(kind))fail('读取模型的命令没有开始推理')
+    const op=JSON.parse(run.commandPayload).nativeOperation
+    if(op&&kind==='completed'){
+      if(data.nativeAction!==op.action||!data.sessionId||(op.action==='fork'?data.sessionId===op.sourceSessionId:data.sessionId!==op.sourceSessionId))
+        fail('原生操作与回执不匹配',409)
+      if(op.action==='delete')db.prepare("UPDATE threads SET nativeInvalid='原生删除已确认',nativeArchived=0 WHERE id=?").run(thread.id)
+      else if(op.action!=='fork')db.prepare('UPDATE threads SET nativeArchived=?,state=? WHERE id=?')
+        .run(Number(op.action==='archive'),op.action==='archive'?'archived':'active',thread.id)
+      message(db,thread.id,'system','activity','已收到原生会话操作回执：'+op.action,{runId:run.id,sourceThreadId:op.sourceThreadId})
+    }
     db.prepare('UPDATE runs SET status=? WHERE id=?').run(kind,run.id)
     changed(db,'model',{threadId:thread.id,runId:run.id,status:kind})
     if(kind==='completed'&&JSON.parse(run.commandPayload).importSessionId)
@@ -541,7 +687,7 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   if(terminal.has(kind)) status=kind
   db.prepare('UPDATE runs SET status=?,pendingRequest=? WHERE id=?').run(status,kind==='input_required'?JSON.stringify(data):terminal.has(kind)?null:run.pendingRequest,run.id)
   const addressed=JSON.parse(run.commandPayload).communication
-  const nativeMessage=kind!=='accepted'?message(db,thread.id,'assistant',kind,String(data.text??''),{...data,runId:run.id},[],thread.taskId,{
+  const nativeMessage=kind!=='accepted'?message(db,thread.id,'assistant',kind,String(data.text??''),{...data,runId:run.id},[],run.taskId,{
     sender:{kind:'work_bot',id:run.instanceId},recipient:addressed?.sender?.kind==='main_bot'?botAudience('main'):userAudience,
     type:kind==='completed'?'delivery':kind,replyTo:addressed?.messageId,
     visibility:addressed?.sender?.kind==='main_bot'&&!['input_required','artifact','failed','blocked'].includes(kind)?'bot_internal':'user_visible'
@@ -564,7 +710,7 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
         {sender:system,type:kind==='input_required'?'question_notice':'delivery_notice',replyTo:addressed?.sourceMessageId})
     }
   }
-  changed(db,'run',{taskId:thread.taskId,runId:run.id,threadId:thread.id,status,activity:kind})
+  changed(db,'run',{taskId:run.taskId,runId:run.id,threadId:thread.id,status,activity:kind})
   if(terminal.has(kind)){
     db.prepare('DELETE FROM run_grants WHERE runId=?').run(run.id)
     db.prepare('DELETE FROM communication_grants WHERE runId=?').run(run.id)

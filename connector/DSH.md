@@ -10,7 +10,9 @@ DSH 的 `desktop`、`web` 和 `acp` 分别加载各自的 profile。桌面里选
 node connector/native-smoke.ts connector/config.example.json dsh-local --inspect-models
 ```
 
-启动器路径因安装位置而异。可使用 PATH 或设置 `MAOQIU_DSH_EXECUTABLE` 指向官方启动器。也可在「Agent 设置」保存实际路径后点「测试连接」。更换已绑定实例的执行入口、工作目录或 profile 时，登记新的实例 ID。连接测试确认节点登记和握手。读取模型目录成功后，仍需实际发送一条消息才能验证供应方登录及额度。当前适配器没有可核对的外部 DSH 会话目录，已绑定会话可按 ACP 能力续接。
+启动器路径因安装位置而异。可使用 PATH 或设置 `MAOQIU_DSH_EXECUTABLE` 指向官方启动器。也可在「Agent 设置」保存实际路径后点「测试连接」。更换已绑定实例的执行入口、工作目录或 profile 时，登记新的实例 ID。连接测试确认节点登记和握手。实际发送一条消息可验证供应方登录及额度。
+
+握手声明 `sessionCapabilities.list` 时，工作台按配置工作目录查询并分页显示外部会话，核对后可导入。原生分支和删除也按握手开放。没有只读历史 API 时，工作台显示本地已收到的聊天记录。[会话能力矩阵](../docs/sessions.md)
 
 开启项目资料授权后，工作台在原生任务说明中给出本次运行可用的 `project-api.ts` 调用方式。可使用它向小毛球提交问题、进展、交接与交付。交接发送给指定后续 Bot 前由小毛球核对项目与用户授权，执行方自报检查需由所有者验收。 [项目通信 API](../server/home/API.md)
 

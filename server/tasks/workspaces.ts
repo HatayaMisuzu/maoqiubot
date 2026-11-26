@@ -6,7 +6,9 @@ export function projectWorkspaces(db:DatabaseSync,key:string,method:string,b:any
   must(db,'SELECT id FROM projects WHERE id=?',key)
   if(method==='POST'){
     const instance=must(db,'SELECT * FROM instances WHERE id=?',required(b.instanceId,'instanceId'))
-    if(required(b.workspaceRef,'workspaceRef')!==instance.workspaceRef)fail('执行实例的工作区与选择不一致',409)
+    if(instance.adapterKey==='model-api'){
+      if(b.workspaceRef||b.allowAgentAccess)fail('API 工作 Bot 只登记项目范围，无本机执行目录或项目凭据',409)
+    }else if(required(b.workspaceRef,'workspaceRef')!==instance.workspaceRef)fail('执行实例的工作区与选择不一致',409)
     if(b.allowAgentAccess!==undefined&&typeof b.allowAgentAccess!=='boolean')fail('allowAgentAccess 须为布尔值')
     const permission=b.agentPermission??'read',allow=b.allowAgentAccess===true?1:0
     if(!['read','append','manage'].includes(permission))fail('无效的运行资料权限')

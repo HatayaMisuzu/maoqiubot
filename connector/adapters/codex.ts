@@ -2,7 +2,7 @@ import {relative,resolve} from 'node:path'
 import {createHash} from 'node:crypto'
 import {Native} from './base.ts'
 import type {Input,Run,Adapter} from '../types.ts'
-import type {ModelOption,ModelState} from '../../contracts/node.ts'
+import type {ModelOption,ModelState,NativeAction,NativeHistory} from '../../contracts/node.ts'
 
 function inputs(input:Input) {
   return [{type:'text',text:input.text,text_elements:[]},...input.files.map(f=>f.mime.startsWith('image/')
@@ -37,17 +37,21 @@ export class Codex extends Native implements Adapter {
       try {await this.rpc.request(method,{},5000);return true}
       catch(e:any) {return e.code===-32602 || (e.code===-32600 && /missing field.*threadId/.test(e.message))}
     }
-    const [steer,cancel,history]=await Promise.all(['turn/steer','turn/interrupt','thread/read'].map(supported))
+    const [steer,cancel,history,nativeHistory,fork,archive,unarchive]=await Promise.all(
+      ['turn/steer','turn/interrupt','thread/read','thread/turns/list','thread/fork','thread/archive','thread/unarchive'].map(supported))
+    const nativeActions:NativeAction[]=[]
+    if(fork)nativeActions.push('fork')
+    if(archive&&unarchive)nativeActions.push('archive','unarchive')
     let sessionList=false
     if(history)try{await this.catalog({limit:1});sessionList=true}catch{}
     return {availableActions:['run','prepare','answer',...(steer?['steer']:[]),...(cancel?['cancel']:[])],
-      version:hello.userAgent,resume:true,history,sessionList,models:this.models}
+      version:hello.userAgent,resume:true,history,sessionList,nativeHistory,nativeActions,models:this.models}
   }
   private async catalog(options:object){
     const result=await this.rpc.request('thread/list',{...options,cwd:this.instance.workspaceRef,currentAccountOnly:true,useStateDbOnly:true},5000)
     if(!Array.isArray(result?.data))throw Error('Codex 未提供可核对的会话目录')
     return {...result,data:result.data.filter((thread:any)=>typeof thread.id==='string'&&typeof thread.cwd==='string'&&
-      relative(this.instance.workspaceRef,thread.cwd)===''&&!thread.ephemeral&&!thread.parentThreadId)}
+      relative(this.instance.workspaceRef,thread.cwd)===''&&!thread.ephemeral)}
   }
   async listSessions(cursor?:string){
     const result=await this.catalog({limit:35,sortKey:'updated_at',cursor})
@@ -77,6 +81,45 @@ export class Codex extends Native implements Adapter {
       throw new Error('原生工作区或线程不符')
     this.sessions.add(thread.id)
     if(typeof model==='string')this.sessionModels.set(thread.id,model)
+    return thread.id as string
+  }
+  async readHistory(sessionId:string,before?:string):Promise<NativeHistory>{
+    const {thread}=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
+    if(thread?.id!==sessionId||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!=='')throw Error('原生历史工作区不匹配')
+    const page=await this.rpc.request('thread/turns/list',{threadId:sessionId,limit:6,sortDirection:'desc',itemsView:'full',cursor:before},5000)
+    if(!Array.isArray(page.data))throw Error('原生历史读取失败')
+    const items:NativeHistory['items']=[]
+    let bytes=0
+    for(const turn of page.data.reverse())for(const item of turn.items??[]){
+      if(typeof item.id!=='string'||typeof turn.id!=='string'||!['userMessage','agentMessage'].includes(item.type))continue
+      const text=item.type==='agentMessage'?item.text:(item.content??[]).filter((part:any)=>part.type==='text').map((part:any)=>part.text).join('\n')
+      if(typeof text!=='string'||!text.trim())continue
+      bytes+=Buffer.byteLength(text)
+      if(bytes>2*1024*1024)throw Error('此页原生历史过大，请在原生客户端查看')
+      items.push({id:item.id,turnId:turn.id,role:item.type==='agentMessage'?'assistant':'user',text})
+    }
+    // Absence from a filtered page is insufficient evidence of external deletion.
+    let archived:boolean|undefined
+    for(const value of [false,true]){
+      try{
+        const found=await this.catalog({includedThreadIds:[sessionId],archived:value,limit:1})
+        if(found.data.some((t:any)=>t.id===sessionId)){archived=value;break}
+      }catch{break}
+    }
+    return {items,nextBefore:page.nextCursor??null,archived}
+  }
+  async sessionAction(action:NativeAction,sessionId:string){
+    if(action==='delete')throw Error('此 Codex 适配器未提供原生删除')
+    if(this.active.has(sessionId))throw Error('原生会话仍在运行')
+    const original=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
+    if(original.thread?.id!==sessionId||typeof original.thread.cwd!=='string'||
+      relative(this.instance.workspaceRef,original.thread.cwd)!==''||original.thread.status?.type==='active')throw Error('原生工作区或空闲状态无法核对')
+    const result=await this.rpc.request('thread/'+action,{threadId:sessionId,...(action==='fork'?{cwd:this.instance.workspaceRef}:{})})
+    if(action==='archive'){this.sessions.delete(sessionId);return sessionId}
+    const thread=result.thread
+    if(typeof thread?.id!=='string'||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!==''||
+      (action==='fork'?thread.id===sessionId:thread.id!==sessionId))throw Error('原生会话操作回执不匹配')
+    if(action==='fork')this.sessions.add(thread.id)
     return thread.id as string
   }
   describeModels(sessionId:string):ModelState{

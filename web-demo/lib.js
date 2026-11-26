@@ -87,4 +87,4 @@ export async function download(id) {
   const a=el('a');a.href=URL.createObjectURL(await response.blob());a.download=encoded?decodeURIComponent(encoded):'附件';
   a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);
 }
-export const state={threads:[],instances:[],projects:[],view:'chat',thread:null,project:null,page:null,snapshot:null};
+export const state={threads:[],archivedThreads:[],deletedThreads:[],instances:[],projects:[],view:'chat',thread:null,instance:'main',mainThread:null,project:null,page:null,snapshot:null};

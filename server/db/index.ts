@@ -4,6 +4,9 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { initHome } from '../home/index.ts'
 import { initSearch } from '../home/search.ts'
+import { initSessions } from './sessions.ts'
+import { initChatBudget } from './chat-budget.ts'
+import { initBotSchema } from '../tasks/bots.ts'
 import type { Principal } from '../home/common.ts'
 
 export const id = () => randomUUID()
@@ -34,7 +37,7 @@ export function openDatabase(dir: string) {
   mkdirSync(dir, { recursive: true })
   const db = new DatabaseSync(join(dir, 'workbench.sqlite'))
   try {
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000')
+    db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON')
     migrate(db,[initLegacySchema,db=>{
       // Legacy releases could set v1 before finishing the initial schema.
       initLegacySchema(db)
@@ -84,7 +87,7 @@ export function openDatabase(dir: string) {
       CREATE TABLE memory_candidates(id TEXT PRIMARY KEY,threadId TEXT NOT NULL REFERENCES threads(id),
         messageId TEXT NOT NULL UNIQUE REFERENCES messages(id), projectId TEXT REFERENCES projects(id),
         body TEXT NOT NULL,factKey TEXT,recordType TEXT NOT NULL,important INTEGER NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL);
-    `)])
+    `),db=>{initSessions(db);initBotSchema(db);initChatBudget(db)}])
     db.exec('UPDATE instances SET online=0')
     db.function('maoqiu_fact_key',{deterministic:true},value=>typeof value==='string'?normalizeFactKey(value):null)
     return db

@@ -3,17 +3,17 @@ import type { Server } from 'node:http'
 import type { DatabaseSync } from 'node:sqlite'
 import { transaction, changed, now, required, one, must, fail } from '../db/index.ts'
 import { applyEvent, addProjectContext, checkQueuedInput, markUncertain } from '../tasks/index.ts'
-import type { NativeSession, NodeCommand } from '../../contracts/node.ts'
+import type { NativeSession, NativeHistory, NodeCommand } from '../../contracts/node.ts'
 import { secret,hash } from './auth.ts'
 import { isLocal } from './local.ts'
 
-export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined){
+export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined,dataDir:string){
   const wss=new WebSocketServer({noServer:true,maxPayload:4*1024*1024})
   const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,alive:boolean,instances:Set<string>}>()
   const catalogs=new Map<string,{ws:WebSocket; respond:(frame:any)=>void}>()
   server.on('upgrade',(req,socket,head)=>{
     const nodeId=authenticate((req.headers.authorization??'').replace(/^Bearer /,''))
-    if(!nodeId || req.url?.split('?')[0]!=='/api/v1/node'){socket.destroy();return}
+    if(!nodeId || nodeId==='@model-api' || req.url?.split('?')[0]!=='/api/v1/node'){socket.destroy();return}
     wss.handleUpgrade(req,socket,head,ws=>{
       let registered=false
       const helloTimeout=setTimeout(()=>{if(!registered) ws.terminate()},10000)
@@ -35,11 +35,21 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
               for(const i of m.instances){
                 const key=required(i.id,'instanceId'),old=one(db,'SELECT * FROM instances WHERE id=?',key)
                 const profileId=required(i.profileId??'default','profileId')
-                if(key==='main'|| (old && (old.nodeId!==nodeId || old.workspaceRef!==i.workspaceRef || old.adapterKey!==i.adapterKey || old.profileId!==profileId))) fail('实例绑定冲突，请用新实例 ID')
+                const runtimeScopeId=i.runtimeScopeId==null?null:required(i.runtimeScopeId,'runtimeScopeId')
+                if(runtimeScopeId&&!/^[a-f0-9]{64}$/.test(runtimeScopeId))fail('原生运行范围标识无效')
+                if(key==='main'||i.adapterKey==='model-api'|| (old && (old.nodeId!==nodeId || old.workspaceRef!==i.workspaceRef || old.adapterKey!==i.adapterKey || old.profileId!==profileId ||
+                  old.runtimeScopeId&&runtimeScopeId&&old.runtimeScopeId!==runtimeScopeId))) fail('实例绑定冲突，请用新实例 ID')
                 if(!Array.isArray(i.availableActions)) fail('缺少实例能力')
                 const blocked=i.adapterKey==='codex'&&!isLocal(req)
-                const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
-                db.prepare('INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,availableActions=excluded.availableActions,lastSeen=excluded.lastSeen,online=excluded.online,capabilities=excluded.capabilities').run(key,nodeId,required(i.name,'name'),required(i.adapterKey,'adapterKey'),required(i.workspaceRef,'workspaceRef'),JSON.stringify(i.availableActions),now(),blocked||i.online===false?0:1,JSON.stringify(caps),profileId)
+                const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,nativeHistory:i.nativeHistory===true,
+                  nativeActions:['fork','archive','unarchive','delete'].filter(action=>Array.isArray(i.nativeActions)&&i.nativeActions.includes(action)),
+                  error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
+                db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,availableActions=excluded.availableActions,
+                  lastSeen=excluded.lastSeen,online=excluded.online,capabilities=excluded.capabilities,
+                  runtimeScopeId=COALESCE(excluded.runtimeScopeId,instances.runtimeScopeId)`)
+                  .run(key,nodeId,required(i.name,'name'),required(i.adapterKey,'adapterKey'),required(i.workspaceRef,'workspaceRef'),
+                    JSON.stringify(i.availableActions),now(),blocked||i.online===false?0:1,JSON.stringify(caps),profileId,runtimeScopeId)
               }
               changed(db,'presence',{nodeId,online:true})
             })
@@ -55,7 +65,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           if(m.type==='event'){
             transaction(db,()=>applyEvent(db,nodeId,m.event))
             ws.send(JSON.stringify({type:'ack',key:m.event.key}))
-          }else if(m.type==='sessions'){
+          }else if(m.type==='sessions'||m.type==='history'){
             const request=catalogs.get(m.id)
             if(request?.ws===ws)request.respond(m)
           }else if(m.type==='receipt_missing'){
@@ -113,7 +123,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     const input=['run','steer','prepare'].includes(c.kind)
     const projectRun=c.kind==='run'&&c.projectId
     const binding=projectRun?one(db,'SELECT agentPermission FROM project_workspaces WHERE projectId=? AND instanceId=? AND allowAgentAccess=1',c.projectId,c.instanceId)?.agentPermission??null:null
-    if(input)checkQueuedInput(db,c,{...rest,attachmentIds})
+    if(input)checkQueuedInput(db,dataDir,c,{...rest,attachmentIds,communication})
     if(c.status!=='queued'&&!previous)fail('旧版本发送记录缺少冻结材料，需人工核对',409)
     if(previous&&['run','prepare'].includes(c.kind)&&
       (c.runStatus!=='queued'||c.nativeRunId||c.sessionId!==previous.sessionId))
@@ -141,7 +151,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       .run(JSON.stringify(dispatch),c.id)
     return {id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,projectId:c.projectId,
       profileId:c.profileId,workspaceRef:c.workspaceRef,kind:c.kind,payload:{text:dispatch.text,sessionId:dispatch.sessionId,nativeRunId:dispatch.nativeRunId,
-        attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,communication,importSessionId,
+        attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,nativeOperation:rest.nativeOperation,communication,importSessionId,
         ...(grant?{homeAccess:grant}:{}),...(communicationAccess?{communicationAccess}:{})}}
   }
   function flush(){
@@ -200,12 +210,12 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       }
     }
   }
-  function listSessions(inst:any,cursor:string|null){
+  function queryNative(inst:any,request:Record<string,unknown>){
     const link=online.get(inst.nodeId)
     if(!link?.instances.has(inst.id)||link.ws.readyState!==WebSocket.OPEN)fail('原生节点离线',409)
     const {ws}=link
     if(catalogs.size>=10)fail('读取原生会话的请求过多，请稍后重试',429)
-    return new Promise<{items:NativeSession[];nextCursor:string|null}>((resolve,reject)=>{
+    return new Promise<any>((resolve,reject)=>{
       const id=secret()
       function cleanup(){catalogs.delete(id);clearTimeout(timeout);ws.off('close',disconnected)}
       function error(text:string){cleanup();reject(Object.assign(Error(text),{status:502}))}
@@ -215,15 +225,36 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       catalogs.set(id,{ws,respond(frame){
         if(frame.error||!Array.isArray(frame.items)){error('原生实例无法返回当前工作区的会话');return}
         cleanup()
-        const items=frame.items.slice(0,35).filter((item:any)=>typeof item?.id==='string'&&/^[\w-]{1,128}$/.test(item.id))
-          .map((item:any)=>({id:item.id,title:String(item.title??'').slice(0,140),updatedAt:Number(item.updatedAt)||0,active:item.active===true}))
-        resolve({items,nextCursor:typeof frame.nextCursor==='string'&&frame.nextCursor.length<=2000?frame.nextCursor:null})
+        resolve(frame)
       }})
-      ws.send(JSON.stringify({type:'list_sessions',id,instanceId:inst.id,workspaceRef:inst.workspaceRef,profileId:inst.profileId,cursor:cursor??undefined}),
+      ws.send(JSON.stringify({...request,id,instanceId:inst.id,workspaceRef:inst.workspaceRef,profileId:inst.profileId}),
         failure=>{if(failure)error('原生节点未能接收会话查询')})
     })
   }
-  return {flush,listSessions,inspect(runId:string){
+  async function listSessions(inst:any,cursor:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>{
+    const frame=await queryNative(inst,{type:'list_sessions',cursor:cursor??undefined})
+    const items=frame.items.filter((item:any)=>typeof item?.id==='string'&&/^[\w-]{1,128}$/.test(item.id))
+      .map((item:any)=>({id:item.id,title:String(item.title??'').slice(0,140),updatedAt:Number(item.updatedAt)||0,active:item.active===true}))
+    return {items,nextCursor:typeof frame.nextCursor==='string'&&frame.nextCursor.length<=2000?frame.nextCursor:null}
+  }
+  async function readHistory(thread:any,before?:string):Promise<NativeHistory>{
+    const inst=must(db,'SELECT * FROM instances WHERE id=?',thread.instanceId)
+    if(!thread.sessionId||!JSON.parse(inst.capabilities).nativeHistory)fail('此实例未提供绑定会话的只读历史',409)
+    if(before&&before.length>2000)fail('原生历史游标无效')
+    const frame=await queryNative(inst,{type:'read_history',threadId:thread.id,sessionId:thread.sessionId,before})
+    const latest=must(db,'SELECT state,sessionId FROM threads WHERE id=?',thread.id)
+    if(!['active','archived'].includes(latest.state)||latest.sessionId!==thread.sessionId)fail('会话可见范围已变化',409)
+    const items=frame.items.filter((i:any)=>typeof i.id==='string'&&typeof i.turnId==='string'&&typeof i.text==='string'&&['user','assistant'].includes(i.role))
+      .map(({id,turnId,role,text}:any)=>({id,turnId,role,text}))
+    if(typeof frame.archived==='boolean'&&Boolean(thread.nativeArchived)!==frame.archived){
+      transaction(db,()=>{
+        db.prepare('UPDATE threads SET nativeArchived=?,state=? WHERE id=?').run(Number(frame.archived),frame.archived?'archived':'active',thread.id)
+        changed(db,'thread',{threadId:thread.id,source:'native'})
+      })
+    }
+    return {items,nextBefore:typeof frame.nextBefore==='string'&&frame.nextBefore.length<=2000?frame.nextBefore:null,archived:frame.archived}
+  }
+  return {flush,listSessions,readHistory,inspect(runId:string){
     for(const command of db.prepare(`SELECT c.id,i.nodeId FROM commands c JOIN instances i ON i.id=c.instanceId
       WHERE c.runId=? AND c.status IN ('sent','received','uncertain')`).all(runId)){
       const link=online.get(String(command.nodeId)),id=String(command.id)

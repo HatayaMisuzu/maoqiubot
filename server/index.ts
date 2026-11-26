@@ -11,10 +11,11 @@ import { mainWorker } from './chat/index.ts'
 import type { ChatProvider } from './chat/provider.ts'
 import { selectedModel } from './chat/model-settings.ts'
 import { discoverModels, probeCapability, probeModel } from './chat/compatible.ts'
-import { checkQueuedInput, homeRead, nativeSessionTarget } from './tasks/index.ts'
+import { checkQueuedInput, homeRead, nativeSessionCatalogTarget } from './tasks/index.ts'
 import { isLocal } from './api/local.ts'
 import { pluginHost } from './plugins/host.ts'
 import { coordinationWorker } from './chat/coordination.ts'
+import { apiBotWorker } from './tasks/api-bots.ts'
 import { dueReminders } from './chat/daily.ts'
 import { expireApprovals } from './chat/approval.ts'
 import type { DesktopBridge } from './chat/tools.ts'
@@ -37,13 +38,15 @@ const stable=(v:any):any=>Array.isArray(v)?v.map(stable):v && typeof v==='object
 export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat?:boolean,chatProvider?:ChatProvider,desktop?:DesktopBridge}={}){
   const dataDir=resolve(opts.dataDir??process.env.MAOQIU_DATA??'data'),db=openDatabase(dataDir),auth=access(dataDir)
   const plugins=pluginHost(dataDir)
+  const apiBots=apiBotWorker(db,dataDir)
   const coordination=coordinationWorker(db,dataDir,plugins,opts.chatProvider)
   const ticket=secret(), sessions=new Set<string>();let ticketExpires=Date.now()+5*60000
   const streams=new Map<ServerResponse,number>()
   const chat=mainWorker(db,dataDir,opts.chatProvider,(threadId,messageId,text)=>{
     const data=JSON.stringify({kind:'chat_delta',threadId,messageId,text})
     for(const res of streams.keys())if(!res.writableNeedDrain&&!res.writableEnded)res.write('data: '+data+'\n\n')
-  },plugins,{desktop:opts.desktop,listSessions:(inst,cursor)=>nodes.listSessions(inst,cursor)})
+  },plugins,{desktop:opts.desktop,listSessions:(inst,cursor)=>nodes.listSessions(inst,cursor),
+    readNativeHistory:(thread,before)=>nodes.readHistory(thread,before)})
   const server=createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff')
     res.setHeader('Referrer-Policy','no-referrer')
@@ -80,7 +83,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
             WHERE c.id=? AND i.nodeId=? AND c.kind IN ('run','steer') AND c.status IN ('sent','received')
               AND r.status IN ('queued','running','waiting_input','cancelling')`,url.searchParams.get('commandId'),nodeId)
           if(!c||!JSON.parse(c.payload).attachmentIds?.includes(m[1]))fail('附件未随此命令授权',403)
-          checkQueuedInput(db,c,JSON.parse(c.payload))
+          checkQueuedInput(db,dataDir,c,JSON.parse(c.payload))
           return json(res,200,homeRead(db,dataDir,path,c.projectId))
         }
         fail('请使用工作台访问令牌登录',401)
@@ -105,11 +108,18 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         return json(res,200,result)
       }
       const sessionCatalog=path.match(/^\/instances\/([\w-]{1,128})\/sessions$/)
+      const nativeHistory=path.match(/^\/threads\/([\w-]{1,128})\/native$/)
+      if(method==='GET'&&nativeHistory){
+        if(!principal.owner||!isLocal(req))fail('原生消息限本机所有者读取',403)
+        const thread=one(db,"SELECT * FROM threads WHERE id=? AND state IN ('active','archived')",nativeHistory[1])
+        if(!thread)fail('会话不可读',404)
+        return json(res,200,await nodes.readHistory(thread,url.searchParams.get('before')??undefined))
+      }
       if(method==='GET'&&sessionCatalog){
         if(!principal.owner||!isLocal(req))fail('原生会话目录限本机所有者',403)
         const cursor=url.searchParams.get('cursor')
         if(cursor&&cursor.length>2000)fail('原生会话游标无效')
-        const inst=nativeSessionTarget(db,sessionCatalog[1],url.searchParams.get('projectId')||null)
+        const inst=nativeSessionCatalogTarget(db,sessionCatalog[1],url.searchParams.get('projectId')||null)
         return json(res,200,await nodes.listSessions(inst,cursor))
       }
       if(method==='POST'&&['/chat/models/test','/chat/models/discover','/chat/models/capability'].includes(path)){
@@ -152,11 +162,11 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         coordination.revalidate()
         if(b.action==='inspect'&&/^\/runs\/[^/]+\/recovery$/.test(path))nodes.inspect(result.runId)
         else nodes.flush()
-        broadcast();if(opts.chat!==false)void chat.tick()
+        apiBots.tick();broadcast();if(opts.chat!==false)void chat.tick()
       }
     }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}
   })
-  const nodes=attachNodes(server,db,auth.node)
+  const nodes=attachNodes(server,db,auth.node,dataDir)
   function mustProject(projectId:unknown){
     if(typeof projectId!=='string'||!one(db,'SELECT 1 FROM projects WHERE id=?',projectId))fail('项目不存在',404)
   }
@@ -166,7 +176,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
     for(const e of events){const value={...JSON.parse(String(e.body)),kind:e.kind,cursor:e.cursor};const ok=res.write('id: '+e.cursor+'\ndata: '+JSON.stringify(value)+'\n\n');streams.set(res,Number(e.cursor));if(!ok)break}
   }}
   const interval=setInterval(()=>{
-    nodes.flush();chat.revalidate();coordination.revalidate();expireApprovals(db);dueReminders(db,opts.desktop?.notify);broadcast()
+    nodes.flush();apiBots.tick();chat.revalidate();coordination.revalidate();expireApprovals(db);dueReminders(db,opts.desktop?.notify);broadcast()
     if(opts.chat!==false){void chat.tick();void coordination.tick()}
   },500)
   const heartbeat=setInterval(()=>{for(const r of streams.keys())if(!r.writableNeedDrain)r.write(': heartbeat\n\n')},15000)
@@ -174,7 +184,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
   const port=opts.port??Number(process.env.PORT??4317),host=opts.host??process.env.HOST??'127.0.0.1'
   server.listen(port,host)
   return {server,db,auth,ticket,dataDir,async close(){
-    clearInterval(interval);clearInterval(heartbeat);nodes.close();chat.abort();coordination.abort()
+    clearInterval(interval);clearInterval(heartbeat);nodes.close();apiBots.close();chat.abort();coordination.abort()
     for(const r of streams.keys())r.end()
     await new Promise<void>((done)=>server.close(()=>done()))
     db.close()

@@ -30,10 +30,12 @@ export function resolveOperation(db:DatabaseSync,b:any){
 }
 
 export function pendingChat(db:DatabaseSync,threadId:string){
-  return db.prepare(`SELECT messageId,status,operation FROM chat_jobs WHERE threadId=?
-    AND status IN ('queued','working','awaiting_approval') ORDER BY id`).all(threadId).map(({messageId,status,operation})=>{
+  return db.prepare(`SELECT messageId,status,operation,checkpoint FROM chat_jobs WHERE threadId=?
+    AND status IN ('queued','working','awaiting_approval','budget_paused') ORDER BY id`).all(threadId).map(({messageId,status,operation,checkpoint})=>{
     const data=status==='awaiting_approval'&&typeof operation==='string'?JSON.parse(operation) as Operation:null
-    return {messageId,status,proposal:data?{id:data.id,tool:data.tool,arguments:JSON.parse(data.args),expires:data.expires}:undefined}
+    const budget=status==='budget_paused'&&typeof checkpoint==='string'?JSON.parse(checkpoint):null
+    return {messageId,status,proposal:data?{id:data.id,tool:data.tool,arguments:JSON.parse(data.args),expires:data.expires}:undefined,
+      budget:budget?{used:budget.steps,softLimit:budget.softStepLimit,hardLimit:budget.hardStepLimit}:undefined}
   })
 }
 

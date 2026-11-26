@@ -1,6 +1,12 @@
 export type ModelOption = {id:string,label:string}
 export type ModelState = {current:string|null,options?:ModelOption[]}
 export type NativeSession={id:string;title:string;updatedAt:number;active:boolean}
+export type NativeAction='fork'|'archive'|'unarchive'|'delete'
+export type NativeHistory={items:{id:string;turnId:string;role:'user'|'assistant';text:string}[];nextBefore:string|null;archived?:boolean}
+export type NodeInstanceRegistration={id:string;name:string;adapterKey:string;workspaceRef:string;profileId?:string;runtimeScopeId?:string;
+  availableActions:string[];online?:boolean;version?:string;resume?:boolean;history?:boolean;sessionList?:boolean;nativeHistory?:boolean;
+  nativeActions?:NativeAction[];error?:string;models?:ModelOption[]}
+export type NodeHello={type:'hello';nodeId:string;receiptLookup?:boolean;instances:NodeInstanceRegistration[]}
 export type Actor={kind:'user'|'main_bot'|'work_bot'|'system'|'tool';id:string}
 export type Audience={kind:'user'|'bot'|'task'|'system';id:string}
 export type Communication={sender:Actor;recipient:Audience;type:string;visibility:'user_visible'|'bot_internal'|'system';
@@ -10,7 +16,7 @@ export type NodeCommand = {
   projectId?: string | null, profileId?: string, workspaceRef?: string,
   kind: 'run' | 'prepare' | 'steer' | 'cancel' | 'answer',
   payload: {text?: string, inputText?:string, sessionId?: string, nativeRunId?: string, requestId?: string, choice?: string, modelId?:string, attachmentIds?: string[],
-    materials?:unknown[],importSessionId?:string,communication?:Communication,communicationAccess?:{token:string},
+    materials?:unknown[],importSessionId?:string,nativeOperation?:{action:NativeAction;sourceThreadId:string;sourceSessionId:string},communication?:Communication,communicationAccess?:{token:string},
     homeAccess?: {token:string,projectId:string,permission?:'read'|'append'|'manage'}}
 }
 export type NodeEvent = {

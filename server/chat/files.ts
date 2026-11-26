@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fail } from '../db/index.ts'
 
@@ -16,6 +16,19 @@ export function allowedRoot(raw:string,dataDir:string){
   if(hasSecretPath(actual)||!statSync(actual).isDirectory()||inside(actual,appData)||inside(appData,actual))
     fail('资料根目录不能包含工作台数据、登录目录或秘密文件目录')
   return actual
+}
+export function workspaceDirectory(root:string,name:string,create:boolean){
+  if(!/^[\p{L}\p{N}_-][\p{L}\p{N}_ .-]{0,78}$/u.test(name)||/[. ]$/.test(name)||hasSecretPath(name)||
+    /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(name))fail('工作目录名无效',400)
+  const path=resolve(root,name)
+  const existing=lstatSync(path,{throwIfNoEntry:false})
+  if(existing){
+    if(existing.isSymbolicLink()||!existing.isDirectory()||!inside(root,realpathSync(path)))fail('已有路径不是授权根目录下的普通目录',403)
+  }else{
+    if(!create)fail('此工作目录尚不存在',404)
+    mkdirSync(path,{mode:0o700})
+  }
+  return {path:realpathSync(path),created:!existing}
 }
 export function localFiles(root:string,input:string,action:'list'|'read'|'write'|'open'|'archive',text?:string){
   const parts=input.split(/[\\/]+/)

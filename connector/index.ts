@@ -24,6 +24,7 @@ const instances=new Map<string,Entry>()
 const running=new Map<string,{run:Run,adapter:Adapter}>()
 const handling=new Set<string>()
 const occupied=new Set<string>()
+const workspaceTails=new Map<string,Promise<void>>()
 const grantCleanups=new Set<()=>void>()
 let ws:WebSocket|undefined
 let stopping=false
@@ -101,11 +102,13 @@ async function handle(c:Command) {
   let started=false
   let locked=false
   let cleanup=()=>{}
+  let releaseWorkspace=()=>{}
   try {
     receipt(c.id,'received')
     if(!inst?.adapter || !inst.caps.availableActions.includes(c.kind)) throw new Error('实例离线或不支持该操作')
     if(c.workspaceRef!==inst.config.workspaceRef || c.profileId!==inst.config.profileId) throw new Error('命令的工作区或 profile 与节点不一致')
     const adapter=inst.adapter
+    if(c.kind==='run'||c.kind==='prepare')releaseWorkspace=await lockWorkspace(inst.config.workspaceRef)
     if(c.kind==='run'||c.kind==='prepare') {
       if(occupied.has(c.threadId)) throw new Error('话题正在处理上一轮输入')
       occupied.add(c.threadId);locked=true
@@ -113,6 +116,19 @@ async function handle(c:Command) {
       const bound=store.binding(c,inst.config.workspaceRef,runtimeKey)
       if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
       const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
+      const op=c.kind==='prepare'?c.payload.nativeOperation:undefined
+      if(op){
+        if(!adapter.sessionAction||!inst.caps.nativeActions?.includes(op.action)||
+          store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey)!==op.sourceSessionId||
+          (op.action==='fork'?bound||op.sourceThreadId===c.threadId:bound!==op.sourceSessionId))throw Error('原生操作能力或来源绑定不匹配')
+        store.submit(c.id)
+        started=true
+        const sessionId=await adapter.sessionAction(op.action,op.sourceSessionId)
+        if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
+        emit(c,'completed',{sessionId,nativeAction:op.action})
+        receipt(c.id,'done')
+        return
+      }
       if(incoming&&(bound&&bound!==incoming||!inst.caps.sessionList||!adapter.importSession))throw Error('当前绑定或原生协议无法导入此会话')
       const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
       store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
@@ -160,18 +176,38 @@ async function handle(c:Command) {
   } finally {
     handling.delete(c.id)
     if(locked) {running.delete(c.runId);occupied.delete(c.threadId)}
+    releaseWorkspace()
     cleanup()
+  }
+}
+async function lockWorkspace(workspaceRef:string){
+  const key=resolve(workspaceRef).toLowerCase()
+  const previous=workspaceTails.get(key)??Promise.resolve()
+  let release!:()=>void
+  const current=new Promise<void>(resolveLock=>{release=resolveLock})
+  const tail=previous.then(()=>current)
+  workspaceTails.set(key,tail)
+  await previous
+  return ()=>{
+    release()
+    if(workspaceTails.get(key)===tail)workspaceTails.delete(key)
   }
 }
 async function runtimeIdentity(inst:{config:Instance,adapter?:Adapter}) {
   const account=await inst.adapter?.identity?.()
-  return account?JSON.stringify([inst.config.runtimeKey,account]):inst.config.runtimeKey
+  const runtimeKey=inst.config.runtimeKey??''
+  return account?JSON.stringify([runtimeKey,account]):runtimeKey
+}
+async function scopeIdForInstance(inst:Entry):Promise<string|undefined>{
+  if(inst.config.adapterKey==='codex'&&!inst.adapter)return undefined
+  try{return createHash('sha256').update(await runtimeIdentity(inst)).digest('hex')}
+  catch{return undefined}
 }
 async function recover(inst:Entry) {
   for(const row of store.pending(inst.config.id)) {
     if(handling.has(row.id))continue
     const c:Command=JSON.parse(row.body)
-    if(c.kind==='prepare' || row.submitted===0){
+    if(row.submitted===0){
       const detail=c.kind==='prepare'?'连接中断，请重新读取会话模型':'原生进程中断，指令尚未发送'
       if(c.kind==='run'||c.kind==='prepare')emit(c,'failed',{text:detail})
       store.status(c.id,'failed',detail)
@@ -250,9 +286,16 @@ for(const instance of config.instances as Instance[]) {
 function connect(){
   if(stopping) return
   ws=new WebSocket(url,{headers:{Authorization:'Bearer '+token,'X-Node-Id':config.nodeId},maxPayload:4*1024*1024,handshakeTimeout:15000})
-  ws.on('open',()=>{
-    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,instances:[...instances.values()].map(({config:i,caps,error})=>({
-      id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,...caps,error,online:!error}))})
+  ws.on('open',async()=>{
+    const socket=ws
+    const registrations=await Promise.all([...instances.values()].map(async entry=>{
+      const {config:i,caps,error}=entry
+      const runtimeScopeId=await scopeIdForInstance(entry)
+      return {id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,
+        ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,error,online:!error}
+    }))
+    if(ws!==socket||socket?.readyState!==WebSocket.OPEN)return
+    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,instances:registrations})
     for(const row of store.db.prepare('SELECT event FROM outbox ORDER BY rowid').iterate()) send({type:'event',event:JSON.parse(String(row.event))})
     for(const row of store.db.prepare('SELECT c.id,c.status,c.detail FROM commands c LEFT JOIN receipt_acks a ON c.id=a.id WHERE c.status IS NOT a.status ORDER BY c.rowid').iterate()) send({type:'receipt',commandId:row.id,status:row.status,detail:row.detail})
   })
@@ -260,6 +303,16 @@ function connect(){
     try{
       const frame=JSON.parse(bytes.toString())
       if(frame.type==='command') await handle(frame.command)
+      else if(frame.type==='read_history'&&typeof frame.id==='string'){
+        const entry=instances.get(frame.instanceId),socket=ws
+        try{
+          if(!entry?.caps.nativeHistory||!entry.adapter?.readHistory||entry.config.workspaceRef!==frame.workspaceRef||
+            entry.config.profileId!==frame.profileId||!frame.sessionId||
+            store.binding(frame,entry.config.workspaceRef,await runtimeIdentity(entry))!==frame.sessionId)throw Error('原生历史绑定不匹配')
+          const page=await entry.adapter.readHistory(frame.sessionId,frame.before)
+          if(ws===socket)send({type:'history',id:frame.id,...page})
+        }catch{if(ws===socket)send({type:'history',id:frame.id,error:true})}
+      }
       else if(frame.type==='list_sessions'&&typeof frame.id==='string'){
         const entry=instances.get(frame.instanceId)
         if(!entry?.caps.sessionList||!entry.adapter?.listSessions||entry.config.workspaceRef!==frame.workspaceRef||entry.config.profileId!==frame.profileId){

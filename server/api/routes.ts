@@ -7,9 +7,13 @@ import { persona, savePersona } from '../chat/persona.ts'
 import { modelSettings, updateModelSettings } from '../chat/model-settings.ts'
 import { chatPolicy, saveChatPolicy } from '../chat/tools.ts'
 import { pendingChat, resolveOperation } from '../chat/approval.ts'
+import { budgetOverride, continueBudget } from '../chat/budget.ts'
 import { projectWorkspaces } from '../tasks/workspaces.ts'
 import { dailyAction, listDaily } from '../chat/daily.ts'
 import { memoryCandidates, reviewMemory } from '../chat/memory.ts'
+import { listThreads, mainThread, threadLifecycle, threadImpact, shareThread, exportThread } from '../sessions.ts'
+import { botSettings, listBots, saveBotSettings } from '../tasks/bots.ts'
+import { registerApiBot } from '../tasks/api-bots.ts'
 
 export function route(db:DatabaseSync,ctx:any){
   const {method,path,body:b,dataDir,principal,localRequest,query,plugins}=ctx
@@ -59,9 +63,13 @@ export function route(db:DatabaseSync,ctx:any){
     if(!localRequest)fail('操作确认限本机',403)
     return resolveOperation(db,b)
   }
+  if(path==='/chat/continue'&&method==='POST'){
+    if(!localRequest)fail('预算续行限本机所有者',403)
+    return continueBudget(db,dataDir,required(b.messageId,'messageId'),b.hardLimit)
+  }
   if(path==='/chat/cancel'&&method==='POST'){
     if(!localRequest)fail('主聊控制限本机',403)
-    const job=must(db,"SELECT * FROM chat_jobs WHERE messageId=? AND status IN ('queued','working','awaiting_approval')",required(b.messageId,'messageId'))
+    const job=must(db,"SELECT * FROM chat_jobs WHERE messageId=? AND status IN ('queued','working','awaiting_approval','budget_paused')",required(b.messageId,'messageId'))
     db.prepare("UPDATE chat_jobs SET status='cancelled',operation=NULL WHERE id=?").run(job.id)
     const prior=one(db,`SELECT 1 FROM messages WHERE threadId=? AND kind='tool'
       AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.ok')=1`,job.threadId,job.messageId)
@@ -91,11 +99,48 @@ export function route(db:DatabaseSync,ctx:any){
     db.prepare('DELETE FROM grants WHERE id=?').run(key)
     return {id:key,revoked:true}
   }
-  if(path==='/instances'&&method==='GET')return [{id:'main',name:'小毛球',online:true,availableActions:['message','delegate']},...db.prepare('SELECT * FROM instances ORDER BY name').all().map(r=>({...unpack(r,['availableActions','capabilities']),online:!!r.online}))]
-  if(path==='/threads'&&method==='POST')return createThread(db,dataDir,b)
-  if(path==='/threads'&&method==='GET')return db.prepare('SELECT t.* FROM threads t LEFT JOIN task_drafts d ON d.threadId=t.id WHERE d.threadId IS NULL ORDER BY t.rowid DESC').all()
+  if(path==='/instances/api'&&method==='POST'){
+    if(!localRequest)fail('注册 API 工作 Bot 限本机所有者',403)
+    return registerApiBot(db,dataDir,b)
+  }
+  if(area==='instances'&&key&&sub==='settings'&&['GET','POST'].includes(method)){
+    if(!localRequest||key==='main')fail('工作 Bot 设置限本机所有者操作',403)
+    if(method==='GET')return botSettings(db,key)
+    const settings=saveBotSettings(db,key,b)
+    changed(db,'instance',{instanceId:key})
+    return settings
+  }
+  if(path==='/instances'&&method==='GET')return [{id:'main',name:'小毛球',online:true,availableActions:['message','delegate']},
+    ...listBots(db).map(bot=>({...bot,...bot.settings}))]
+  if(path==='/threads/main'&&method==='GET')return mainThread(db)
+  if(path==='/threads'&&method==='GET')return listThreads(db,query)
+  if(path==='/threads'&&method==='POST'){
+    const instanceId=b.instanceId??'main'
+    const thread=createThread(db,dataDir,{instanceId,projectId:b.projectId,title:b.title,modelId:b.modelId})
+    if(b.firstMessage===undefined)return thread
+    if(!b.firstMessage||typeof b.firstMessage!=='object'||Array.isArray(b.firstMessage))fail('首条消息格式无效')
+    executionAccess(instanceId)
+    const receipt=sendInput(db,dataDir,thread,b.firstMessage)
+    return {thread:getThread(db,thread.id),receipt}
+  }
   if(area==='threads' && key){
     const thread=getThread(db,key)
+    if(sub==='impact'&&method==='GET')return threadImpact(db,key)
+    if(sub==='budget'&&['GET','POST'].includes(method)){
+      if(!localRequest||thread.instanceId!=='main')fail('工具预算设置限本机小毛球会话',403)
+      if(method==='GET')return {toolBudget:thread.toolBudget?JSON.parse(thread.toolBudget):null}
+      if(!Object.hasOwn(b,'toolBudget'))fail('请提供工具预算或 null')
+      const toolBudget=budgetOverride(dataDir,b.toolBudget)
+      db.prepare('UPDATE threads SET toolBudget=? WHERE id=?').run(toolBudget?JSON.stringify(toolBudget):null,key)
+      return {toolBudget}
+    }
+    if(sub==='lifecycle'&&method==='POST'){
+      if(thread.instanceId!=='main'&&thread.sessionId&&['archive','restore','fork','deleteNative'].includes(b.action))executionAccess(thread.instanceId)
+      return threadLifecycle(db,key,b,dataDir)
+    }
+    if(['deleted','purged'].includes(thread.state))fail('会话已移出工作台；可在最近删除查看可恢复的会话',410)
+    if(sub==='share'&&method==='POST')return shareThread(db,dataDir,key,b,localRequest)
+    if(sub==='export'&&method==='GET')return exportThread(db,key)
     if(!sub && method==='GET'){
       const taskData=thread.taskId?taskView(db,thread.taskId):{run:latestRun(db,key),commands:db.prepare('SELECT * FROM commands WHERE threadId=? ORDER BY rowid').all(key).map(c=>unpack(c,['payload']))}
       const page=query.has('messageLimit')?messagePage(db,key,null,query.get('messageLimit')):{messages:messages(db,key)}

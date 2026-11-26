@@ -4,7 +4,7 @@ import {daily,mainModels,mainPermissions,memories} from './main-settings.js';
 import {extensions} from './extensions.js';
 const drafts=new Map();
 const main=()=>state.snapshot?.thread?.instanceId==='main'||(!state.thread&&(!state.instance||state.instance==='main'));
-const draftKey=()=>state.thread||('new:'+ (state.instance||'main'));
+const draftKey=()=>state.thread||('new:'+ (state.instance||'main')+':'+(state.project||''));
 const currentDraft=()=>{const key=draftKey();if(!drafts.has(key))drafts.set(key,{text:'',files:[],refs:[]});return drafts.get(key)};
 const instance=id=>state.instances.find(i=>i.id===id);
 const actorLabel=actor=>actor?.kind==='user'?'你':actor?.id==='main'&&actor?.kind!=='tool'?'小毛球':
@@ -14,6 +14,10 @@ const commTypes={assignment:'委派',question:'澄清问题',request:'协作请�
 const commLabel=comm=>actorLabel(comm.sender)+' → '+actorLabel(comm.recipient)+
   (commTypes[comm.type]?' · '+commTypes[comm.type]:'');
 const expandedMessages=new Set();
+const selectedMessages=new Set();
+let selectionThreadId=null;
+const nativeHistory=new Map();
+const nativeHistoryLoading=new Set();
 const controls=(run,payload)=>api('/runs/'+url(run.id)+'/commands',payload);
 const finished=run=>!run||['completed','failed','blocked','cancelled'].includes(run.status);
 const reading=snapshot=>snapshot?.run?.modelSetup&&!finished(snapshot.run);
@@ -104,75 +108,19 @@ export const chat = actions=>{
   function carryDraft(contactId,threadId){
     const key='new:'+contactId,draft=drafts.get(key);
     if(!state.thread&&(state.instance||'main')===contactId&&draft&&(!draft.pendingId||draft.pendingId===threadId)){
-      delete draft.pendingId;
-      drafts.set(threadId,draft);drafts.delete(key);
+      delete draft.pendingId;drafts.set(threadId,draft);drafts.delete(key);
     }
   }
   function newThread(preset) {
-    const contacts=state.instances.some(i=>i.id==='main')?state.instances:[{id:'main',name:'小毛球'},...state.instances];
-    async function createTopic({instanceId,title,projectId,modelId}){
-      return api('/threads',{instanceId,title:title||undefined,projectId:projectId||undefined,modelId:modelId||undefined});
+    const id=preset||state.instance||'main',agent=instance(id);
+    if(id!=='main'&&agent?.settings&&(agent.settings.enabled===false||agent.settings.allowDirect===false)){
+      notice(agent.settings.enabled===false?'此 Bot 已停用。':'此 Bot 当前不允许直接聊天。');return;
     }
-    async function showTopic(t){carryDraft(t.instanceId,t.id);await actions.load();await actions.openThread(t.id)}
-    const ui=form('开始新对话',[
-      {key:'instanceId',label:'联系人',options:contacts,value:preset||'main'},{key:'title',label:'话题名称'},
-      {key:'projectId',label:'所属项目',options:projectOptions()},{key:'modelId',label:'首轮模型',options:[keepNative]}
-    ],'创建',async values=>await showTopic(await createTopic(values)));
-    const {select,field,hint,action}=modelField(ui);
-    const importButton=btn('导入已有会话',async()=>{
-      const id=ui.controls.instanceId.value,project=ui.controls.projectId.value,title=ui.controls.title.value.trim();
-      const dialog=$('dialog'),endpoint='/instances/'+url(id)+'/sessions';
-      const results=el('div'),status=el('p','muted','正在读取同一工作区和 profile 的原生会话…');
-      const more=btn('加载更多',()=>page(next),'secondary');
-      let next;
-      async function page(cursor){
-        more.disabled=true;
-        const params=new URLSearchParams();
-        if(project)params.set('projectId',project);
-        if(cursor)params.set('cursor',cursor);
-        try{
-          const records=await api(endpoint+'?'+params);
-          next=records.nextCursor;
-          status.textContent=results.childElementCount||records.items.length?'选择要绑定的原生会话。':'当前范围没有可用会话。';
-          results.append(...records.items.map(item=>el('article','record',el('strong','',item.title||item.id),
-            el('p','muted',item.active?'原生端报告运行中':item.updatedAt?at(item.updatedAt*1000):''),
-            btn('绑定或打开',async()=>{
-              const receipt=await api(endpoint,{projectId:project||undefined,sessionId:item.id,title:title||item.title||'导入的 Codex 话题'});
-              dialog.close();await showTopic(receipt.thread);
-            },'secondary'))));
-        }catch(error){status.textContent=error.message}
-        finally{more.hidden=!next;more.disabled=false}
-      }
-      ui.dialog.close();
-      dialog.replaceChildren(el('h2','','导入 Codex 会话'),status,results,el('div','dialog-foot',more,
-        btn('返回新对话',()=>newThread(id),'ghost'),btn('关闭',()=>dialog.close(),'secondary')));
-      dialog.showModal();
-      await page();
-    },'secondary');
-    ui.save.before(importButton);
-    const read=btn('创建话题并读取模型',async()=>{
-      const values=Object.fromEntries(Object.entries(ui.controls).map(([key,input])=>[key,input.value.trim()]));
-      const locked=[ui.controls.instanceId,ui.controls.projectId,ui.controls.title,ui.save];
-      locked.forEach(input=>input.disabled=true);hint.textContent='正在创建话题…';
-      try{
-        const thread=await createTopic(values);
-        if(!activeForm(ui))return;
-        try{await api(modelPath(thread.id),{prepare:true})}catch(e){notice(e.message)}
-        if(activeForm(ui)){ui.dialog.close();await showTopic(thread)}
-      }catch(e){hint.textContent=e.message}
-      finally{locked.forEach(input=>input.disabled=false)}
-    },'secondary');
-    action.append(read);
-    const update=()=>{
-      const agent=instance(ui.controls.instanceId.value),models=modelOptions(null,agent);
-      importButton.hidden=!agent?.online||!agent?.capabilities?.sessionList;
-      select.value='';useModelOptions(select,models);
-      field.hidden=ui.controls.instanceId.value==='main';
-      action.hidden=field.hidden||models.length>0||!agent?.online||!canRead(agent);
-      hint.textContent=field.hidden?'':!agent?.online?'节点离线。创建的话题仍会跟随原生会话。':
-        models.length?'选择的模型用于首轮。':canRead(agent)?'读取后可以在发送首条消息前选择模型。':'原生会话将决定首轮模型。';
-    };
-    ui.controls.instanceId.addEventListener('change',update);update();
+    const projectId=state.snapshot?.thread?.projectId||state.project||undefined;
+    if(agent?.settings?.allowedProjects&&(!projectId||!agent.settings.allowedProjects.includes(projectId))){
+      notice('此 Bot 仅允许用于指定项目，请从获准项目的话题开始。');return;
+    }
+    actions.openDraft(id,projectId);
   }
   async function readDraftModels(threadId,stillOpen){
     const path='/threads/'+url(threadId);
@@ -289,6 +237,109 @@ export const chat = actions=>{
       await api('/chat/persona',{reset:true});ui.dialog.close();notice('已恢复默认人格。');
     },'secondary'));
   }
+  async function botSettings(agent){
+    if(!agent||agent.id==='main')return;
+    const current=await api('/instances/'+url(agent.id)+'/settings');
+    const selectedProjects=new Set(current.allowedProjects||[]);let allProjects=current.allowedProjects==null;
+    const ui=form('Bot 设置',[
+      {key:'name',label:'显示名称',value:current.name??agent.name,required:true},
+      {key:'description',label:'擅长与用途',type:'textarea',value:current.description??''},
+      {key:'enabled',label:'Bot 状态',options:[{id:'true',name:'启用'},{id:'false',name:'停用'}],value:String(current.enabled!==false)},
+      {key:'allowDirect',label:'用户可直接聊天',options:[{id:'true',name:'允许'},{id:'false',name:'禁止'}],value:String(current.allowDirect!==false)},
+      {key:'allowDelegate',label:'小毛球可委派',options:[{id:'true',name:'允许'},{id:'false',name:'禁止'}],value:String(current.allowDelegate!==false)}
+    ],'保存设置',async values=>{
+      await api('/instances/'+url(agent.id)+'/settings',{
+        name:values.name,description:values.description,enabled:values.enabled==='true',
+        allowDirect:values.allowDirect==='true',allowDelegate:values.allowDelegate==='true',
+        allowedProjects:allProjects?null:[...selectedProjects]
+      });await actions.load();actions.refresh();notice('Bot 设置已保存。');
+    });
+    const all=el('input');all.type='checkbox';all.checked=allProjects;
+    const choices=el('div','project-access');
+    choices.append(el('label','check-field',all,el('span','','所有项目（遵循已有项目授权）')));
+    const projectInputs=[];
+    for(const project of state.projects){
+      const checkbox=el('input');checkbox.type='checkbox';checkbox.value=project.id;checkbox.checked=selectedProjects.has(project.id);
+      checkbox.addEventListener('change',()=>checkbox.checked?selectedProjects.add(project.id):selectedProjects.delete(project.id));
+      projectInputs.push(checkbox);choices.append(el('label','check-field',checkbox,el('span','',project.name)));
+    }
+    all.addEventListener('change',()=>{allProjects=all.checked;projectInputs.forEach(input=>{input.disabled=allProjects})});
+    if(allProjects)projectInputs.forEach(input=>{input.disabled=true});
+    ui.form.querySelector('.form-err').before(choices);
+  }
+  function threadMenu(thread){
+    const dialog=$('dialog');
+    const actionsList=[];
+    const permanent=thread.kind==='main'||thread.conversationType==='main';
+    if(!permanent)actionsList.push(btn('重命名',()=>form('重命名会话',[
+      {key:'title',label:'会话名称',value:thread.title||'',required:true}
+    ],'保存',async({title})=>{await api('/threads/'+url(thread.id)+'/lifecycle',{action:'rename',title});await actions.load();await actions.refresh();}), 'settings-row','edit'));
+    if(!permanent)actionsList.push(btn(thread.state==='archived'?'恢复会话':'归档会话',async()=>{
+      const result=await api('/threads/'+url(thread.id)+'/lifecycle',{action:thread.state==='archived'?'restore':'archive'});
+      dialog.close();await actions.load();await actions.refresh();
+      notice(result.scope==='native_pending'?'已请求原生端操作，等待回执。':result.scope==='workbench'?'会话状态已更新。':'操作已完成。');
+    },'settings-row','file'));
+    const agent=instance(thread.instanceId);
+    if(thread.sessionId&&agent?.capabilities?.nativeActions?.includes('fork'))actionsList.push(btn('从此会话分支',()=>form('创建原生分支',[
+      {key:'title',label:'新会话名称',value:(thread.title||'会话')+' · 分支',required:true}
+    ],'创建分支',async({title})=>{
+      const branch=await api('/threads/'+url(thread.id)+'/lifecycle',{action:'fork',title});dialog.close();
+      await actions.load();await actions.openThread(branch.id);notice('原生分支创建请求已提交。');
+    }),'settings-row','arrow'));
+    actionsList.push(btn('导出会话',async()=>{
+      const result=await api('/threads/'+url(thread.id)+'/export');
+      const file=new Blob([JSON.stringify(result,null,2)],{type:'application/json'}),link=el('a');
+      link.href=URL.createObjectURL(file);link.download=(thread.title||'会话')+'.json';link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);
+    },'settings-row','arrow'));
+    actionsList.push(btn('分享会话',()=>shareThread(thread),'settings-row','arrow'));
+    if(thread.instanceId==='main')actionsList.push(btn('重置上下文',async()=>{
+      if(!confirm('从下一条消息开始建立新上下文？聊天原文和已保存记忆仍可查阅。'))return;
+      await api('/threads/'+url(thread.id)+'/lifecycle',{action:'reset'});dialog.close();
+      await actions.refresh();notice('已重置本会话的模型上下文。');
+    },'settings-row','sliders'));
+    if(thread.instanceId==='main')actionsList.push(btn('会话工具预算',async()=>{
+      const path='/threads/'+url(thread.id)+'/budget';
+      const {toolBudget}=await api(path);
+      form('会话工具预算',[
+        {key:'softLimit',label:'起始次数（留空继承）',type:'number',value:toolBudget?.softLimit},
+        {key:'hardLimit',label:'硬上限（留空继承）',type:'number',value:toolBudget?.hardLimit}
+      ],'保存',async({softLimit,hardLimit})=>{
+        const overrides={};
+        if(softLimit)overrides.softLimit=Number(softLimit);
+        if(hardLimit)overrides.hardLimit=Number(hardLimit);
+        await api(path,{toolBudget:Object.keys(overrides).length?overrides:null});notice('会话工具预算已保存。');
+      });
+    },'settings-row','edit'));
+    if(!permanent)actionsList.push(btn('删除会话',async()=>{
+      await api('/threads/'+url(thread.id)+'/lifecycle',{action:'delete'});dialog.close();await actions.load();await actions.openDraft(thread.instanceId);
+    },'settings-row','close'));
+    dialog.replaceChildren(el('h2','','会话操作'),el('div','settings-list',...actionsList),
+      el('div','dialog-foot',btn('关闭',()=>dialog.close(),'secondary')));dialog.showModal();
+  }
+  function shareThread(thread,messageIds){
+    const targets=state.threads.filter(candidate=>candidate.id!==thread.id&&candidate.state==='active');
+    const agents=state.instances;
+    const projectName=id=>id?state.projects.find(project=>project.id===id)?.name||'其他项目':'个人范围';
+    form('分享会话',[
+      {key:'targetThreadId',label:'目标',options:[{id:'',name:'新建目标会话'},...targets.map(target=>({id:target.id,
+        name:(instance(target.instanceId)?.name||'Bot')+' · '+(target.title||'会话')+' · '+projectName(target.projectId)}))]},
+      {key:'instanceId',label:'新会话联系人',options:agents.map(agent=>({id:agent.id,name:agent.name})),value:agents[0]?.id||'main'},
+      {key:'title',label:'新会话名称',value:'分享：'+(thread.title||'会话')}
+    ],'预览内容',async({targetThreadId,instanceId,title})=>{
+      const destination=targetThreadId?{targetThreadId}:{newThread:{instanceId,title:title||'分享：'+(thread.title||'会话')}};
+      const selection=messageIds?.length?{messageIds}:{};
+      const preview=await api('/threads/'+url(thread.id)+'/share',{...destination,preview:true,...selection});
+      const dialog=$('dialog');dialog.replaceChildren(el('h2','','分享预览'),
+        el('p','muted',preview.crossProject?'跨项目分享 · 仅包含已授权的用户原文和附件':'将分享 '+(preview.items?.length||0)+' 条消息。'),
+        ...(preview.items||[]).map(item=>el('article','record',el('small','muted',(item.role||'')+' · '+at(item.createdAt)),el('p','text',item.text||''),
+          item.attachments?.length?el('small','muted','附件 · '+item.attachments.map(file=>file.name).join('、')):null)),
+        el('div','dialog-foot',btn('返回',()=>shareThread(thread,messageIds),'secondary'),btn(preview.crossProject?'确认跨项目分享':'分享',async()=>{
+          await api('/threads/'+url(thread.id)+'/share',{...destination,...selection,...(preview.crossProject?{confirmCrossProject:true}:{})});dialog.close();
+          for(const id of messageIds||[])selectedMessages.delete(id);
+          await actions.load();await actions.refresh();notice('会话内容已分享。');
+        },'primary')));dialog.showModal();
+    });
+  }
   function runBox(snapshot){
     const {task,run,review,commands=[]}=snapshot;if(!task&&(!run||run.modelSetup&&run.status!=='uncertain'))return null;
     const root=el('div'),actionsBox=el('div','actions');
@@ -381,11 +432,20 @@ export const chat = actions=>{
     const snap=state.snapshot, content=$('content'), prev=content.scrollTop, nearBottom=content.scrollHeight-content.clientHeight-prev<60;
     const isNew=content.dataset.topic!==draftKey();content.dataset.topic=draftKey();
     const t=snap?.thread,agent=instance(t?.instanceId||state.instance);
+    if(selectionThreadId!==t?.id){selectedMessages.clear();selectionThreadId=t?.id??null}
+    const sourceLabels={identity:'固定主会话',migrated:'迁移主会话',direct:'用户直聊',delegated:'任务委派',imported:'原生导入',local:'工作台会话'};
+    const syncStatus=t?.nativeInvalid?'原生绑定失效':t?.nativeArchived?'原生端已归档':
+      t?.sessionId?agent?.online?(agent.capabilities?.nativeHistory?'原生历史可读取':'工作台缓存'):'离线缓存':null;
     $('heading').textContent=t?.title||agent?.name||'小毛球';
-    $('subhead').textContent=[t?.projectId&&state.projects.find(p=>p.id===t.projectId)?.name,snap?.mainChat?.model,agent&&agent.id!=='main'?(agent.online?'节点在线':'节点离线'):null].filter(Boolean).join(' · ');
+    $('subhead').textContent=[t?.projectId&&state.projects.find(p=>p.id===t.projectId)?.name,
+      t?.source&&sourceLabels[t.source],syncStatus,snap?.mainChat?.model,
+      agent&&agent.id!=='main'?(agent.online?'节点在线':'节点离线'):null].filter(Boolean).join(' · ');
     const model=modelPicker(snap,agent);
-    $('tools').replaceChildren(...(main()?[btn('委派任务',delegate,'secondary','task'),
-      btn('设置',()=>chatSettings(t),'secondary','sliders')]:model?[model]:[]));
+    const toolButtons=main()?[btn('委派任务',delegate,'secondary','task'),btn('设置',()=>chatSettings(t),'secondary','sliders')]:model?[model]:[];
+    if(agent&&agent.id!=='main')toolButtons.push(btn('Bot 设置',()=>botSettings(agent),'secondary','sliders'));
+    if(t&&selectedMessages.size)toolButtons.push(btn('分享已选 · '+selectedMessages.size,()=>shareThread(t,[...selectedMessages]),'secondary','arrow'));
+    if(t)toolButtons.push(btn('会话',()=>threadMenu(t),'secondary','edit'));
+    $('tools').replaceChildren(...toolButtons);
     if(!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup&&snap.run.status!=='uncertain')){
       const greeting=main()?banner('今天想一起','做什么？'):banner('和'+(agent?.name||'工作 Bot')+'聊聊');
       content.replaceChildren(el('div','chat-start',greeting,
@@ -396,6 +456,24 @@ export const chat = actions=>{
     if(t?.sessionId)stream.append(el('details','muted',el('summary','','原生会话'),el('code','',t.sessionId),
       el('p','muted',agent?.capabilities?.sessionList?'后续消息会在该原生会话继续。历史可在原客户端查看。':
         '可接续工作台已绑定的会话。该实例未提供可核验的外部会话目录。')));
+    if(t?.sessionId&&agent?.capabilities?.nativeHistory){
+      const cached=nativeHistory.get(t.id),details=el('details','native-history',el('summary','',
+        '原生端可见历史'+(cached?' · '+cached.items.length:'')));
+      if(cached?.items?.length)for(const item of cached.items)
+        details.append(el('article','native-message '+(item.role==='user'?'user':''),el('small','muted',item.role==='user'?'原生用户':'原生 Agent'),el('p','text',item.text)));
+      const loadHistory=before=>{
+        if(nativeHistoryLoading.has(t.id))return;
+        nativeHistoryLoading.add(t.id);
+        const query=new URLSearchParams();if(before)query.set('before',before);
+        api('/threads/'+url(t.id)+'/native'+(query.size?'?'+query:'' )).then(page=>{
+          const previous=nativeHistory.get(t.id),items=[...(previous?.items||[]),...page.items];
+          nativeHistory.set(t.id,{items,nextBefore:page.nextBefore});
+        }).catch(error=>notice(error.message)).finally(()=>{nativeHistoryLoading.delete(t.id);drawContent()});
+      };
+      if(!cached)details.append(btn('读取原生端历史',()=>loadHistory(),'secondary'));
+      else if(cached.nextBefore)details.append(btn('加载更早原生消息',()=>loadHistory(cached.nextBefore),'secondary'));
+      stream.append(details);
+    }
     if(box)stream.append(box);
     if(snap.nextBefore)stream.append(btn('加载更早消息',actions.loadOlder,'secondary'));
     for(const m of snap.messages||[]){
@@ -440,9 +518,18 @@ export const chat = actions=>{
       if(m.text&&['message','artifact'].includes(m.kind)){
         const tools=el('div','message-tools',
           btn('引用',()=>{const d=currentDraft();if(!d.refs.some(r=>r.id===m.id))d.refs.push({type:'message',id:m.id,excerpt:m.text.slice(0,26)});$('compose').dataset.key='';drawComposer();$('input').focus()},'ghost'),
+          btn(selectedMessages.has(m.id)?'取消分享选中':'选择分享',()=>{
+            if(selectedMessages.has(m.id))selectedMessages.delete(m.id);else selectedMessages.add(m.id);
+            drawContent();
+          },'ghost'),
           btn('归档',()=>form('保存这段原话',[{key:'title',label:'资料标题',value:m.text.slice(0,40),required:true},{key:'projectId',label:'保存位置',options:[{id:'',name:'个人资料'},...state.projects],value:t.projectId||''}],'保存',async d=>{
             await api('/submissions',{projectId:d.projectId||undefined,source:{title:d.title,text:m.text,author:role,platform:'小毛球 Bot 工作台',attachmentIds:m.data?.attachmentIds||[]}});notice('原话已归档。')
           }),'ghost'));
+        if(t.instanceId==='main'&&m.kind==='message')tools.append(btn('删除消息',async()=>{
+          if(!confirm('删除此条消息？独立分享的副本仍保留。'))return;
+          await api('/threads/'+url(t.id)+'/lifecycle',{action:'deleteMessage',messageId:m.id});
+          selectedMessages.delete(m.id);await actions.refresh();
+        },'ghost'));
         article.append(tools);
       }
       if(comm?.visibility==='bot_internal'||m.kind==='tool'){
@@ -461,6 +548,25 @@ export const chat = actions=>{
           el('div','actions',btn('确认执行',()=>resolve(true),'primary'),btn('拒绝',()=>resolve(false),'ghost'))));
         continue;
       }
+      if(job.status==='budget_paused'){
+        const budget=job.budget||{};
+        const continueJob=async hardLimit=>{
+          await api('/chat/continue',{messageId:job.messageId,...(hardLimit?{hardLimit}: {})});await actions.refresh();
+        };
+        const increase=async()=>{
+          const policy=await api('/chat/policy');
+          if(budget.hardLimit>=policy.toolHardLimit){
+            await mainPermissions();notice('全局硬上限尚未高于本轮上限，请调整后继续。');return;
+          }
+          const ui=form('提高本轮工具上限',[{key:'hardLimit',label:'新的本轮硬上限',type:'number',
+            value:Math.min(policy.toolHardLimit,budget.hardLimit+10),required:true}],'继续',async({hardLimit})=>continueJob(Number(hardLimit)));
+          ui.controls.hardLimit.min=String(budget.hardLimit+1);ui.controls.hardLimit.max=String(policy.toolHardLimit);
+        };
+        stream.append(el('div','pending',el('strong','','本轮已暂停'),
+          el('p','text','工具调用 '+budget.used+' / '+budget.softLimit+'，本轮硬上限 '+budget.hardLimit+'。已完成的操作和回执已保存。'),
+          el('div','actions',btn('继续本轮',()=>continueJob(),'secondary'),btn('调整本轮上限',increase,'ghost'))));
+        continue;
+      }
       stream.append(el('div','pending',el('span','',job.status==='queued'?'主聊等待处理':'主聊正在回复'),
         btn('取消生成',async()=>{await api('/chat/cancel',{messageId:job.messageId});await actions.refresh()},'ghost')));
     }
@@ -471,6 +577,10 @@ export const chat = actions=>{
   }
   function drawComposer(){
     const key=draftKey();if($('compose').dataset.key===key&&$('input'))return;
+    const contact=instance(state.snapshot?.thread?.instanceId||state.instance);
+    if(contact?.id!=='main'&&contact?.settings&&(contact.settings.enabled===false||contact.settings.allowDirect===false)){
+      $('compose').dataset.key=key;$('compose').replaceChildren(el('p','muted',contact.settings.enabled===false?'此 Bot 已停用，无法发送新消息。':'此 Bot 当前不允许直接聊天。'));return;
+    }
     $('compose').dataset.key=key;const draft=currentDraft();
     const input=el('textarea');input.id='input';input.rows=1;input.value=draft.text;input.placeholder=main()?'输入你的问题…':'补充要求或发送消息…';input.setAttribute('aria-label','消息内容');
     const files=el('div','chips'),picker=el('input');picker.type='file';picker.multiple=true;picker.hidden=true;
@@ -483,11 +593,21 @@ export const chat = actions=>{
       const risk=state.snapshot?.run?.recovery?.action==='abandon'&&!state.snapshot.run.modelSetup;
       if(risk && !confirm('原生运行可能仍在执行。确认在当前会话发送？'))return;
       busy=true;input.readOnly=true;picker.disabled=true;files.inert=true;
-      try{const initialId=state.thread,projectId=state.snapshot?.thread?.projectId,id=draft.pendingId||await ensureThread();draft.pendingId=id;
+      try{const initialId=state.thread,projectId=state.snapshot?.thread?.projectId;
         const attachmentIds=[];for(const f of draft.files){if(!f.uploadId)f.uploadId=(await upload(f,projectId)).id;attachmentIds.push(f.uploadId)}
         const refs=draft.refs.map(({type,id})=>({type,id}));
         const fingerprint=JSON.stringify([text,attachmentIds,refs]);if(draft.fingerprint!==fingerprint){draft.fingerprint=fingerprint;draft.requestId=crypto.randomUUID()}
-        await api('/threads/'+url(id)+'/messages',{text,refs,attachmentIds,requestId:draft.requestId,acknowledge:risk||undefined});drafts.delete(key);
+        let id=initialId;
+        if(!id&&state.draft){
+          const created=await api('/threads',{instanceId:state.instance||'main',projectId:state.project||undefined,
+            kind:(state.instance||'main')==='main'?'side':'native',
+            firstMessage:{text,refs,attachmentIds,requestId:draft.requestId},requestId:draft.requestId});
+          id=created.thread.id;
+        }else{
+          id=draft.pendingId||await ensureThread();draft.pendingId=id;
+          await api('/threads/'+url(id)+'/messages',{text,refs,attachmentIds,requestId:draft.requestId,acknowledge:risk||undefined});
+        }
+        drafts.delete(key);
         if(state.view==='chat'&&state.thread===initialId&&key===draftKey()){
           await actions.load();
           if(state.view==='chat'&&state.thread===initialId&&key===draftKey()){

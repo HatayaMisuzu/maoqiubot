@@ -1,8 +1,9 @@
 import {readFileSync} from 'node:fs'
 import {pathToFileURL} from 'node:url'
+import {relative} from 'node:path'
 import {Native} from './base.ts'
 import type {Run,Input,Adapter} from '../types.ts'
-import type {ModelOption,ModelState} from '../../contracts/node.ts'
+import type {ModelOption,ModelState,NativeAction,NativeSession} from '../../contracts/node.ts'
 
 type DshModelState=ModelState & {configId?:string}
 
@@ -44,11 +45,14 @@ export class Dsh extends Native implements Adapter {
   resume=false
   load=false
   images=false
+  sessionList=false
+  nativeActions:NativeAction[]=[]
   accepted=new Set<string>()
   messages=new Map<string,string>()
   private modelState=new Map<string,DshModelState>()
   private opening=0
   private openingModels=new Map<string,DshModelState>()
+  private cancelBeforePrompt=new Set<string>()
   private cacheModels(sessionId:string,state:DshModelState){
     this.modelState.set(sessionId,state)
     const run=this.active.get(sessionId)
@@ -73,7 +77,45 @@ export class Dsh extends Native implements Adapter {
     this.resume=!!caps.sessionCapabilities?.resume
     this.load=!!caps.loadSession
     this.images=!!caps.promptCapabilities?.image
-    return {availableActions:['run','prepare','cancel','answer'],resume:this.resume||this.load,history:false,version:hello.agentInfo?.version}
+    this.sessionList=!!caps.sessionCapabilities?.list
+    this.nativeActions=(['fork','delete'] as const).filter(action=>!!caps.sessionCapabilities?.[action])
+    return {availableActions:['run','prepare','cancel','answer'],sessionList:this.sessionList,nativeActions:this.nativeActions,
+      resume:this.resume||this.load,history:false,version:hello.agentInfo?.version}
+  }
+  async listSessions(cursor?:string):Promise<{items:NativeSession[];nextCursor:string|null}>{
+    if(!this.sessionList)throw Error('ACP 未声明会话目录能力')
+    const page=await this.rpc.request('session/list',{cwd:this.instance.workspaceRef,cursor},5000)
+    if(!Array.isArray(page.sessions))throw Error('ACP 会话目录回执无效')
+    const items=page.sessions.filter((s:any)=>typeof s.sessionId==='string'&&typeof s.cwd==='string'&&relative(this.instance.workspaceRef,s.cwd)==='')
+      .map((s:any)=>({id:s.sessionId,title:String(s.title||'ACP 会话').slice(0,140),updatedAt:Math.floor((Date.parse(s.updatedAt)||0)/1000),active:this.active.has(s.sessionId)}))
+    return {items,nextCursor:typeof page.nextCursor==='string'?page.nextCursor:null}
+  }
+  async importSession(sessionId:string){
+    if(!this.resume&&!this.load)throw Error('ACP 未声明原生续接能力')
+    let cursor:string|undefined
+    const seen=new Set<string>()
+    do{
+      const page=await this.listSessions(cursor)
+      if(page.items.some(s=>s.id===sessionId))return this.open(sessionId)
+      cursor=page.nextCursor??undefined
+      if(cursor&&seen.has(cursor))throw Error('ACP 目录返回重复游标')
+      if(cursor)seen.add(cursor)
+    }while(cursor&&seen.size<=100)
+    throw Error('在该实例已核对的目录页中未找到此会话')
+  }
+  async sessionAction(action:NativeAction,sessionId:string){
+    if(!this.nativeActions.includes(action)||this.active.has(sessionId))throw Error('ACP 未授权此操作或会话正在运行')
+    if(action==='delete'){
+      await this.rpc.request('session/delete',{sessionId})
+      this.sessions.delete(sessionId)
+      return sessionId
+    }
+    const result=await this.rpc.request('session/fork',{sessionId,cwd:this.instance.workspaceRef,mcpServers:[]})
+    if(typeof result?.sessionId!=='string'||!result.sessionId||result.sessionId===sessionId)throw Error('ACP 分支回执不匹配')
+    this.sessions.add(result.sessionId)
+    const state=readModels(result)
+    if(state)this.cacheModels(result.sessionId,state)
+    return result.sessionId as string
   }
   async open(sessionId?:string) {
     if(sessionId && this.sessions.has(sessionId)) return sessionId
@@ -132,6 +174,10 @@ export class Dsh extends Native implements Adapter {
       }
       this.reportModels(run)
     }
+    if(this.cancelBeforePrompt.delete(run.command.runId)){
+      run.emit('cancelled',{text:'提示尚未发送时运行已取消',sessionId:run.sessionId})
+      return
+    }
     const prompt:any[]=[{type:'text',text:input.text}]
     for(const file of input.files) {
       if(this.images && file.mime.startsWith('image/'))
@@ -182,5 +228,11 @@ export class Dsh extends Native implements Adapter {
       }
     } else if(msg.id!=null) this.rpc.send({id:msg.id,error:{code:-32601,message:'Unsupported client method'}})
   }
-  async cancel(run:Run) {await this.rpc.write({method:'session/cancel',params:{sessionId:run.sessionId}})}
+  async cancel(run:Run) {
+    if(!this.active.has(run.sessionId)){
+      this.cancelBeforePrompt.add(run.command.runId)
+      return
+    }
+    await this.rpc.write({method:'session/cancel',params:{sessionId:run.sessionId}})
+  }
 }

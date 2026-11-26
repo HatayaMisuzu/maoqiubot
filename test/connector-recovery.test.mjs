@@ -32,7 +32,7 @@ for await (const line of createInterface({input:process.stdin})) {
   if(method==='session/prompt') {
     const text=params.prompt[0].text.replace(/^工作台通信 [^\n]*\n\n/,'')
     log('prompt',params.sessionId,text)
-    if(text==='wait-for-cancel') {turn={id,sessionId:params.sessionId};continue}
+    if(text==='wait-for-cancel'||text.startsWith('wait-for-cancel ')) {turn={id,sessionId:params.sessionId};continue}
     write({method:'session/update',params:{sessionId:params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'original output'}}}})
     if(text==='disconnect-after-acceptance')setTimeout(()=>process.exit(1),40)
     else reply({stopReason:'end_turn'})
@@ -137,6 +137,84 @@ test('connector restarts a native DSH process without replaying the interrupted 
       ['start']
     ])
   } finally {
+    if(child?.connected)child.disconnect()
+    if(exit)await Promise.race([exit,delay(2000,undefined,{ref:false})])
+    if(child?.exitCode===null)child.kill()
+    if(exit)await exit
+    await app.close()
+    rmSync(temp,{recursive:true,force:true,maxRetries:4,retryDelay:100})
+  }
+})
+
+test('connector prevents duplicate native session bindings across matching runtimes',()=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-binding-'))
+  const store=new Store(join(temp,'connector.sqlite'))
+  const command=(id,threadId,instanceId)=>({id,threadId,runId:'run-'+id,taskId:null,kind:'run',instanceId,payload:{}})
+  try {
+    const first=command('one','thread-one','codex-a')
+    store.bind(first,'C:/workspace','session-one','runtime-a')
+    assert.throws(()=>store.bind(command('two','thread-two','codex-b'),'C:/workspace','session-one','runtime-a'),/原生会话已绑定/)
+    store.bind(command('three','thread-three','codex-c'),'C:/workspace','session-one','runtime-b')
+    assert.throws(()=>store.bind(command('four','thread-four','codex-a'),'C:/workspace','session-one','runtime-a'),/原生会话已绑定/)
+  } finally {
+    store.db.close()
+    rmSync(temp,{recursive:true,force:true,maxRetries:4,retryDelay:100})
+  }
+})
+
+test('connector serializes writes to one workspace until the prior run ends',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-workspace-lock-'))
+  const log=join(temp,'native.calls')
+  const app=startServer({port:0,dataDir:join(temp,'server'),chat:false})
+  let child,exit,ws
+  try{
+    await once(app.server,'listening')
+    const port=app.server.address().port
+    const config=join(temp,'node.json')
+    writeFileSync(config,JSON.stringify({url:'ws://127.0.0.1:'+port+'/api/v1/node',nodeId:'local',stateDir:join(temp,'node'),
+      instances:[{id:'dsh',name:'DSH fixture',adapterKey:'dsh',workspaceRef:temp,env:{MAOQIU_ACP_TEST_LOG:log,DSH_HOME:join(temp,'dsh')},
+        command:process.execPath,args:['--input-type=commonjs','-e',`(async()=>{${fakeAcp}})()`]}]}))
+    child=spawn(process.execPath,['connector/index.ts',config],{
+      env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local},stdio:['ignore','ignore','inherit','ipc'],windowsHide:true
+    })
+    exit=once(child,'exit')
+    async function request(path,body,expected=200){
+      const res=await fetch('http://127.0.0.1:'+port+'/api/v1'+path,{
+        method:body?'POST':'GET',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'},
+        body:body&&JSON.stringify(body)
+      })
+      const data=await res.json()
+      assert.equal(res.status,expected,JSON.stringify(data))
+      return data
+    }
+    async function wait(label,fn){
+      const end=Date.now()+12000
+      while(Date.now()<end){const value=await fn();if(value)return value;await delay(50)}
+      assert.fail('timed out: '+label)
+    }
+    await wait('connector online',async()=>(await request('/instances')).some(i=>i.id==='dsh'&&i.online))
+    const firstThread=await request('/threads',{instanceId:'dsh'})
+    const secondThread=await request('/threads',{instanceId:'dsh'})
+    const first=await request('/threads/'+firstThread.id+'/messages',{text:'wait-for-cancel first'})
+    await wait('first native run started',()=>readFileSync(log,'utf8').includes('wait-for-cancel first'))
+    const second=await request('/threads/'+secondThread.id+'/messages',{text:'wait-for-cancel second'})
+    await delay(200)
+    const beforeCancel=readFileSync(log,'utf8').split('\n').filter(line=>line.includes('"prompt"')).map(line=>JSON.parse(line)[2])
+    assert.deepEqual(beforeCancel,['wait-for-cancel first'])
+    await request('/runs/'+first.runId+'/commands',{kind:'cancel'})
+    await wait('first run ended',async()=>{
+      const status=(await request('/threads/'+firstThread.id)).run?.status
+      return status==='cancelled'?status:null
+    })
+    await wait('second run started after workspace became free',()=>readFileSync(log,'utf8').includes('wait-for-cancel second'))
+    await request('/runs/'+second.runId+'/commands',{kind:'cancel'})
+    await wait('second run ended',async()=>{
+      const status=(await request('/threads/'+secondThread.id)).run?.status
+      return status==='cancelled'?status:null
+    })
+    const calls=readFileSync(log,'utf8').trim().split('\n').map(line=>JSON.parse(line))
+    assert.deepEqual(calls.filter(call=>call[0]==='prompt').map(call=>call[2]),['wait-for-cancel first','wait-for-cancel second'])
+  }finally{
     if(child?.connected)child.disconnect()
     if(exit)await Promise.race([exit,delay(2000,undefined,{ref:false})])
     if(child?.exitCode===null)child.kill()

@@ -21,7 +21,7 @@ type Skill=ReturnType<typeof skillMetadata>&{id:string;root:string;projectId?:st
 type Handler=(event:PluginEvent)=>void|Promise<void>
 type Live={manifest:PluginManifest;tools:Map<string,RegisteredTool<Core>>;skills:Map<string,Skill>;
   providers:Map<string,PluginProvider>;handlers:Map<PluginEvent['type'],Set<Handler>>;stop?:()=>void|Promise<void>;
-  test?:PluginModule['test']}
+  test?:PluginModule['test'];calls:number;acceptingCalls:boolean}
 const stateFile='plugins.json'
 const identifier=/^[a-z][a-z0-9-]{0,39}$/
 const exportedName=/^[a-z][a-z0-9_]{0,31}$/
@@ -101,7 +101,12 @@ export function pluginHost(dir:string){
       if(dependsOn(dependency,manifest.id))fail('插件依赖形成循环',409)
     }
     if(manifest.configSchema&&!validateSchema(manifest.configSchema)(item.config))fail('插件配置不符合清单')
-    const live:Live={manifest,tools:new Map(),skills:new Map(),providers:new Map(),handlers:new Map()}
+    const live:Live={manifest,tools:new Map(),skills:new Map(),providers:new Map(),handlers:new Map(),calls:0,acceptingCalls:true}
+    const withLiveCall=async<T>(work:()=>T|Promise<T>):Promise<T>=>{
+      if(!live.acceptingCalls)fail('插件正在更新，请稍后重试',409)
+      live.calls++
+      try{return await work()}finally{live.calls--}
+    }
     const namespace=manifest.id.replaceAll('-','_')+'__'
     const permitted=(cap:PluginCapability)=>{
       if(!manifest.capabilities.includes(cap))fail('插件未声明能力：'+cap,403)
@@ -124,14 +129,14 @@ export function pluginHost(dir:string){
         return add(live.tools,name,toolEntry<Core>({name,description:tool.description,parameters:tool.parameters,async:true,
           confirm:tool.risk==='confirm',allowed:c=>c.actor==='user'&&(!pkg.projectId||pkg.projectId===c.thread.projectId)&&
             (!c.model||tool.network==='network.public'||(c.thread.projectId?c.model.shareProject:c.model.sharePersonal)),
-          execute:(c,args)=>tool.execute(args,{actor:c.actor,threadId:c.thread.id,messageId:c.current.id,projectId:c.thread.projectId,
-            signal:c.signal,maxResultBytes:7500,requestText:c.current.text,authorizedDestinations:[...(c.webDestinations??[])]})}))
+          execute:async(c,args)=>withLiveCall(()=>tool.execute(args,{actor:c.actor,threadId:c.thread.id,messageId:c.current.id,projectId:c.thread.projectId,
+            signal:c.signal,maxResultBytes:7500,requestText:c.current.text,authorizedDestinations:[...(c.webDestinations??[])]}))}))
       },
       registerProvider(provider){
         permitted('providers')
         if(pkg.projectId||!exportedName.test(provider.id)||typeof provider.generate!=='function')fail('插件模型提供方配置无效')
         const name='plugin:'+namespace+provider.id
-        return add(live.providers,name,{...provider,id:name})
+        return add(live.providers,name,{...provider,id:name,generate:request=>withLiveCall(()=>provider.generate(request))})
       },
       registerSkill({path:rel}){
         permitted('skills')
@@ -144,8 +149,9 @@ export function pluginHost(dir:string){
         permitted('events')
         if(!accepting||!['tool.finished','task.communication','task.delivery'].includes(type))fail('该事件不可订阅')
         const handlers=live.handlers.get(type)??new Set<Handler>()
-        handlers.add(handler);live.handlers.set(type,handlers)
-        return ()=>{handlers.delete(handler)}
+        const guarded:Handler=event=>live.acceptingCalls?withLiveCall(()=>handler(event)):undefined
+        handlers.add(guarded);live.handlers.set(type,handlers)
+        return ()=>{handlers.delete(guarded)}
       }
     }
     try{
@@ -156,7 +162,10 @@ export function pluginHost(dir:string){
         const mod=await lifecycle(()=>import(pathToFileURL(packagePath(path,manifest.entry!)).href)) as PluginModule
         if(typeof mod.activate!=='function')fail('插件代码缺少 activate()')
         live.stop=mod.deactivate
-        live.test=mod.test
+        if(mod.test){
+          const test=mod.test
+          live.test=(config,input,signal)=>withLiveCall(()=>test(config,input,signal))
+        }
         await lifecycle(()=>mod.activate(context))
       }
       return live
@@ -173,9 +182,26 @@ export function pluginHost(dir:string){
     seen.add(name)
     return (active.get(name)?.manifest.requires??[]).some(d=>dependsOn(d,target,seen))
   }
-  async function replace(name:string,item:Entry,live?:Live){
+  async function replace(name:string,item:Entry,prepareNext?:()=>Promise<Live>){
     const old=active.get(name)
-    try{save(name,item,true)}catch(e){try{await lifecycle(()=>live?.stop?.())}catch{}throw e}
+    if(old){
+      old.acceptingCalls=false
+      const deadline=Date.now()+5000
+      while(old.calls>0&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,20))
+      if(old.calls){
+        old.acceptingCalls=true
+        fail('插件仍有在途调用，请稍后重试',409)
+      }
+    }
+    let live:Live|undefined
+    try{
+      live=await prepareNext?.()
+      save(name,item,true)
+    }catch(e){
+      if(old)old.acceptingCalls=true
+      try{await lifecycle(()=>live?.stop?.())}catch{}
+      throw e
+    }
     if(live)active.set(name,live);else active.delete(name)
     snapshot()
     if(old){
@@ -204,15 +230,19 @@ export function pluginHost(dir:string){
     tail=result.catch(()=>{})
     return result
   }
-  const stage=(files:Map<string,Buffer>,source:string,projectId?:string)=>{
+  const stage=(files:Map<string,Buffer>,source:string,projectId?:string,expectedId?:string)=>{
     const folder=id(),path=join(root,folder)
     try{
       writeTree(path,files)
       const manifest=pluginManifest(path)
+      if(expectedId&&manifest.id!==expectedId)fail('修订不能更换插件 ID',409)
       if(builtin.has(manifest.id))fail('此插件 ID 由随应用安装的插件保留')
       if(!Object.hasOwn(state.entries,manifest.id)&&Object.keys(state.entries).length>=60)fail('最多管理 60 个外部插件')
       const pkg={folder,digest:fingerprint(tree(path)),manifest,source,projectId}
       const previous=entry(manifest.id)
+      if([previous.current,previous.pending].some(existing=>existing&&(existing.projectId??null)!==(projectId??null)))
+        fail('此插件 ID 已在其他范围登记',403)
+      if(source==='creator'&&!expectedId&&previous.pending)fail('已有待审草稿，请基于当前草稿版本修订',409)
       save(manifest.id,{...previous,pending:pkg})
       clean(previous.pending)
       return {id:manifest.id,digest:pkg.digest,version:manifest.version}
@@ -301,9 +331,45 @@ export function pluginHost(dir:string){
       if(!identifier.test(name))fail('插件 ID 无效')
       const item=entry(name)
       switch(body.action){
+        case 'revise':{
+          const base=item.pending??item.current
+          if(!base||base.digest!==body.baseDigest)fail('插件基准版本已改变，请重新读取差异',409)
+          const files=tree(verifyPackage(base).path)
+          if(!Array.isArray(body.files)||body.files.length>100)fail('修订文件最多 100 个')
+          let total=0
+          const touched=new Set<string>()
+          for(const change of body.files){
+            if(!object(change)||typeof change.path!=='string'||typeof change.content!=='string')fail('修订文件须包含相对路径和文本内容')
+            const path=relativePath(change.path),bytes=Buffer.from(change.content,'utf8')
+            if(touched.has(path))fail('同一修订中不能重复变更文件')
+            touched.add(path)
+            total+=bytes.length
+            if(total>8*1024*1024||bytes.includes(0))fail('修订内容超过 8 MiB 或包含二进制数据')
+            files.set(path,bytes)
+          }
+          if(body.remove!==undefined){
+            if(!Array.isArray(body.remove)||body.remove.length>100)fail('删除文件最多 100 个')
+            for(const value of body.remove){
+              const path=relativePath(value)
+              if(path==='plugin.json')fail('不能删除插件清单')
+              if(touched.has(path))fail('同一文件不能同时更新和删除')
+              touched.add(path)
+              files.delete(path)
+            }
+          }
+          if(body.manifest!==undefined){
+            if(!object(body.manifest)||body.manifest.id!==name||body.manifest.entry!==base.manifest.entry)
+              fail('修订清单不能改变插件 ID 或代码入口')
+            files.set('plugin.json',Buffer.from(JSON.stringify(body.manifest,null,2)))
+          }
+          if(files.size>256||[...files.values()].reduce((size,bytes)=>size+bytes.length,0)>8*1024*1024)
+            fail('修订后的插件最多 256 个文件且不超过 8 MiB')
+          return stage(files,base.source,base.projectId,name)
+        }
         case 'review': return review(item,body.version)
         case 'test':{
           const plugin=active.get(name)
+          if(body.digest&&body.digest!==item.current?.digest)fail('插件已更新，请重新选择测试版本',409)
           if(!plugin?.test||!object(body.input))fail('此插件没有可用的连接测试',409)
           return plugin.test(Object.freeze(structuredClone(item.config)),body.input,signal)
         }
@@ -328,7 +394,7 @@ export function pluginHost(dir:string){
             fail('请确认此版本的网络能力',403)
           const next={...item,current:pkg,previous:item.pending?item.current:item.previous,pending:undefined,
             enabled:true,trusted:pkg.source!=='bundled'&&pkg.manifest.entry?pkg.digest:undefined}
-          try{await replace(name,next,await prepare(pkg,next))}catch(e){errors.set(name,explain(e));fail(explain(e),409)}
+          try{await replace(name,next,()=>prepare(pkg,next))}catch(e){errors.set(name,explain(e));fail(explain(e),409)}
           if(item.pending)clean(item.previous)
           break
         }
@@ -338,10 +404,11 @@ export function pluginHost(dir:string){
           if(pkg.manifest.entry&&body.trustCode!==true)fail('回滚代码版本须重新确认运行权限',403)
           if(pkg.manifest.capabilities.some(cap=>network.has(cap))&&body.allowNetwork!==true)fail('请确认此版本的网络能力',403)
           const next={...item,current:pkg,previous:item.current,enabled:true,trusted:pkg.manifest.entry?pkg.digest:undefined}
-          await replace(name,next,await prepare(pkg,next));break
+          await replace(name,next,()=>prepare(pkg,next));break
         }
         case 'configure':{
           if(!item.current||!object(body.config))fail('插件配置须为对象')
+          const current=item.current
           const next={...item,config:structuredClone(body.config)}
           if(item.current.manifest.configSchema&&!validateSchema(item.current.manifest.configSchema)(next.config))fail('插件配置不符合清单')
           const networkConfig=item.current.manifest.capabilities.some(cap=>network.has(cap))&&
@@ -350,11 +417,12 @@ export function pluginHost(dir:string){
           if(item.enabled&&item.current.manifest.entry&&item.current.source!=='bundled'){
             await replace(name,next)
             restart.add(name)
-          }else if(item.enabled)await replace(name,next,await prepare(item.current,next));else save(name,next)
+          }else if(item.enabled)await replace(name,next,()=>prepare(current,next));else save(name,next)
           break
         }
         case 'disable':
         case 'uninstall':{
+          if(body.digest&&body.digest!==item.current?.digest)fail('插件已更新，请重新选择版本',409)
           if([...active.keys()].some(other=>other!==name&&dependsOn(other,name)))fail('请先停用依赖此插件的扩展',409)
           if(body.action==='uninstall'&&builtin.has(name))fail('随应用安装的插件可停用',409)
           await replace(name,{...item,enabled:false})
@@ -401,7 +469,7 @@ export function pluginHost(dir:string){
     },
     validateDraft(name:string,projectId:string|null){
       const pkg=entry(name).pending
-      if(!pkg||pkg.source!=='creator'||(pkg.projectId??null)!==projectId)fail('当前范围内没有该草稿',404)
+      if(!pkg||(pkg.projectId??null)!==projectId)fail('当前范围内没有该草稿',404)
       return validate(pkg)
     },
     get revision(){return state.revision},

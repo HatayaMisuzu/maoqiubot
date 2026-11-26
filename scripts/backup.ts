@@ -67,6 +67,8 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
           UPDATE chat_jobs SET status='failed' WHERE status IN ('queued','working');`)
         if(snap.prepare("SELECT 1 FROM pragma_table_info('chat_jobs') WHERE name='operation'").get())
           snap.exec("UPDATE chat_jobs SET status=CASE WHEN status='awaiting_approval' THEN 'cancelled' ELSE status END,operation=NULL")
+        if(snap.prepare("SELECT 1 FROM pragma_table_info('chat_jobs') WHERE name='checkpoint'").get())
+          snap.exec("UPDATE chat_jobs SET status=CASE WHEN status='budget_paused' THEN 'cancelled' ELSE status END,checkpoint=NULL,inFlight=NULL")
       }
       const files=snap.prepare('SELECT id,bytes FROM attachments').all()
       mkdirSync(join(stage,'attachments'),{mode:0o700})

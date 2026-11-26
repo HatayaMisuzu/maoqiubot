@@ -2,10 +2,12 @@ import {$,api,banner,btn,el,form,headers,icon,iconBtn,items,notice,state,url} fr
 import {chat} from './chat.js';
 import {home} from './home.js';
 import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
-let revision=0, cursor=0, subscription, refreshTimer, retryTimer, connection='正在连接';
-const actions={load,openThread,openWorkDraft,openHome,refresh,loadOlder,current:id=>revision===id};
+let revision=0, catalogRevision=0, cursor=0, subscription, refreshTimer, retryTimer, connection='正在连接';
+const threadOffsets=new Map(),threadHasMore=new Map();
+const actions={load,openThread,openDraft,openWorkDraft,openHome,refresh,loadOlder,current:id=>revision===id};
 const chats=chat(actions),house=home(actions);
 $('mark').append(icon('yarn'));$('menu').append(icon('menu'));$('menu').onclick=()=>sidebar(true);$('shade').onclick=()=>sidebar(false);
+$('menu').setAttribute('aria-label','打开导航菜单');
 const narrow=matchMedia('(max-width: 760px)');
 function sidebar(open){
   const wasOpen=document.body.classList.contains('open');
@@ -39,6 +41,7 @@ function unauthorized(){
 }
 function row(title,fn,active,symbol,online){
   const b=btn('',fn,'row-btn'+(active?' active':''),symbol);b.append(el('span','title',title));b.title=title;
+  if(active)b.setAttribute('aria-current','page');
   if(online!=null){const d=el('i','dot '+(online?'live':''));d.title=online?'在线':'离线';b.append(d)}return b;
 }
 function side(){
@@ -47,28 +50,112 @@ function side(){
   const list=$('side-list');list.replaceChildren();
   if(state.view==='home'){list.append(el('div','group-title','项目目录',iconBtn('建立项目',house.createProject,'plus')));
     for(const p of state.projects)list.append(row(p.name,()=>openHome(p.id),p.id===state.project,'layers'));return}
-  if(state.instances.some(i=>i.id!=='main')){list.append(el('div','group-title','联系人'));
-    const all=state.instances.some(i=>i.id==='main')?state.instances:[{id:'main',name:'小毛球'},...state.instances];
-    all.forEach(i=>list.append(row(i.name,()=>go('#chat?instance='+url(i.id)),!state.thread&&(state.instance||'main')===i.id,'chat',i.online)))}
-  list.append(el('div','group-title','最近对话',iconBtn('开始新对话',()=>chats.newThread(),'plus')));
-  for(const t of state.threads)list.append(row(t.title,()=>openThread(t.id),state.thread===t.id,t.taskId?'task':'chat'));
+  list.append(el('div','group-title','联系人'));
+  const all=state.instances.some(i=>i.id==='main')?state.instances:[{id:'main',name:'小毛球'},...state.instances];
+  for(const i of all){
+    const selected=state.thread?state.threads.find(t=>t.id===state.thread)||
+      (state.snapshot?.thread?.id===state.thread?state.snapshot.thread:null):null;
+    const active=selected?selected.instanceId===i.id:(state.instance||'main')===i.id;
+    list.append(row(i.name,()=>i.id==='main'&&state.mainThread?openThread(state.mainThread.id):go('#chat?instance='+url(i.id)),active,'chat',i.id==='main'?true:i.online));
+    if(i.id==='main'&&state.mainThread)list.append(row('主会话',()=>openThread(state.mainThread.id),state.thread===state.mainThread.id,'chat'));
+    if(!active)continue;
+    if(i.id==='main'){
+      list.append(el('div','group-title side-group',el('span','','侧边会话'),iconBtn('新建侧聊',()=>chats.newThread('main'),'plus')));
+      for(const t of state.threads.filter(t=>t.instanceId==='main'&&(t.kind==='side'||t.conversationType==='side')))
+        list.append(row(t.title||'侧边会话',()=>openThread(t.id),state.thread===t.id,'chat'));
+    }else{
+      list.append(el('div','group-title side-group',el('span','','最近会话'),iconBtn('新建会话',()=>chats.newThread(i.id),'plus')));
+      for(const t of state.threads.filter(t=>t.instanceId===i.id))list.append(row(t.title||'新会话',()=>openThread(t.id),state.thread===t.id,t.taskId?'task':'chat'));
+    }
+    const archived=state.archivedThreads.filter(thread=>thread.instanceId===i.id);
+    if(archived.length){
+      list.append(el('div','group-title side-group','已归档'));
+      for(const thread of archived)list.append(row('恢复 · '+(thread.title||'会话'),()=>restoreThread(thread),'','file'));
+    }
+    const deleted=state.deletedThreads.filter(thread=>thread.instanceId===i.id);
+    if(deleted.length){
+      list.append(el('div','group-title side-group','最近删除'));
+      for(const thread of deleted)list.append(row('最近删除 · '+(thread.title||'会话'),()=>manageDeleted(thread),'','file'));
+    }
+    if(threadHasMore.get(i.id))list.append(btn('加载更早会话',()=>loadMoreThreads(i.id),'ghost'));
+  }
 }
 async function load(){
-  const [instances,threads,projects]=await Promise.all([api('/instances'),api('/threads'),api('/projects')]);
-  state.instances=items(instances);state.threads=items(threads);state.projects=items(projects);
+  const serial=++catalogRevision;
+  const [instances,mainThread,projects]=await Promise.all([api('/instances'),api('/threads/main'),api('/projects')]);
+  const agents=items(instances);
+  const pages=await Promise.all(agents.flatMap(agent=>['active','archived','deleted'].map(status=>api('/threads?'+new URLSearchParams({
+    instanceId:agent.id,state:status,limit:status==='active'?'40':'20',offset:'0'
+  })))));
+  if(serial!==catalogRevision)return;
+  state.instances=agents;state.mainThread=mainThread;state.projects=items(projects);
+  state.threads=[];state.archivedThreads=[];state.deletedThreads=[];
+  state.instances.forEach((agent,index)=>{
+    const active=items(pages[index*3]),archived=items(pages[index*3+1]),deleted=items(pages[index*3+2]);
+    state.threads.push(...active);state.archivedThreads.push(...archived);state.deletedThreads.push(...deleted);
+    threadOffsets.set(agent.id,active.length);threadHasMore.set(agent.id,active.length===40);
+  });
+}
+async function restoreThread(thread){
+  await api('/threads/'+url(thread.id)+'/lifecycle',{action:'restore'});await load();side();notice('会话已恢复。');
+}
+async function manageDeleted(thread){
+  const impact=await api('/threads/'+url(thread.id)+'/impact'),dialog=$('dialog');
+  const agent=state.instances.find(item=>item.id===thread.instanceId);
+  const summary=el('div','impact-summary',
+    el('p','muted','关联任务 '+impact.tasks.length+' 条 · 运行 '+impact.runs.length+' 项 · 待处理命令 '+impact.jobs.length+' 项'),
+    el('p','muted','分享 '+impact.shares+' 项 · 挂起输入 '+impact.held+' 项'));
+  dialog.replaceChildren(el('h2','','最近删除'),el('p','text',thread.title||'此会话'),summary,
+    el('p','muted',impact.scope),
+    el('p','muted',impact.canPurge?'可永久清理此会话的工作台缓存。':'仍有关联运行或待核对操作，暂时不能永久清理。'),
+    el('div','dialog-foot',btn('关闭',()=>dialog.close(),'secondary'),
+      btn('恢复会话',async()=>{await api('/threads/'+url(thread.id)+'/lifecycle',{action:'restore'});dialog.close();await load();side()},'secondary'),
+      thread.sessionId&&!thread.nativeInvalid&&agent?.capabilities?.nativeActions?.includes('delete')?btn('删除原生会话',async()=>{
+        if(!confirm('确认在 '+agent.name+' 原生端永久删除会话 '+thread.sessionId+'？这会影响原生客户端中的该会话。'))return;
+        const result=await api('/threads/'+url(thread.id)+'/lifecycle',{action:'deleteNative',confirm:true,sessionId:thread.sessionId});
+        dialog.close();await load();side();notice(result.scope==='native_pending'?'原生删除请求已提交，等待回执。':'原生会话已删除。');
+      },'secondary'):null,
+      btn('永久清理',async()=>{
+        if(!confirm('永久清理“'+(thread.title||'此会话')+'”及其工作台缓存？此操作无法恢复。'))return;
+        await api('/threads/'+url(thread.id)+'/lifecycle',{action:'purge',confirm:true});dialog.close();await load();side();
+      },'secondary')));
+  dialog.querySelector('.dialog-foot button:last-child').disabled=!impact.canPurge;
+  dialog.showModal();
+}
+async function loadMoreThreads(instanceId){
+  const serial=catalogRevision,offset=threadOffsets.get(instanceId)||0;
+  const page=await api('/threads?'+new URLSearchParams({instanceId,state:'active',limit:'40',offset:String(offset)}));
+  if(serial!==catalogRevision||threadOffsets.get(instanceId)!==offset)return;
+  const existing=new Set(state.threads.map(thread=>thread.id));
+  state.threads.push(...items(page).filter(thread=>!existing.has(thread.id)));
+  threadOffsets.set(instanceId,offset+items(page).length);threadHasMore.set(instanceId,items(page).length===40);side();
 }
 function route(){
   const [view,params]=(location.hash.slice(1)||'chat').split('?'),q=new URLSearchParams(params);
-  state.view=view==='home'?'home':'chat';state.thread=q.get('thread');state.instance=q.get('instance')||'main';state.project=q.get('project');state.page=q.get('page');
+  state.view=view==='home'?'home':'chat';state.thread=q.get('thread');state.instance=q.get('instance')||'main';state.draft=q.get('draft')==='1';state.project=q.get('project');state.page=q.get('page');
 }
 async function refresh(){
   const serial=++revision;
   if(state.view==='home'){await house.draw(serial);return}
+  const previousId=state.thread;
+  if(!state.thread&&!state.draft&&(state.instance||'main')==='main'&&state.mainThread){
+    state.thread=state.mainThread.id;
+    const target='#chat?thread='+url(state.thread);
+    if(location.hash!==target)history.replaceState(null,'',target);
+  }
+  if(!state.thread&&!state.draft&&state.instance!=='main'){
+    const last=localStorage.getItem('mao-last-thread:'+state.instance);
+    const recent=state.threads.find(thread=>thread.instanceId===state.instance&&thread.id===last)||
+      state.threads.find(thread=>thread.instanceId===state.instance);
+    if(recent){state.thread=recent.id;const target='#chat?thread='+url(recent.id);if(location.hash!==target)history.replaceState(null,'',target)}
+    else{state.draft=true;const target='#chat?instance='+url(state.instance)+'&draft=1';if(location.hash!==target)history.replaceState(null,'',target)}
+  }
   const id=state.thread;
   const snap=id?await api('/threads/'+url(id)+'?messageLimit=60'):null;
   if(snap){
     const previous=state.snapshot;
-    const overlap=previous?.olderLoaded&&previous.thread.id===id?previous.messages.findIndex(m=>m.id===snap.messages[0]?.id):-1;
+    const overlap=previous?.olderLoaded&&previous.thread.id===id&&previous.thread.contextRevision===snap.thread.contextRevision?
+      previous.messages.findIndex(m=>m.id===snap.messages[0]?.id):-1;
     if(overlap>=0){
       snap.olderLoaded=true;snap.nextBefore=previous.nextBefore;
       snap.messages=[...previous.messages.slice(0,overlap),...snap.messages];
@@ -76,6 +163,9 @@ async function refresh(){
     await linkTasks(snap);
   }
   if(serial!==revision)return;
+  if(snap?.thread?.instanceId!=='main'&&snap?.thread?.state==='active')
+    localStorage.setItem('mao-last-thread:'+snap.thread.instanceId,snap.thread.id);
+  if(state.thread!==previousId)side();
   state.snapshot=snap;chats.draw();
 }
 async function linkTasks(snap){
@@ -115,6 +205,7 @@ async function navigate(){
 }
 async function go(hash){if(location.hash!==hash)history.pushState(null,'',hash);await navigate()}
 function openThread(id){return go('#chat?thread='+url(id))}
+function openDraft(id,projectId){return go('#chat?instance='+url(id)+(projectId?'&project='+url(projectId):'')+'&draft=1')}
 async function openWorkDraft(id,refs){
   chats.seedReferences(id,refs);
   await load();
@@ -146,7 +237,7 @@ async function subscribe(){
         if(!data)continue;const event=JSON.parse(data),id=Number(event.cursor||lines.find(x=>x.startsWith('id:'))?.slice(3));
         if(event.kind==='chat_delta'){chats.preview(event);continue}
         if(Number.isSafeInteger(id)&&id>cursor)cursor=id;
-        const listsChanged=['presence','thread'].includes(event.kind)||event.kind==='home'&&event.path==='/projects';
+        const listsChanged=['presence','thread','instance'].includes(event.kind)||event.kind==='home'&&event.path==='/projects';
         if(listsChanged ||
           (state.view==='home' && (event.kind==='home'||event.taskId)) ||
           (state.view==='chat' && event.threadId===state.thread) ||

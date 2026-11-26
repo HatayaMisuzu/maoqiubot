@@ -36,11 +36,12 @@ export function offerMemory(db:DatabaseSync,thread:any,current:any,value:unknown
 }
 export function memoryCandidates(db:DatabaseSync,thread:any){
   return db.prepare(`SELECT c.*,m.text AS original FROM memory_candidates c JOIN messages m ON m.id=c.messageId
-    WHERE c.projectId IS ? AND c.status='pending' ORDER BY c.rowid DESC LIMIT 50`).all(thread.projectId)
+    JOIN threads t ON t.id=c.threadId WHERE t.state IN ('active','archived')
+    AND c.projectId IS ? AND c.status='pending' ORDER BY c.rowid DESC LIMIT 50`).all(thread.projectId)
 }
 export function reviewMemory(db:DatabaseSync,dir:string,thread:any,b:any){
   if(!['accept','reject'].includes(b.action))fail('记忆候选操作无效')
-  const candidate=must(db,"SELECT * FROM memory_candidates WHERE id=? AND projectId IS ? AND status='pending'",
+  const candidate=must(db,"SELECT * FROM memory_candidates WHERE id=? AND projectId IS ? AND status='pending' AND threadId IN(SELECT id FROM threads WHERE state IN ('active','archived'))",
     required(b.id,'记忆候选 ID'),thread.projectId)
   const saved=b.action==='accept'?saveUserMemory(db,dir,{id:candidate.threadId,projectId:thread.projectId},{
     body:b.body??candidate.body,factKey:b.factKey??candidate.factKey,type:candidate.recordType,

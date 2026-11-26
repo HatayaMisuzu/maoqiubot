@@ -296,6 +296,10 @@ test('自然主聊创建代码草稿，所有者审查后激活、更新、回�
     await api('/chat/plugins',{action:'activate',id:'creator-test',digest:proof.digest},{status:403})
     if(n===3){
       await api('/chat/plugins',{action:'activate',id:'creator-test',digest:proof.digest,trustCode:true},{status:409})
+      const preserved=(await api('/chat/plugins')).plugins.find(p=>p.id==='creator-test')
+      assert.equal(preserved.current.manifest.version,'2.0.0')
+      assert.equal(preserved.loaded,true)
+      assert.equal(preserved.pending.digest,proof.digest)
     }else await plugins('activate','creator-test',{digest:proof.digest,trustCode:true})
     assert.match((await ask('用扩展测试')).text,new RegExp('"value":'+Math.min(n,2)))
   }
@@ -1295,7 +1299,7 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
   legacyConnector.close()
   for(let i=0;i<2;i++){
     const migrated=openDatabase(old)
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,6)
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,7)
     assert.equal(migrated.prepare('SELECT sessionId FROM threads WHERE id=?').get('old-thread').sessionId,'old-session')
     assert.equal(migrated.prepare('SELECT count(*) n FROM run_grants').get().n,0)
     assert.ok(Date.parse(migrated.prepare('SELECT expiresAt FROM grants').get().expiresAt)>Date.now())
