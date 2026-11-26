@@ -21,6 +21,8 @@ npm.cmd run package:desktop
 
 桌面首次启动会在 PATH 和常用安装目录查找官方执行入口。非标准 DSH 安装位置可在「Agent 设置」填写官方 `dsh.cmd` 的绝对路径，或在启动前设置 `MAOQIU_DSH_EXECUTABLE`。保存后点「测试连接」应用配置并查看各实例握手。托盘菜单也可重启连接器。有运行已送达时，工作台会提示等待或先停止该运行。实际推理还取决于原生账号与额度。
 
+需要让多个 Bot 并行修改同一 Git 项目时，在「Agent 设置」可从以仓库根目录为工作区的实例创建独立 Git 工作树。选择目标父目录后，应用会从当前提交建立分支和新实例。点「测试连接」登记新实例，再到项目中绑定并按需授权。运行旧桌面版时可用 `MAOQIU_PACKAGE_OUT` 指定另一个打包输出目录。[会话与工作区说明](docs/sessions.md)
+
 桌面配置默认保存到数据目录的 `desktop-connector.json`。高级配置仍可使用 `connector/config.local.json` 或 `MAOQIU_CONNECTOR_CONFIG`。相对工作区路径以连接器的工作目录为准。
 
 给其他前端或脚本测试接口时，使用 `npm.cmd run local` 启动本机 HTTP 服务和连接器，默认端口为 4317。仅需后端时可运行 `npm.cmd start`。
@@ -56,6 +58,8 @@ npm.cmd run package:desktop
 从「插件与 Skill」启用网页搜索、导入标准 Skill、安装经过审查的扩展，或配置声明式业务 API。可以请小毛球生成扩展草稿，再通过界面验证、审查和启用。配置示例见 [网页插件说明](plugins/web/README.md) 和 [插件 SDK](plugins/README.md)。
 
 ## 原生接入
+
+联系人下的「搜索会话」可按名称、项目和归档状态查找工作台话题。支持原生目录的实例可在同一区域查看和导入，已经属于其他范围的会话会从目录过滤。Codex 的「Bot 设置」可按需查询官方额度快照。[Orca 升级与验收报告](docs/orca-reuse-report.md)
 
 - **Codex** 通过本机官方 CLI 和私有 stdio App Server 使用个人 ChatGPT 登录。导入前核对账号、工作区及 profile；重复导入打开已有话题。支持的实例可以读取原生聊天文本、分支、归档和恢复。原客户端仍占用会话时须先释放。[Codex App Server 认证文档](https://developers.openai.com/codex/app-server/)
 - **DSH** 通过桌面安装包里的官方 `dsh --profile acp` 运行。工作台根据 ACP 握手开放模型目录、工作区会话列表及续接。没有原生历史接口时可以查看工作台已收到的消息。[DSH 会话模型](connector/DSH.md)

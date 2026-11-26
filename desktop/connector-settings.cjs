@@ -1,6 +1,9 @@
-const { existsSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
-const { basename, delimiter, isAbsolute, join, resolve } = require('node:path')
+const { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
+const { basename, delimiter, isAbsolute, join, relative, resolve, sep } = require('node:path')
 const { randomUUID } = require('node:crypto')
+const { execFile } = require('node:child_process')
+const { promisify } = require('node:util')
+const git = promisify(execFile)
 const officialNames = {
   codex: /^codex(?:\.exe)?$/i,
   dsh: /^dsh(?:\.exe|\.cmd)?$/i
@@ -19,7 +22,9 @@ function detectedCommand(adapterKey, command) {
   ]
   for (const path of candidates) {
     if (!isAbsolute(path) || !officialNames[adapterKey].test(basename(path))) continue
-    if (statSync(path,{throwIfNoEntry:false})?.isFile()) return path
+    try {
+      if (statSync(path, { throwIfNoEntry: false })?.isFile()) return path
+    } catch { /* PATH can contain inaccessible directories. Continue discovery. */ }
   }
   return null
 }
@@ -57,8 +62,9 @@ function write(file, config) {
 }
 
 function settingsView(settings) {
-  const instances = configFrom(settings.file).instances.map(({ id, name, adapterKey, profileId, workspaceRef, command }) =>
-    ({ id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, detectedCommand:detectedCommand(adapterKey,command) }))
+  const instances = configFrom(settings.file).instances.map(({ id, name, adapterKey, profileId, workspaceRef, command, worktree }) =>
+    ({ id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, worktree,
+      detectedCommand:detectedCommand(adapterKey,command) }))
   return { file: settings.file, editable: settings.editable, workspace: settings.workspace, instances }
 }
 
@@ -90,9 +96,69 @@ function saveInstance(settings, db, input) {
     (inUse && existing?.command !== command))) throw Error('此实例已登记。修改执行入口、工作区或 profile 时请使用新实例 ID')
   const args = existing?.adapterKey === adapterKey ? existing.args : adapterKey === 'codex' ? ['app-server'] : ['--profile', 'acp']
   const next = { ...existing, id, name, adapterKey, profileId, workspaceRef, command, args }
+  if (workspaceRef !== existing?.workspaceRef || adapterKey !== existing?.adapterKey) delete next.worktree
   config.instances = existing ? config.instances.map(i => i.id === id ? next : i) : [...config.instances, next]
   write(settings.file, config)
   return settingsView(settings)
 }
 
-module.exports = { connectorSettings, settingsView, saveInstance }
+async function createWorktree(settings, db, sourceId, instanceId, parent) {
+  if (!settings.editable) throw Error('当前使用独立 JSON 配置，请在原环境管理工作区')
+  if (typeof instanceId !== 'string' || !/^[a-zA-Z0-9][\w-]{0,47}$/.test(instanceId) || instanceId === 'main' ||
+    /^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])$/i.test(instanceId)) throw Error('请为新实例填写有效且唯一的 ID')
+  const source = configFrom(settings.file).instances.find(item => item.id === sourceId)
+  if (!source || !officialNames[source.adapterKey]?.test(basename(source.command))) throw Error('请选择本机 Codex 或 DSH 实例')
+  function available(config) {
+    if (config.instances.some(i => i.id.toLowerCase() === instanceId.toLowerCase()) ||
+      db.prepare('SELECT id FROM instances WHERE id=? COLLATE NOCASE').get(instanceId)) throw Error('这个实例 ID 已存在，请换一个 ID')
+  }
+  available(configFrom(settings.file))
+  const cwd = realpathSync(resolve(settings.workspace, source.workspaceRef))
+  const destinationParent = realpathSync(parent)
+  const workspaceRef = join(destinationParent, instanceId)
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) if (/^GIT_/i.test(key)) delete env[key]
+  async function run(args, directory = cwd) {
+    try {
+      const { stdout } = await git('git', ['--no-optional-locks', ...args], {
+        cwd: directory, env, windowsHide: true, timeout: 30000, maxBuffer: 4 * 1024 * 1024
+      })
+      return stdout.trim()
+    } catch (error) {
+      if (error.code === 'ENOENT') throw Error('找不到 Git，请检查本机 Git 安装')
+      throw Error('Git 操作失败：' + String(error.stderr || error.message).trim().slice(0, 700))
+    }
+  }
+  const root = realpathSync(await run(['rev-parse', '--show-toplevel']))
+  if (relative(root, cwd) !== '') throw Error('请从以仓库根目录为工作区的实例创建 Worktree')
+  const inside = relative(root, destinationParent)
+  if (!inside || (!isAbsolute(inside) && inside !== '..' && !inside.startsWith('..' + sep))) throw Error('请选择原工作区以外的 Worktree 父目录')
+  if (lstatSync(workspaceRef, { throwIfNoEntry: false })) throw Error('目标路径已存在，请换一个目录或实例 ID')
+  const branch = 'maoqiu/' + instanceId
+  const baseCommit = await run(['rev-parse', '--verify', 'HEAD^{commit}'])
+  if (!/^[a-f0-9]{40,64}$/.test(baseCommit)) throw Error('无法核对仓库的当前提交')
+  const dirty = Boolean(await run(['status', '--porcelain']))
+  await run(['worktree', 'add', '-b', branch, '--', workspaceRef, baseCommit])
+  try {
+    const actual = realpathSync(workspaceRef)
+    if (relative(actual, workspaceRef) !== '' || await run(['branch', '--show-current'], actual) !== branch ||
+      await run(['rev-parse', 'HEAD'], actual) !== baseCommit) throw Error('Git 回执与目标目录、分支或基准提交不一致')
+    const config = configFrom(settings.file)
+    available(config)
+    if (JSON.stringify(config.instances.find(item => item.id === sourceId)) !== JSON.stringify(source)) throw Error('来源实例配置已变化')
+    const worktree = { branch, baseCommit, sourceId }
+    config.instances.push({ ...source, id: instanceId, name: source.name + ' · ' + instanceId, workspaceRef: actual, worktree })
+    write(settings.file, config)
+    return { workspaceRef: actual, branch, baseCommit, dirty }
+  } catch (error) {
+    throw Error('Git 已创建目录 ' + workspaceRef + '，实例未保存：' + error.message)
+  }
+}
+
+function worktreeSource(settings, instance) {
+  if (!settings.editable) return undefined
+  return configFrom(settings.file).instances.find(i => i.id === instance.id && i.workspaceRef === instance.workspaceRef &&
+    i.adapterKey === instance.adapterKey)?.worktree?.sourceId
+}
+
+module.exports = { connectorSettings, settingsView, saveInstance, createWorktree, worktreeSource }

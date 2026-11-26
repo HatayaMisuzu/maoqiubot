@@ -28,12 +28,16 @@ export function listThreads(db:DatabaseSync,query:URLSearchParams){
   const state=query.get('state')??'active'
   if(!['active','deleted','archived'].includes(state))fail('未知会话状态')
   const instance=query.get('instanceId')
+  const title=(query.get('q')??'').trim()
+  if(title.length>120)fail('会话检索词最多 120 字符')
+  const project=query.get('projectId')||null
   // Legacy callers without pagination expect the full list.
   const limit=query.has('limit')?integer(query.get('limit'),50,200):-1
   return db.prepare(`SELECT t.* FROM threads t WHERE state=? AND (? IS NULL OR instanceId=?)
+    AND (?=0 OR projectId IS ?) AND instr(lower(COALESCE(title,'')),lower(?))>0
     AND NOT EXISTS(SELECT 1 FROM task_drafts d WHERE d.threadId=t.id)
     ORDER BY (kind='main') DESC,lastActivity DESC,t.id LIMIT ? OFFSET ?`)
-    .all(state,instance,instance,limit,integer(query.get('offset'),0,Number.MAX_SAFE_INTEGER,0))
+    .all(state,instance,instance,Number(query.has('projectId')),project,title,limit,integer(query.get('offset'),0,Number.MAX_SAFE_INTEGER,0))
 }
 
 function historyScope(thread:any,model:Sharing){

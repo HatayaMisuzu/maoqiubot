@@ -907,7 +907,8 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   socket.send(JSON.stringify({type:'hello',receiptLookup:true,instances:[
     {id:'codex-catalog',name:'Codex',workspaceRef:f.dir,adapterKey:'codex',profileId:'native-profile',
       availableActions:['run','prepare'],history:true,sessionList:true},
-    {id:'dsh-no-catalog',name:'DSH',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare']}
+    {id:'dsh-no-catalog',name:'DSH',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare']},
+    {id:'dsh-list-only',name:'DSH 只读',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare'],sessionList:true,sessionImport:false}
   ]}))
   await eventually(async()=>(await api('/instances')).find(i=>i.id==='codex-catalog'&&i.online))
   const p=await api('/projects',{name:'原生导入'})
@@ -916,6 +917,7 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   await api(endpoint,null,{token:shared.token,status:403})
   await api(endpoint+'?projectId='+p.id,null,{status:409})
   await api('/instances/dsh-no-catalog/sessions',null,{status:409})
+  await api('/instances/dsh-list-only/sessions',{sessionId:'existing-native'},{status:409})
   await api('/projects/'+p.id+'/workspaces',{instanceId:'codex-catalog',workspaceRef:f.dir})
   const listed=await api(endpoint+'?projectId='+p.id+'&cursor=opaque')
   assert.deepEqual(listed.items,[{id:'existing-native',title:'现有原生会话',updatedAt:150,active:false}])
@@ -926,6 +928,10 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   const data={sessionId:listed.items[0].id,title:listed.items[0].title,projectId:p.id}
   const first=await api(endpoint,data)
   assert.equal((await api(endpoint,data)).thread.id,first.thread.id)
+  const another=await api('/projects',{name:'另一项目'})
+  await api('/projects/'+another.id+'/workspaces',{instanceId:'codex-catalog',workspaceRef:f.dir})
+  assert.deepEqual((await api(endpoint+'?projectId='+another.id)).items,[])
+  await api(endpoint,{...data,projectId:another.id},{status:409})
   const command=await eventually(()=>frames.find(f=>f.command?.runId===first.runId)?.command)
   assert.equal(command.kind,'prepare')
   assert.equal(command.payload.importSessionId,'existing-native')
@@ -937,6 +943,11 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   await event(1,'model_state',{sessionId:'existing-native',current:'native-model'})
   await event(2,'completed',{sessionId:'existing-native'})
   assert.equal((await api(endpoint,data)).status,'bound')
+  assert.deepEqual((await api(endpoint)).items,[])
+  await api(endpoint,{...data,projectId:null},{status:409})
+  const search='/threads?instanceId=codex-catalog&q='+encodeURIComponent('现有原生')+'&projectId='
+  assert.deepEqual((await api(search+p.id)).map(t=>t.id),[first.thread.id])
+  assert.deepEqual(await api(search+another.id),[])
   const snapshot=await api('/threads/'+first.thread.id)
   assert.equal(snapshot.run.status,'completed')
   assert.equal(snapshot.thread.sessionId,'existing-native')

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
 import {once} from 'node:events'
-import {mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs'
+import {mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
@@ -108,7 +108,10 @@ test('connector restarts a native DSH process without replaying the interrupted 
     await online()
     await request('/threads/'+original.id+'/model',{modelId:'manual'})
     const follow=await request('/threads/'+original.id+'/messages',{text:'wait-for-cancel'})
-    await wait('ACP model setup before prompt',()=>readFileSync(log,'utf8').includes('"switch"'))
+    await wait('ACP prompt is written after model setup',async()=>{
+      const snapshot=await request('/threads/'+original.id)
+      return snapshot.messages.some(m=>m.data.runId===follow.runId&&m.data.controlReady)
+    })
     await request('/runs/'+follow.runId+'/commands',{kind:'cancel'})
     const cancelled=await status(original,follow.runId,'cancelled')
     assert.ok(cancelled.messages.some(m=>m.data.runId===follow.runId&&m.data.controlReady))
@@ -162,18 +165,21 @@ test('connector prevents duplicate native session bindings across matching runti
   }
 })
 
-test('connector serializes writes to one workspace until the prior run ends',async()=>{
+test('connector serializes workspace writes, cancels queued inputs, and runs independent workspaces concurrently',async()=>{
   const temp=mkdtempSync(join(tmpdir(),'maoqiu-workspace-lock-'))
   const log=join(temp,'native.calls')
   const app=startServer({port:0,dataDir:join(temp,'server'),chat:false})
-  let child,exit,ws
+  let child,exit
   try{
     await once(app.server,'listening')
     const port=app.server.address().port
     const config=join(temp,'node.json')
+    const independent=join(temp,'independent')
+    mkdirSync(independent)
+    const fixture={name:'DSH fixture',adapterKey:'dsh',env:{MAOQIU_ACP_TEST_LOG:log,DSH_HOME:join(temp,'dsh')},
+      command:process.execPath,args:['--input-type=commonjs','-e',`(async()=>{${fakeAcp}})()`]}
     writeFileSync(config,JSON.stringify({url:'ws://127.0.0.1:'+port+'/api/v1/node',nodeId:'local',stateDir:join(temp,'node'),
-      instances:[{id:'dsh',name:'DSH fixture',adapterKey:'dsh',workspaceRef:temp,env:{MAOQIU_ACP_TEST_LOG:log,DSH_HOME:join(temp,'dsh')},
-        command:process.execPath,args:['--input-type=commonjs','-e',`(async()=>{${fakeAcp}})()`]}]}))
+      instances:[{...fixture,id:'dsh',workspaceRef:temp},{...fixture,id:'dsh-other',workspaceRef:independent}]}))
     child=spawn(process.execPath,['connector/index.ts',config],{
       env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local},stdio:['ignore','ignore','inherit','ipc'],windowsHide:true
     })
@@ -192,15 +198,25 @@ test('connector serializes writes to one workspace until the prior run ends',asy
       while(Date.now()<end){const value=await fn();if(value)return value;await delay(50)}
       assert.fail('timed out: '+label)
     }
-    await wait('connector online',async()=>(await request('/instances')).some(i=>i.id==='dsh'&&i.online))
+    await wait('both connectors online',async()=>(await request('/instances')).filter(i=>i.adapterKey==='dsh'&&i.online).length===2)
     const firstThread=await request('/threads',{instanceId:'dsh'})
     const secondThread=await request('/threads',{instanceId:'dsh'})
     const first=await request('/threads/'+firstThread.id+'/messages',{text:'wait-for-cancel first'})
     await wait('first native run started',()=>readFileSync(log,'utf8').includes('wait-for-cancel first'))
+    const discardThread=await request('/threads',{instanceId:'dsh'})
+    const discard=await request('/threads/'+discardThread.id+'/messages',{text:'must never reach native'})
+    await wait('connector received queued input',()=>app.db.prepare('SELECT status FROM commands WHERE id=?').get(discard.commandId).status==='received')
+    await request('/runs/'+discard.runId+'/commands',{kind:'cancel'})
+    await wait('queued run cancelled without waiting for workspace',async()=>
+      (await request('/threads/'+discardThread.id)).run?.status==='cancelled')
     const second=await request('/threads/'+secondThread.id+'/messages',{text:'wait-for-cancel second'})
-    await delay(200)
+    await wait('connector received next input',()=>app.db.prepare('SELECT status FROM commands WHERE id=?').get(second.commandId).status==='received')
+    const parallelThread=await request('/threads',{instanceId:'dsh-other'})
+    await request('/threads/'+parallelThread.id+'/messages',{text:'independent run'})
+    await wait('independent workspace finished before first was cancelled',async()=>
+      (await request('/threads/'+parallelThread.id)).run?.status==='completed')
     const beforeCancel=readFileSync(log,'utf8').split('\n').filter(line=>line.includes('"prompt"')).map(line=>JSON.parse(line)[2])
-    assert.deepEqual(beforeCancel,['wait-for-cancel first'])
+    assert.deepEqual(beforeCancel,['wait-for-cancel first','independent run'])
     await request('/runs/'+first.runId+'/commands',{kind:'cancel'})
     await wait('first run ended',async()=>{
       const status=(await request('/threads/'+firstThread.id)).run?.status
@@ -213,7 +229,7 @@ test('connector serializes writes to one workspace until the prior run ends',asy
       return status==='cancelled'?status:null
     })
     const calls=readFileSync(log,'utf8').trim().split('\n').map(line=>JSON.parse(line))
-    assert.deepEqual(calls.filter(call=>call[0]==='prompt').map(call=>call[2]),['wait-for-cancel first','wait-for-cancel second'])
+    assert.deepEqual(calls.filter(call=>call[0]==='prompt').map(call=>call[2]),['wait-for-cancel first','independent run','wait-for-cancel second'])
   }finally{
     if(child?.connected)child.disconnect()
     if(exit)await Promise.race([exit,delay(2000,undefined,{ref:false})])

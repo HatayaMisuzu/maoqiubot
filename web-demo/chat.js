@@ -254,6 +254,23 @@ export const chat = actions=>{
         allowedProjects:allProjects?null:[...selectedProjects]
       });await actions.load();actions.refresh();notice('Bot 设置已保存。');
     });
+    if(['codex','dsh'].includes(agent.adapterKey)){
+      const usage=el('div','muted','额度未知');usage.setAttribute('role','status');
+      const read=agent.online&&agent.capabilities?.usage?btn('查询原生额度',async()=>{
+        usage.textContent='正在查询…';
+        try{
+          const data=await api('/instances/'+url(agent.id)+'/usage');
+          usage.textContent=data.windows.length?'Codex App Server · '+at(data.fetchedAt):'额度未知';
+          for(const window of data.windows){
+            const duration=window.durationMinutes?window.durationMinutes+' 分钟窗口':'窗口长度未知';
+            const reset=window.resetsAt?'，重置 '+at(window.resetsAt*1000):'';
+            usage.append(el('div','',duration+' · 已用 '+window.usedPercent+'%'+reset));
+          }
+        }catch(error){usage.textContent='额度未知';throw error}
+      },'secondary'):null;
+      ui.form.children[0].after(el('div','record',el('p','muted',(agent.online?'节点在线':'节点离线')+
+        (agent.lastSeen?' · 最近节点心跳 '+at(agent.lastSeen):'')),usage,read));
+    }
     const all=el('input');all.type='checkbox';all.checked=allProjects;
     const choices=el('div','project-access');
     choices.append(el('label','check-field',all,el('span','','所有项目（遵循已有项目授权）')));
@@ -446,7 +463,7 @@ export const chat = actions=>{
     if(t&&selectedMessages.size)toolButtons.push(btn('分享已选 · '+selectedMessages.size,()=>shareThread(t,[...selectedMessages]),'secondary','arrow'));
     if(t)toolButtons.push(btn('会话',()=>threadMenu(t),'secondary','edit'));
     $('tools').replaceChildren(...toolButtons);
-    if(!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup&&snap.run.status!=='uncertain')){
+    if(!t?.sessionId&&!snap?.messages?.length&&!snap?.task&&(!snap?.run||snap.run.modelSetup&&snap.run.status!=='uncertain')){
       const greeting=main()?banner('今天想一起','做什么？'):banner('和'+(agent?.name||'工作 Bot')+'聊聊');
       content.replaceChildren(el('div','chat-start',greeting,
         agent?.capabilities?.error?el('p','form-err',agent.capabilities.error):null));return;
@@ -456,22 +473,39 @@ export const chat = actions=>{
     if(t?.sessionId)stream.append(el('details','muted',el('summary','','原生会话'),el('code','',t.sessionId),
       el('p','muted',agent?.capabilities?.sessionList?'后续消息会在该原生会话继续。历史可在原客户端查看。':
         '可接续工作台已绑定的会话。该实例未提供可核验的外部会话目录。')));
-    if(t?.sessionId&&agent?.capabilities?.nativeHistory){
-      const cached=nativeHistory.get(t.id),details=el('details','native-history',el('summary','',
+    const historyKey=t?.sessionId&&!t.nativeInvalid?t.id+':'+t.sessionId:null;
+    const cached=historyKey?nativeHistory.get(historyKey):null;
+    if(historyKey&&(cached||agent?.capabilities?.nativeHistory)){
+      const details=el('details','native-history',el('summary','',
         '原生端可见历史'+(cached?' · '+cached.items.length:'')));
+      details.open=!isNew&&Boolean(content.querySelector('.native-history')?.open);
+      if(cached)details.append(el('p','muted',(agent?.online?'原生端读取':'离线缓存')+' · '+at(cached.fetchedAt)));
       if(cached?.items?.length)for(const item of cached.items)
         details.append(el('article','native-message '+(item.role==='user'?'user':''),el('small','muted',item.role==='user'?'原生用户':'原生 Agent'),el('p','text',item.text)));
-      const loadHistory=before=>{
-        if(nativeHistoryLoading.has(t.id))return;
-        nativeHistoryLoading.add(t.id);
+      const loadHistory=async before=>{
+        if(nativeHistoryLoading.has(historyKey))return;
+        nativeHistoryLoading.add(historyKey);
         const query=new URLSearchParams();if(before)query.set('before',before);
-        api('/threads/'+url(t.id)+'/native'+(query.size?'?'+query:'' )).then(page=>{
-          const previous=nativeHistory.get(t.id),items=[...(previous?.items||[]),...page.items];
-          nativeHistory.set(t.id,{items,nextBefore:page.nextBefore});
-        }).catch(error=>notice(error.message)).finally(()=>{nativeHistoryLoading.delete(t.id);drawContent()});
+        try{
+          const page=await api('/threads/'+url(t.id)+'/native'+(query.size?'?'+query:''));
+          const seen=new Set(),items=[...page.items,...(before?cached.items:[])].filter(item=>{
+            const key=JSON.stringify([item.turnId,item.id]);
+            if(seen.has(key))return false;
+            seen.add(key);return true;
+          });
+          const cursors=new Set(before?cached.cursors:[]);
+          if(before)cursors.add(before);
+          nativeHistory.set(historyKey,{items,nextBefore:cursors.has(page.nextBefore)?null:page.nextBefore,cursors,
+            fetchedAt:page.fetchedAt||new Date().toISOString()});
+        }finally{
+          nativeHistoryLoading.delete(historyKey);
+          if(state.view==='chat'&&state.thread===t.id)drawContent();
+        }
       };
-      if(!cached)details.append(btn('读取原生端历史',()=>loadHistory(),'secondary'));
-      else if(cached.nextBefore)details.append(btn('加载更早原生消息',()=>loadHistory(cached.nextBefore),'secondary'));
+      if(agent?.online&&agent.capabilities?.nativeHistory){
+        details.append(btn(cached?'刷新原生历史':'读取原生端历史',()=>loadHistory(),'secondary'));
+        if(cached?.nextBefore)details.append(btn('加载更早原生消息',()=>loadHistory(cached.nextBefore),'secondary'));
+      }
       stream.append(details);
     }
     if(box)stream.append(box);

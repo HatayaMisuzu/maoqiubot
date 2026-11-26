@@ -1,4 +1,4 @@
-import {$,api,banner,btn,el,form,headers,icon,iconBtn,items,notice,state,url} from './lib.js';
+import {$,api,at,banner,btn,el,form,headers,icon,iconBtn,items,notice,state,url} from './lib.js';
 import {chat} from './chat.js';
 import {home} from './home.js';
 import {desktopSettings,hasDesktopSettings} from './desktop-settings.js';
@@ -78,6 +78,8 @@ function side(){
       for(const thread of deleted)list.append(row('最近删除 · '+(thread.title||'会话'),()=>manageDeleted(thread),'','file'));
     }
     if(threadHasMore.get(i.id))list.append(btn('加载更早会话',()=>loadMoreThreads(i.id),'ghost'));
+    list.append(btn('搜索会话',()=>findThreads(i),'ghost'));
+    if(i.capabilities?.sessionList)list.append(btn('查看原生目录',()=>nativeCatalog(i),'ghost'));
   }
 }
 async function load(){
@@ -95,6 +97,89 @@ async function load(){
     state.threads.push(...active);state.archivedThreads.push(...archived);state.deletedThreads.push(...deleted);
     threadOffsets.set(agent.id,active.length);threadHasMore.set(agent.id,active.length===40);
   });
+}
+function findThreads(agent){
+  const dialog=$('dialog');
+  const currentProject=state.snapshot?.thread?.projectId||state.project;
+  const search=el('input');search.type='search';search.maxLength=120;
+  const space=el('select'),status=el('select');
+  for(const [id,name] of [['all','所有范围'],['','个人范围'],...state.projects.map(p=>[p.id,p.name])]){
+    const option=el('option','',name);option.value=id;space.append(option);
+  }
+  if(state.projects.some(p=>p.id===currentProject))space.value=currentProject;
+  for(const [id,name] of [['active','进行中及近期会话'],['archived','已归档']]){
+    const option=el('option','',name);option.value=id;status.append(option);
+  }
+  const results=el('div');results.setAttribute('aria-live','polite');
+  const more=btn('加载更早会话',()=>loadPage(false),'secondary');more.hidden=true;
+  const controls=el('form','',el('label','field','会话名称',search),el('label','field','项目范围',space),el('label','field','状态',status));
+  const submit=el('button','primary','搜索');submit.type='submit';controls.append(submit);
+  controls.onsubmit=event=>{event.preventDefault();loadPage(true).catch(error=>notice(error.message))};
+  let query,offset=0,revision=0,seen=new Set();
+  async function loadPage(reset){
+    const serial=++revision;
+    if(reset){
+      offset=0;seen=new Set();
+      query=new URLSearchParams({instanceId:agent.id,state:status.value,q:search.value,limit:'25'});
+      if(space.value!=='all')query.set('projectId',space.value);
+      results.replaceChildren(el('p','muted','正在搜索…'));
+      more.hidden=true;
+    }
+    query.set('offset',String(offset));
+    const page=items(await api('/threads?'+query));
+    if(serial!==revision||!dialog.open||!dialog.contains(results))return;
+    if(reset)results.replaceChildren();
+    for(const thread of page){
+      if(seen.has(thread.id))continue;
+      seen.add(thread.id);
+      const project=state.projects.find(p=>p.id===thread.projectId)?.name||'个人范围';
+      const row=btn(thread.title||'会话',()=>{dialog.close();return openThread(thread.id)},'settings-row','chat');
+      results.append(el('div','record',row,el('small','muted',[project,at(thread.lastActivity)].filter(Boolean).join(' · '))));
+    }
+    if(!seen.size)results.append(el('p','muted','没有符合条件的会话。'));
+    offset+=page.length;more.hidden=page.length!==25;
+  }
+  dialog.replaceChildren(el('h2','','搜索 '+agent.name+' 的会话'),controls,results,
+    el('div','dialog-foot',more,btn('关闭',()=>dialog.close(),'ghost')));
+  dialog.showModal();search.focus();return loadPage(true);
+}
+async function nativeCatalog(agent){
+  const dialog=$('dialog'),results=el('div'),status=el('p','muted','正在读取原生目录…');
+  const projectId=state.snapshot?.thread?.projectId||state.project||null;
+  const path='/instances/'+url(agent.id)+'/sessions';
+  const project=state.projects.find(p=>p.id===projectId)?.name||'个人范围';
+  const seen=new Set(),cursors=new Set();
+  let cursor=null;
+  const more=btn('加载更早原生会话',()=>loadPage(),'secondary');more.hidden=true;
+  async function loadPage(){
+    const query=new URLSearchParams();
+    if(projectId)query.set('projectId',projectId);
+    if(cursor)query.set('cursor',cursor);
+    try{
+      const page=await api(path+(query.size?'?'+query:''));
+      if(!dialog.open||!dialog.contains(results))return;
+      for(const session of page.items){
+        if(seen.has(session.id))continue;
+        seen.add(session.id);
+        results.append(el('div','record',el('strong','',session.title||'原生会话'),
+          el('p','muted',[session.active?'原生端运行中':null,session.updatedAt&&at(session.updatedAt*1000)].filter(Boolean).join(' · ')),
+          agent.capabilities.sessionImport!==false&&!session.active?btn('导入',async()=>{
+            const result=await api(path,{projectId,sessionId:session.id,title:(session.title||'导入的原生会话').slice(0,120)});
+            if(!dialog.contains(results))return;
+            dialog.close();await load();await openThread(result.thread.id);
+            if(result.status!=='bound')notice('导入已提交，等待原生回执。');
+          },'secondary'):null));
+      }
+      cursor=page.nextCursor&&!cursors.has(page.nextCursor)?page.nextCursor:null;
+      if(cursor)cursors.add(cursor);
+      more.hidden=!cursor;
+      status.textContent=seen.size?(agent.capabilities.sessionImport===false?'当前原生端未声明导入能力。':''):
+        (cursor?'此页在当前范围内没有可显示的会话，可继续加载。':'当前范围暂无可显示的原生会话。');
+    }catch(error){status.textContent=error.message;throw error}
+  }
+  dialog.replaceChildren(el('h2','','原生会话目录'),el('p','muted',agent.name+' · '+project+' · '+agent.profileId),status,results,
+    el('div','dialog-foot',more,btn('关闭',()=>dialog.close(),'ghost')));
+  dialog.showModal();await loadPage();
 }
 async function restoreThread(thread){
   await api('/threads/'+url(thread.id)+'/lifecycle',{action:'restore'});await load();side();notice('会话已恢复。');

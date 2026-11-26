@@ -1,10 +1,10 @@
 import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { packager } from '@electron/packager'
 
 const root = realpathSync(fileURLToPath(new URL('../', import.meta.url)))
-const out = join(root, 'dist')
+const out = process.env.MAOQIU_PACKAGE_OUT ? resolve(process.env.MAOQIU_PACKAGE_OUT) : join(root, 'dist')
 const name = 'Xiaomaoqiu'
 const target = join(out, name + '-win32-x64')
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
@@ -16,6 +16,7 @@ const runtimePackages = Object.entries(lockfile.packages)
 const runtimeDirectories = new Set(['desktop', 'server', 'connector', 'contracts', 'web-demo', 'plugins'])
 const runtimeFiles = new Set([
   'package.json',
+  'THIRD_PARTY_NOTICES.md',
   'connector/config.example.json',
   'server/chat/decision.json',
   'scripts/project-api.ts',
@@ -39,7 +40,7 @@ function exclude(path) {
 
 mkdirSync(out, { recursive: true })
 if (realpathSync(out) !== out || lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) {
-  throw Error('桌面构建目录必须位于当前工作区')
+  throw Error('桌面构建目录及包目标须为实际目录，不能通过符号链接覆盖其他文件')
 }
 
 const [release] = await packager({

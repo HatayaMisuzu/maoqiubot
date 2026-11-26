@@ -80,7 +80,7 @@ export class Dsh extends Native implements Adapter {
     this.sessionList=!!caps.sessionCapabilities?.list
     this.nativeActions=(['fork','delete'] as const).filter(action=>!!caps.sessionCapabilities?.[action])
     return {availableActions:['run','prepare','cancel','answer'],sessionList:this.sessionList,nativeActions:this.nativeActions,
-      resume:this.resume||this.load,history:false,version:hello.agentInfo?.version}
+      sessionImport:this.sessionList&&(this.resume||this.load),resume:this.resume||this.load,history:false,version:hello.agentInfo?.version}
   }
   async listSessions(cursor?:string):Promise<{items:NativeSession[];nextCursor:string|null}>{
     if(!this.sessionList)throw Error('ACP 未声明会话目录能力')

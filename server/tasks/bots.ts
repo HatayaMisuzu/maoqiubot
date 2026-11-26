@@ -52,7 +52,7 @@ export function botSettings(db:DatabaseSync,instanceId:string){
 }
 
 export function listBots(db:DatabaseSync){
-  return db.prepare('SELECT id,name,adapterKey,workspaceRef,profileId,nodeId,online,availableActions,capabilities FROM instances ORDER BY name,id')
+  return db.prepare('SELECT id,name,adapterKey,workspaceRef,profileId,nodeId,online,lastSeen,availableActions,capabilities FROM instances ORDER BY name,id')
     .all().map((row:any)=>({
       ...row,
       online:Boolean(row.online),

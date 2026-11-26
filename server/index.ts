@@ -45,7 +45,8 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
   const chat=mainWorker(db,dataDir,opts.chatProvider,(threadId,messageId,text)=>{
     const data=JSON.stringify({kind:'chat_delta',threadId,messageId,text})
     for(const res of streams.keys())if(!res.writableNeedDrain&&!res.writableEnded)res.write('data: '+data+'\n\n')
-  },plugins,{desktop:opts.desktop,listSessions:(inst,cursor)=>nodes.listSessions(inst,cursor),
+  },plugins,{desktop:opts.desktop,listSessions:(inst,cursor,projectId)=>nodes.listSessions(inst,cursor,projectId),
+    readUsage:instanceId=>nodes.readUsage(instanceId),
     readNativeHistory:(thread,before)=>nodes.readHistory(thread,before)})
   const server=createServer(async(req,res)=>{
     res.setHeader('X-Content-Type-Options','nosniff')
@@ -108,7 +109,12 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         return json(res,200,result)
       }
       const sessionCatalog=path.match(/^\/instances\/([\w-]{1,128})\/sessions$/)
+      const nativeUsage=path.match(/^\/instances\/([\w-]{1,128})\/usage$/)
       const nativeHistory=path.match(/^\/threads\/([\w-]{1,128})\/native$/)
+      if(method==='GET'&&nativeUsage){
+        if(!principal.owner||!isLocal(req))fail('原生额度限本机所有者读取',403)
+        return json(res,200,await nodes.readUsage(nativeUsage[1]))
+      }
       if(method==='GET'&&nativeHistory){
         if(!principal.owner||!isLocal(req))fail('原生消息限本机所有者读取',403)
         const thread=one(db,"SELECT * FROM threads WHERE id=? AND state IN ('active','archived')",nativeHistory[1])
@@ -119,8 +125,9 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         if(!principal.owner||!isLocal(req))fail('原生会话目录限本机所有者',403)
         const cursor=url.searchParams.get('cursor')
         if(cursor&&cursor.length>2000)fail('原生会话游标无效')
-        const inst=nativeSessionCatalogTarget(db,sessionCatalog[1],url.searchParams.get('projectId')||null)
-        return json(res,200,await nodes.listSessions(inst,cursor))
+        const projectId=url.searchParams.get('projectId')||null
+        const inst=nativeSessionCatalogTarget(db,sessionCatalog[1],projectId)
+        return json(res,200,await nodes.listSessions(inst,cursor,projectId))
       }
       if(method==='POST'&&['/chat/models/test','/chat/models/discover','/chat/models/capability'].includes(path)){
         if(!principal.owner||!isLocal(req))fail('模型测试限本机所有者',403)
@@ -166,7 +173,7 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       }
     }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}
   })
-  const nodes=attachNodes(server,db,auth.node,dataDir)
+  const nodes=attachNodes(server,db,auth.node,dataDir,opts.desktop?.worktreeSource)
   function mustProject(projectId:unknown){
     if(typeof projectId!=='string'||!one(db,'SELECT 1 FROM projects WHERE id=?',projectId))fail('项目不存在',404)
   }

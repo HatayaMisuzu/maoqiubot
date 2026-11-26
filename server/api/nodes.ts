@@ -2,15 +2,16 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import type { DatabaseSync } from 'node:sqlite'
 import { transaction, changed, now, required, one, must, fail } from '../db/index.ts'
-import { applyEvent, addProjectContext, checkQueuedInput, markUncertain } from '../tasks/index.ts'
-import type { NativeSession, NativeHistory, NodeCommand } from '../../contracts/node.ts'
+import { applyEvent, addProjectContext, checkQueuedInput, markUncertain, nativeBindingInScope, nativeSessionBinding, nativeSessionCatalogTarget } from '../tasks/index.ts'
+import type { NativeSession, NativeHistory, NativeUsage, NodeCommand } from '../../contracts/node.ts'
 import { secret,hash } from './auth.ts'
 import { isLocal } from './local.ts'
 
-export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined,dataDir:string){
+export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined,dataDir:string,
+  worktreeSource?:(instance:{id:string;workspaceRef:string;adapterKey:string})=>string|undefined){
   const wss=new WebSocketServer({noServer:true,maxPayload:4*1024*1024})
-  const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,alive:boolean,instances:Set<string>}>()
-  const catalogs=new Map<string,{ws:WebSocket; respond:(frame:any)=>void}>()
+  const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,cancelBeforeStart:boolean,alive:boolean,instances:Set<string>}>()
+  const catalogs=new Map<string,{ws:WebSocket; type:string; respond:(frame:any)=>void}>()
   server.on('upgrade',(req,socket,head)=>{
     const nodeId=authenticate((req.headers.authorization??'').replace(/^Bearer /,''))
     if(!nodeId || nodeId==='@model-api' || req.url?.split('?')[0]!=='/api/v1/node'){socket.destroy();return}
@@ -42,6 +43,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                 if(!Array.isArray(i.availableActions)) fail('缺少实例能力')
                 const blocked=i.adapterKey==='codex'&&!isLocal(req)
                 const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,nativeHistory:i.nativeHistory===true,
+                  sessionImport:i.sessionList===true&&i.sessionImport!==false,usage:i.adapterKey==='codex'&&i.usage===true,
                   nativeActions:['fork','archive','unarchive','delete'].filter(action=>Array.isArray(i.nativeActions)&&i.nativeActions.includes(action)),
                   error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
                 db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
@@ -50,13 +52,17 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                   runtimeScopeId=COALESCE(excluded.runtimeScopeId,instances.runtimeScopeId)`)
                   .run(key,nodeId,required(i.name,'name'),required(i.adapterKey,'adapterKey'),required(i.workspaceRef,'workspaceRef'),
                     JSON.stringify(i.availableActions),now(),blocked||i.online===false?0:1,JSON.stringify(caps),profileId,runtimeScopeId)
+                const source=!old&&nodeId==='local'&&isLocal(req)?worktreeSource?.(i):undefined
+                if(source)db.prepare(`INSERT INTO bot_settings(instanceId,description,enabled,allowDirect,allowDelegate,allowedProjects,updatedAt)
+                  SELECT ?,description,enabled,allowDirect,allowDelegate,allowedProjects,? FROM bot_settings WHERE instanceId=?`)
+                  .run(key,now(),source)
               }
               changed(db,'presence',{nodeId,online:true})
             })
             registered=true
             const previous=online.get(nodeId)
             const ids=db.prepare('SELECT id FROM instances WHERE nodeId=? AND online=1').all(nodeId).map(r=>String(r.id))
-            online.set(nodeId,{ws,sent:new Set(),lookups:new Map(),missing:new Set(),receiptLookup:m.receiptLookup===true,alive:true,instances:new Set(ids)})
+            online.set(nodeId,{ws,sent:new Set(),lookups:new Map(),missing:new Set(),receiptLookup:m.receiptLookup===true,cancelBeforeStart:m.cancelBeforeStart===true,alive:true,instances:new Set(ids)})
             previous?.ws.terminate()
             flush()
             return
@@ -65,9 +71,9 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           if(m.type==='event'){
             transaction(db,()=>applyEvent(db,nodeId,m.event))
             ws.send(JSON.stringify({type:'ack',key:m.event.key}))
-          }else if(m.type==='sessions'||m.type==='history'){
+          }else if(m.type==='sessions'||m.type==='history'||m.type==='usage'){
             const request=catalogs.get(m.id)
-            if(request?.ws===ws)request.respond(m)
+            if(request?.ws===ws&&request.type===m.type)request.respond(m)
           }else if(m.type==='receipt_missing'){
             const link=online.get(nodeId)!
             if(link.lookups.delete(m.commandId))link.missing.add(m.commandId)
@@ -85,7 +91,8 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                 db.prepare("UPDATE tasks SET status='running' WHERE id=? AND status='waiting_input' AND EXISTS(SELECT 1 FROM runs WHERE id=? AND status='running')").run(c.taskId,c.runId)
               }
               if(m.status==='failed' && c.kind==='cancel'){
-                const prior=JSON.parse(c.payload).priorStatus==='uncertain'?'uncertain':'running'
+                const before=JSON.parse(c.payload).priorStatus
+                const prior=['queued','uncertain'].includes(before)?before:'running'
                 const run=db.prepare("UPDATE runs SET status=CASE WHEN pendingRequest IS NOT NULL THEN 'waiting_input' ELSE ? END WHERE id=? AND status='cancelling' RETURNING status").get(prior,c.runId)
                 if(run)db.prepare('UPDATE tasks SET status=? WHERE id=?').run(run.status,c.taskId)
               }
@@ -197,7 +204,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           const ready=c.adapterKey==='dsh'&&c.sessionId&&one(db,`SELECT 1 FROM messages
             WHERE threadId=? AND kind='activity' AND json_extract(data,'$.runId')=?
               AND json_extract(data,'$.controlReady')=1 LIMIT 1`,c.threadId,c.runId)
-          if(!ready)continue
+          if(!ready&&!(c.kind==='cancel'&&link.cancelBeforeStart&&JSON.parse(c.payload).priorStatus==='queued'))continue
         }
         try {
           const command=transaction(db,()=>freeze(c))
@@ -210,7 +217,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       }
     }
   }
-  function queryNative(inst:any,request:Record<string,unknown>){
+  function queryNative(inst:any,type:string,request:Record<string,unknown>){
     const link=online.get(inst.nodeId)
     if(!link?.instances.has(inst.id)||link.ws.readyState!==WebSocket.OPEN)fail('原生节点离线',409)
     const {ws}=link
@@ -222,18 +229,26 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       const disconnected=()=>error('读取原生会话时节点断开')
       const timeout=setTimeout(()=>error('读取原生会话超时'),6500)
       ws.once('close',disconnected)
-      catalogs.set(id,{ws,respond(frame){
+      catalogs.set(id,{ws,type,respond(frame){
         if(frame.error||!Array.isArray(frame.items)){error('原生实例无法返回当前工作区的会话');return}
         cleanup()
         resolve(frame)
       }})
-      ws.send(JSON.stringify({...request,id,instanceId:inst.id,workspaceRef:inst.workspaceRef,profileId:inst.profileId}),
+      ws.send(JSON.stringify({...request,id,instanceId:inst.id,workspaceRef:inst.workspaceRef,profileId:inst.profileId,runtimeScopeId:inst.runtimeScopeId}),
         failure=>{if(failure)error('原生节点未能接收会话查询')})
     })
   }
-  async function listSessions(inst:any,cursor:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>{
-    const frame=await queryNative(inst,{type:'list_sessions',cursor:cursor??undefined})
-    const items=frame.items.filter((item:any)=>typeof item?.id==='string'&&/^[\w-]{1,128}$/.test(item.id))
+  async function listSessions(inst:any,cursor:string|null,projectId:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>{
+    const frame=await queryNative(inst,'sessions',{type:'list_sessions',cursor:cursor??undefined})
+    const current=nativeSessionCatalogTarget(db,inst.id,projectId)
+    if(current.runtimeScopeId!==inst.runtimeScopeId)fail('原生会话的账号或 profile 已变化',409)
+    const seen=new Set<string>()
+    const items=frame.items.slice(0,200).filter((item:any)=>{
+      if(typeof item?.id!=='string'||!/^[\w-]{1,128}$/.test(item.id)||seen.has(item.id))return false
+      seen.add(item.id)
+      const binding=nativeSessionBinding(db,inst,item.id)
+      return !binding||nativeBindingInScope(binding,inst.id,projectId)
+    })
       .map((item:any)=>({id:item.id,title:String(item.title??'').slice(0,140),updatedAt:Number(item.updatedAt)||0,active:item.active===true}))
     return {items,nextCursor:typeof frame.nextCursor==='string'&&frame.nextCursor.length<=2000?frame.nextCursor:null}
   }
@@ -241,7 +256,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     const inst=must(db,'SELECT * FROM instances WHERE id=?',thread.instanceId)
     if(!thread.sessionId||!JSON.parse(inst.capabilities).nativeHistory)fail('此实例未提供绑定会话的只读历史',409)
     if(before&&before.length>2000)fail('原生历史游标无效')
-    const frame=await queryNative(inst,{type:'read_history',threadId:thread.id,sessionId:thread.sessionId,before})
+    const frame=await queryNative(inst,'history',{type:'read_history',threadId:thread.id,sessionId:thread.sessionId,before})
     const latest=must(db,'SELECT state,sessionId FROM threads WHERE id=?',thread.id)
     if(!['active','archived'].includes(latest.state)||latest.sessionId!==thread.sessionId)fail('会话可见范围已变化',409)
     const items=frame.items.filter((i:any)=>typeof i.id==='string'&&typeof i.turnId==='string'&&typeof i.text==='string'&&['user','assistant'].includes(i.role))
@@ -252,9 +267,21 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
         changed(db,'thread',{threadId:thread.id,source:'native'})
       })
     }
-    return {items,nextBefore:typeof frame.nextBefore==='string'&&frame.nextBefore.length<=2000?frame.nextBefore:null,archived:frame.archived}
+    return {items,nextBefore:typeof frame.nextBefore==='string'&&frame.nextBefore.length<=2000?frame.nextBefore:null,archived:frame.archived,source:'native' as const,fetchedAt:now()}
   }
-  return {flush,listSessions,readHistory,inspect(runId:string){
+  async function readUsage(instanceId:string):Promise<NativeUsage>{
+    const inst=must(db,'SELECT * FROM instances WHERE id=?',instanceId)
+    const unknown={source:null,fetchedAt:null,windows:[]}
+    if(!inst.online||!inst.runtimeScopeId||!JSON.parse(inst.capabilities).usage)return unknown
+    try{
+      const frame=await queryNative(inst,'usage',{type:'read_usage'})
+      const windows=frame.items.slice(0,2).filter((w:any)=>Number.isFinite(w?.usedPercent)&&w.usedPercent>=0&&w.usedPercent<=100)
+        .map((w:any)=>({usedPercent:w.usedPercent,durationMinutes:Number.isSafeInteger(w.durationMinutes)&&w.durationMinutes>0?w.durationMinutes:null,
+          resetsAt:Number.isSafeInteger(w.resetsAt)&&w.resetsAt>0?w.resetsAt:null}))
+      return {source:'codex_app_server',fetchedAt:now(),windows}
+    }catch{return unknown}
+  }
+  return {flush,listSessions,readHistory,readUsage,inspect(runId:string){
     for(const command of db.prepare(`SELECT c.id,i.nodeId FROM commands c JOIN instances i ON i.id=c.instanceId
       WHERE c.runId=? AND c.status IN ('sent','received','uncertain')`).all(runId)){
       const link=online.get(String(command.nodeId)),id=String(command.id)

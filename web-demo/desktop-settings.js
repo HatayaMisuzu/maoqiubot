@@ -36,9 +36,11 @@ export async function desktopSettings(){
       const status=registered?.online?'在线 · 已握手':registered?.capabilities?.error||'离线 · 等待登记';
       return el('div','record',el('strong','',instance.name),el('p','muted',status),
         el('small','muted',[instance.id,instance.profileId,instance.workspaceRef].join(' · ')),
+        instance.worktree?el('p','muted',instance.worktree.branch+' · 基准 '+instance.worktree.baseCommit.slice(0,12)):null,
         el('p','muted',instance.detectedCommand||'未检测到已配置的官方可执行文件，可手填绝对路径。'),
         settings.editable?el('div','actions',btn('编辑配置',()=>instanceForm(settings,instance),'ghost'),
-          btn('复制为新实例',()=>instanceForm(settings,instance,true),'ghost')):null);
+          btn('复制为新实例',()=>instanceForm(settings,instance,true),'ghost'),
+          desktop().createWorktree?btn('新建 Git 工作树',()=>worktreeForm(instance),'ghost'):null):null);
     }));
   }
   showInstances(instances);
@@ -47,6 +49,16 @@ export async function desktopSettings(){
     el('div','dialog-foot',settings.editable?btn('新增实例',()=>instanceForm(settings),'ghost'):null,
       operation,btn('关闭',()=>dialog.close(),'ghost')));
   dialog.showModal();
+}
+
+function worktreeForm(instance){
+  const ui=form('新建 Git 工作树',[{key:'instanceId',label:'新实例 ID',required:true}], '选择目标父目录',async({instanceId})=>{
+    const result=await desktop().createWorktree({sourceId:instance.id,instanceId});
+    if(!result)return;
+    await desktopSettings();
+    notice('已创建 '+result.branch+'。'+(result.dirty?'源目录的未提交修改仍留在原处。':'')+'测试连接后，可在项目中绑定新实例。');
+  });
+  ui.form.children[0].after(el('p','muted',instance.workspaceRef+' · 从当前提交创建新分支和独立执行实例。'));
 }
 
 function instanceForm(settings,instance,copy=false){

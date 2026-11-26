@@ -12,7 +12,9 @@ const dshExecutable=process.env.MAOQIU_DSH_EXECUTABLE
 if(instance.adapterKey==='dsh'&&!isAbsolute(instance.command)&&dshExecutable&&isAbsolute(dshExecutable)&&
   /^dsh(?:\.cmd|\.exe)?$/i.test(basename(dshExecutable)))instance.command=dshExecutable
 instance.workspaceRef=resolve(instance.workspaceRef)
-const adapter=new registry[instance.adapterKey](instance)
+const registration=registry.get(instance.adapterKey)
+if(!registration)throw Error('未注册原生连接器：'+instance.adapterKey)
+const adapter=new registration.create(instance)
 const timer=setTimeout(()=>adapter.close(),120000)
 try {
   console.log(JSON.stringify(await adapter.probe()))

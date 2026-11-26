@@ -2,7 +2,7 @@ import {relative,resolve} from 'node:path'
 import {createHash} from 'node:crypto'
 import {Native} from './base.ts'
 import type {Input,Run,Adapter} from '../types.ts'
-import type {ModelOption,ModelState,NativeAction,NativeHistory} from '../../contracts/node.ts'
+import type {ModelOption,ModelState,NativeAction,NativeHistory,UsageWindow} from '../../contracts/node.ts'
 
 function inputs(input:Input) {
   return [{type:'text',text:input.text,text_elements:[]},...input.files.map(f=>f.mime.startsWith('image/')
@@ -23,10 +23,21 @@ export class Codex extends Native implements Adapter {
     if(account?.type!=='chatgpt')throw Error('请在本机使用官方 Codex 登录 ChatGPT')
     return createHash('sha256').update(String(account.email??'local-chatgpt')).digest('hex')
   }
+  async readUsage():Promise<UsageWindow[]>{
+    const result=await this.rpc.request('account/rateLimits/read',{},5000)
+    const limits=result?.rateLimitsByLimitId?.codex??result?.rateLimits
+    return [limits?.primary,limits?.secondary].flatMap(window=>
+      Number.isFinite(window?.usedPercent)&&window.usedPercent>=0&&window.usedPercent<=100?[{
+        usedPercent:window.usedPercent,
+        durationMinutes:Number.isSafeInteger(window.windowDurationMins)&&window.windowDurationMins>0?window.windowDurationMins:null,
+        resetsAt:Number.isSafeInteger(window.resetsAt)&&window.resetsAt>0?window.resetsAt:null
+      }]:[])
+  }
   endings=new Map<string,{finish:()=>void,fail:(err:Error)=>void}>()
+  private starts=new Map<Run,Promise<unknown>>()
   async probe() {
     const hello=await this.rpc.request('initialize',{clientInfo:{name:'xiaomaoqiu',title:'小毛球工作台',version:'1.0.0'},capabilities:{}})
-    this.rpc.send({method:'initialized',params:{}})
+    await this.rpc.write({method:'initialized'})
     await this.identity()
     try{
       const result=await this.rpc.request('model/list',{limit:100,includeHidden:false},5000)
@@ -45,7 +56,7 @@ export class Codex extends Native implements Adapter {
     let sessionList=false
     if(history)try{await this.catalog({limit:1});sessionList=true}catch{}
     return {availableActions:['run','prepare','answer',...(steer?['steer']:[]),...(cancel?['cancel']:[])],
-      version:hello.userAgent,resume:true,history,sessionList,nativeHistory,nativeActions,models:this.models}
+      version:hello.userAgent,resume:true,history,sessionList,sessionImport:sessionList,nativeHistory,nativeActions,models:this.models}
   }
   private async catalog(options:object){
     const result=await this.rpc.request('thread/list',{...options,cwd:this.instance.workspaceRef,currentAccountOnly:true,useStateDbOnly:true},5000)
@@ -136,7 +147,9 @@ export class Codex extends Native implements Adapter {
     this.endings.set(run.sessionId,{finish:end.resolve,fail:end.reject})
     this.rpc.once('closed',end.reject)
     try {
-      const {turn}=await this.rpc.request('turn/start',{threadId:run.sessionId,input:inputs(input),...(model?{model}:{})})
+      const start=this.rpc.request('turn/start',{threadId:run.sessionId,input:inputs(input),...(model?{model}:{})})
+      this.starts.set(run,start)
+      const {turn}=await start
       if(run.nativeRunId && run.nativeRunId!==turn.id) throw new Error('原生回执运行 ID 不一致')
       if(!run.nativeRunId) {run.nativeRunId=turn.id;run.emit('accepted',{sessionId:run.sessionId,nativeRunId:turn.id})}
       if(model){
@@ -145,6 +158,7 @@ export class Codex extends Native implements Adapter {
       }
       await end.promise
     } finally {
+      this.starts.delete(run)
       this.rpc.off('closed',end.reject)
       this.endings.delete(run.sessionId)
       this.finish(run)
@@ -188,7 +202,9 @@ export class Codex extends Native implements Adapter {
     await this.rpc.request('turn/steer',{threadId:run.sessionId,expectedTurnId:run.nativeRunId,input:inputs(input)})
   }
   async cancel(run:Run) {
+    if(!run.nativeRunId)await this.starts.get(run)
     if(!run.nativeRunId) throw new Error('尚未收到原生运行回执')
+    if(this.active.get(run.sessionId)!==run)throw new Error('原生运行已经结束')
     await this.rpc.request('turn/interrupt',{threadId:run.sessionId,turnId:run.nativeRunId})
   }
   async inspect(run:Run) {

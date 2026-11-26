@@ -358,6 +358,7 @@ export function nativeSessionTarget(db:DatabaseSync,instanceId:string,projectId:
 }
 export function nativeSessionCatalogTarget(db:DatabaseSync,instanceId:string,projectId:string|null){
   const inst=instance(db,instanceId)
+  assertBotProjectAllowed(db,instanceId,projectId)
   return checkNativeCatalogTarget(db,inst,projectId)
 }
 function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null){
@@ -366,31 +367,44 @@ function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null
   if(!inst.online)fail('原生实例离线',409)
   return inst
 }
-export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any){
-  const projectId=b.projectId==null?null:required(b.projectId,'projectId')
-  const native=required(b.sessionId,'sessionId')
-  if(!/^[\w-]{1,128}$/.test(native))fail('原生会话 ID 格式无效')
-  const inst=nativeSessionTarget(db,key,projectId)
+export function nativeSessionBinding(db:DatabaseSync,inst:any,native:string){
   const existing=one(db,`SELECT t.* FROM threads t JOIN instances i ON i.id=t.instanceId
     WHERE t.sessionId=? AND i.workspaceRef=? AND i.adapterKey=? AND
       ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
        (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
     native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId)
-  if(existing)return {thread:existing,status:'bound'}
+  if(existing)return {thread:existing,status:'bound' as const}
   const pending=one(db,`SELECT c.threadId,c.runId FROM commands c JOIN runs r ON r.id=c.runId JOIN instances i ON i.id=c.instanceId
     WHERE i.workspaceRef=? AND i.adapterKey=? AND c.kind='prepare' AND json_extract(c.payload,'$.importSessionId')=?
       AND r.status IN ('queued','running','uncertain') AND
       ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
        (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
     inst.workspaceRef,inst.adapterKey,native,inst.runtimeScopeId,inst.nodeId,inst.profileId)
-  if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending'}
+  if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending' as const}
+}
+
+export function nativeBindingInScope(binding:{thread:any},instanceId:string,projectId:string|null){
+  return binding.thread.instanceId===instanceId&&binding.thread.projectId===projectId&&['active','archived'].includes(binding.thread.state)
+}
+
+export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any){
+  const projectId=b.projectId==null?null:required(b.projectId,'projectId')
+  const native=required(b.sessionId,'sessionId')
+  if(!/^[\w-]{1,128}$/.test(native))fail('原生会话 ID 格式无效')
+  const inst=nativeSessionTarget(db,key,projectId)
+  if(JSON.parse(inst.capabilities).sessionImport===false)fail('此实例可列出原生会话，但未声明导入所需的续接能力',409)
+  const binding=nativeSessionBinding(db,inst,native)
+  if(binding){
+    if(!nativeBindingInScope(binding,key,projectId))fail('原生会话已绑定，请从原工作话题管理',409)
+    return binding
+  }
   const previous=one(db,`SELECT t.* FROM threads t JOIN commands c ON t.id=c.threadId
     WHERE t.instanceId=? AND t.projectId IS ? AND t.sessionId IS NULL AND c.kind='prepare'
     AND json_extract(c.payload,'$.importSessionId')=? AND t.taskId IS NULL
     AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.threadId=t.id AND m.role='user')
     ORDER BY c.rowid DESC LIMIT 1`,key,projectId,native)
   const thread=previous&&terminal.has(latestRun(db,previous.id)?.status)?previous:
-    createThread(db,dir,{title:required(b.title??'导入的 Codex 话题','title').slice(0,120),instanceId:key,projectId,source:'imported'})
+    createThread(db,dir,{title:required(b.title??(inst.adapterKey==='codex'?'导入的 Codex 话题':'导入的 DSH 话题'),'title').slice(0,120),instanceId:key,projectId,source:'imported'})
   const run=startRun(db,thread)
   enqueue(db,run,'prepare',{importSessionId:native})
   return {thread,runId:run.id,status:'queued'}

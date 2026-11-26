@@ -28,17 +28,21 @@ export class Rpc extends EventEmitter {
     this.process.stderr.resume()
     this.process.stdin.on('error', e => this.stop(e))
     this.process.once('error', e => this.stop(e))
-    this.process.once('exit', (code,signal) => this.stop(new Error('原生进程已退出 '+(code ?? signal))))
+    // `exit` can arrive before the last terminal JSON-RPC response has drained.
+    this.process.once('close', (code,signal) => this.stop(new Error('原生进程已退出 '+(code ?? signal))))
     const lines = createInterface({input:this.process.stdout})
     lines.on('line', line => {
       let msg
       try { msg = JSON.parse(line) } catch { return }
-      if (msg.method) this.emit('incoming',msg)
+      if(!msg||typeof msg!=='object'||Array.isArray(msg))return
+      if (typeof msg.method==='string') this.emit('incoming',msg)
       else if (this.pending.has(msg.id)) {
         const waiter = this.pending.get(msg.id)!
         this.pending.delete(msg.id)
-        if (msg.error) waiter.fail(Object.assign(new Error(String(msg.error.message ?? 'RPC error')),{code:msg.error.code}))
-        else waiter.ok(msg.result)
+        if ('error' in msg && !('result' in msg) && Number.isInteger(msg.error?.code) && typeof msg.error?.message==='string')
+          waiter.fail(Object.assign(new Error(msg.error.message),{code:msg.error.code}))
+        else if ('result' in msg && !('error' in msg)) waiter.ok(msg.result)
+        else waiter.fail(new Error('原生响应格式无效，无法核对请求结果'))
       }
     })
   }

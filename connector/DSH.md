@@ -55,6 +55,8 @@ node connector/native-smoke.ts connector/config.example.json dsh-local --inspect
 
 ## 检查原生状态
 
+当 ACP 握手同时声明目录和 `resume` 或 `loadSession` 时，工作台开放原生导入。仅声明目录时仍可分页查看。DSH 没有只读历史和订阅额度接口时，界面保留工作台历史并显示额度未知。测试模型和续接时请使用独立 `DSH_HOME` 与临时工作目录。
+
 ```powershell
 node connector/native-smoke.ts connector/config.local.json dsh-go-local --inspect-models
 node connector/native-smoke.ts connector/config.local.json dsh-go-local --inspect-models --select-model-index=1 --new-session --inspect-models

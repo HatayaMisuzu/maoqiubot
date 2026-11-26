@@ -65,12 +65,17 @@ export class Store {
     return row?.session as string|undefined
   }
   bind(c:Command,workspace:string,session:string,runtime?:string) {
-    if(this.db.prepare(`SELECT 1 FROM bindings WHERE session=? AND workspace=? AND thread<>?
-      AND (instance=? OR (runtime IS NOT NULL AND runtime=?)) LIMIT 1`)
-      .get(session,workspace,c.threadId,c.instanceId,runtime??null))throw Error('原生会话已绑定到另一个话题')
-    this.db.prepare('INSERT OR IGNORE INTO bindings(thread,instance,workspace,session,runtime) VALUES(?,?,?,?,?)').run(c.threadId,c.instanceId,workspace,session,runtime??null)
-    if(this.binding(c,workspace,runtime)!==session) throw new Error('话题正在使用另一原生会话')
-    this.db.prepare('UPDATE bindings SET runtime=? WHERE thread=? AND runtime IS NULL').run(runtime??null,c.threadId)
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if(this.db.prepare(`SELECT 1 FROM bindings WHERE session=? AND workspace=? AND thread<>?
+        AND (instance=? OR (runtime IS NOT NULL AND runtime=?)) LIMIT 1`)
+        .get(session,workspace,c.threadId,c.instanceId,runtime??null))throw Error('原生会话已绑定到另一个话题')
+      this.db.prepare('INSERT OR IGNORE INTO bindings(thread,instance,workspace,session,runtime) VALUES(?,?,?,?,?)')
+        .run(c.threadId,c.instanceId,workspace,session,runtime??null)
+      if(this.binding(c,workspace,runtime)!==session) throw new Error('话题正在使用另一原生会话')
+      this.db.prepare('UPDATE bindings SET runtime=? WHERE thread=? AND runtime IS NULL').run(runtime??null,c.threadId)
+      this.db.exec('COMMIT')
+    } catch(e) {this.db.exec('ROLLBACK');throw e}
   }
   emit(c:Command,kind:string,data:any) {
     this.db.exec('BEGIN IMMEDIATE')

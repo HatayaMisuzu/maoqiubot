@@ -1,4 +1,4 @@
-import type {NodeCommand,ModelOption,ModelState,NativeSession,NativeAction,NativeHistory} from '../contracts/node.ts'
+import type {NodeCommand,ModelOption,ModelState,NativeSession,NativeAction,NativeHistory,UsageWindow} from '../contracts/node.ts'
 export interface Instance {
   id: string
   name: string
@@ -20,7 +20,7 @@ export interface Run {
   nativeRunId?: string
   emit: Emit
 }
-export type Capabilities = {availableActions: string[], version?: string, history: boolean, resume: boolean, sessionList?:boolean, nativeHistory?:boolean, nativeActions?:NativeAction[], models?:ModelOption[]}
+export type Capabilities = {availableActions: string[], version?: string, history: boolean, resume: boolean, sessionList?:boolean, sessionImport?:boolean, nativeHistory?:boolean, nativeActions?:NativeAction[], models?:ModelOption[]}
 export interface Adapter {
   onDisconnect(handler:(error:Error)=>void):void
   probe(): Promise<Capabilities>
@@ -30,6 +30,7 @@ export interface Adapter {
   listSessions?(cursor?:string):Promise<{items:NativeSession[],nextCursor:string|null}>
   importSession?(sessionId:string):Promise<string>
   readHistory?(sessionId:string,before?:string):Promise<NativeHistory>
+  readUsage?():Promise<UsageWindow[]>
   sessionAction?(action:NativeAction,sessionId:string):Promise<string>
   run(run: Run, input: Input): Promise<void>
   cancel(run: Run): Promise<void>

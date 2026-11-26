@@ -3,7 +3,7 @@ const { once } = require('node:events')
 const { existsSync, mkdirSync, readdirSync, readFileSync, statSync } = require('node:fs')
 const { delimiter, dirname, join, resolve } = require('node:path')
 const { pathToFileURL } = require('node:url')
-const { connectorSettings, settingsView, saveInstance } = require('./connector-settings.cjs')
+const { connectorSettings, settingsView, saveInstance, createWorktree, worktreeSource } = require('./connector-settings.cjs')
 
 app.setName('小毛球 Bot 工作台')
 app.setAppUserModelId('local.xiaomaoqiu.workbench')
@@ -119,6 +119,7 @@ function createWindow(root, login, restartConnector) {
 
 async function start() {
   const paths = appPaths()
+  const settings = () => connectorSettings(paths)
   mkdirSync(paths.workspace, { recursive: true })
   addInstalledCodexToPath()
   Menu.setApplicationMenu(null)
@@ -130,6 +131,7 @@ async function start() {
         instances:result.instances.map(({id,name,adapterKey,workspaceRef,profileId,detected})=>({id,name,adapterKey,workspaceRef,profileId,detected})) }
     },
     save: value => saveInstance(settings(), workbench.db, value),
+    worktreeSource: instance => worktreeSource(settings(), instance),
     restart: async () => { await restartConnector(); return {connectorRunning:!!connector} },
     openPath: path => shell.openPath(path),
     notify: body => { if(Notification.isSupported())new Notification({title:'小毛球提醒',body}).show() }
@@ -137,7 +139,6 @@ async function start() {
   await once(workbench.server, 'listening')
   const { port } = workbench.server.address()
   origin = 'http://127.0.0.1:' + port
-  const settings = () => connectorSettings(paths)
   function view() {
     const s = settings()
     try { return { ...settingsView(s), connectorRunning: !!connector, lastError: connectorExit } }
@@ -169,6 +170,11 @@ async function start() {
   handle('connector:settings', view)
   handle('connector:save', value => saveInstance(settings(), workbench.db, value))
   handle('connector:restart', restartConnector)
+  handle('connector:worktree', async value => {
+    const choice = await dialog.showOpenDialog(window, { title: '选择新 Git 工作树的父目录', properties: ['openDirectory'] })
+    if (choice.canceled) return null
+    return createWorktree(settings(), workbench.db, value?.sourceId, value?.instanceId, choice.filePaths[0])
+  })
   try {
     const config=settings()
     settingsView(config)

@@ -31,6 +31,14 @@ SQLite 主库升级为版本 7。在迁移事务内，从个人范围中选取�
 
 Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。原生目录支持不等于外部客户端已经释放写入占用。ACP 的 list 与 delete 由协议握手字段声明，fork 属于需要单独协商的扩展。[ACP 目录](https://agentclientprotocol.com/protocol/v1/session-list) · [ACP 删除语义](https://agentclientprotocol.com/protocol/v1/session-delete) · [ACP fork 草案](https://agentclientprotocol.com/rfds/session-fork)
 
+工作台联系人下可搜索会话和查看原生目录。原生目录按实例、工作区、账号/profile 读取，已绑定或待导入的会话只在原项目及实例显示。原生历史保留本次页面会话中已读取的分页内容和读取时间，掉线时显示为缓存。Codex 可按需从 App Server 查询额度窗口。窗口、使用百分比和重置时间使用服务端实际返回值。[Codex App Server](https://learn.chatgpt.com/docs/app-server)
+
+## 并行工作与独立工作区
+
+同一连接器内，指向同一个真实路径的运行和原生会话写操作依次进入队列。运行中可以停止，已经进队但尚未提交的提示也可以撤回。独立目录可以并行。SQLite 记录命令、绑定和回执，节点中断后已提交且无法核对的提示保留「送达待核对」。
+
+仅本机桌面托管配置可在「Agent 设置 → 新建 Git 工作树」使用。来源实例须配置在仓库根目录。选择原仓库以外的父目录并提供新实例 ID，将创建 `maoqiu/<实例 ID>`，记录新路径、基准提交以及来源实例。新实例沿用原生 profile 与来源 Bot 的启用、直聊、委派和项目范围设置。测试连接后在毛球之家绑定所需项目，项目资料授权由现有界面单独确认。新任务选择新实例，旧任务仍指向原有实例。普通目录可以继续直接作为工作区。清理前先检查工作树状态和未合并提交，再通过 Git 管理。[Git Worktree](https://git-scm.com/docs/git-worktree)
+
 ## HTTP / 节点协议
 
 下列路径使用 `/api/v1` 前缀，写请求可以提供稳定的顶层 `requestId`。来源与工作话题关联到任务，运行和命令保持各自的 ID。
@@ -38,10 +46,12 @@ Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。原�
 | 请求 | 用途 |
 | --- | --- |
 | GET /threads/main | 返回固定主聊行 |
-| GET /threads?instanceId=…&state=active&limit=40&offset=0 | 按 Bot、状态、最近活动分页；状态也可为 archived、deleted |
+| GET /threads?instanceId=…&state=active&limit=40&offset=0 | 按 Bot、状态、最近活动分页。可用 `q` 搜索标题，`projectId` 过滤项目（空值查个人会话） |
 | POST /threads | 无首条消息时沿用原有建话题接口。携带 `firstMessage` 时，在同一事务创建话题、保存消息并返回 `{thread,receipt}` |
 | GET /threads/:id/messages、GET /threads/:id/export | 分页工作台时间线与导出可见文本 |
-| GET /threads/:id/native?before=… | 已绑定原生文本历史；返回 items 和 nextBefore。没有能力或实例离线时返回错误 |
+| GET /threads/:id/native?before=… | 已绑定原生文本历史，返回 `items`、`nextBefore`、`source`、`fetchedAt`。实例无能力或离线时返回错误 |
+| GET 或 POST /instances/:id/sessions | 本机所有者按 `projectId` 查询及导入；目录支持 `cursor`，导入需要 `sessionImport` 能力 |
+| GET /instances/:id/usage | 本机所有者按需读取官方额度，未知时返回空窗口 |
 | POST /threads/:id/share | 可选 `messageIds`，指定 `targetThreadId` 或 `newThread`。预览用 `preview:true`，跨范围提交另带 `confirmCrossProject:true` |
 | GET /threads/:id/impact、POST /threads/:id/lifecycle | 查影响，执行 rename/archive/restore/delete/purge/reset/deleteMessage/fork；`purge` 需先软删并明确确认 |
 | POST /threads/:id/lifecycle，action=deleteNative | 仅能力支持时可用。需先软删、提供实际 sessionId 和 confirm=true，并核对所有关联运行 |
@@ -53,6 +63,12 @@ Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。原�
 | GET 或 POST /threads/:id/budget | 设置小毛球会话的 `toolBudget: {softLimit,hardLimit}`，用 null 恢复继承。发送消息时可在请求中带 `toolBudget` 覆盖单轮 |
 
 原生读历史使用 `read_history/history` 查询帧。分支和原生归档类变更复用有持久回执的 prepare 命令，携带来源话题、来源 session ID 和操作。连接器核对本地绑定后才调用原生方法。提交后中断且无法核对时进入 uncertain。
+
+## 原生适配器接入
+
+1. 在 `connector/adapters/index.ts` 注册构造器与运行目录配置，实现 `connector/types.ts` 中的 `Adapter` 契约。将启动、认证、方法名和工作目录校验保留在对应适配器及其传输层。
+2. `probe()` 只声明可证实的动作。目录、导入、只读历史、额度、`steer` 与 `inspect` 各自按需实现。缺失能力须在服务和界面关闭相应入口。`NodeHello` 能力字段可选，旧节点可继续用原有协议。
+3. 注册配置和能力后，使用隔离节点和专用账号验证创建、续接、持久绑定、审批、会话内串行、进程中断和重复命令，再开放桌面配置入口。原生回执只能由对应适配器解释。可参考 `test/connector-recovery.test.mjs` 和 `scripts/smoke-sessions.ts`。
 
 主聊工具次数由工作台记录。可在聊天的「会话」菜单中设置起始次数和硬限，两项均受工作台全局硬限约束。软预算会随任务进展增加；审批前的提议不计入已执行次数。连续失败、重复操作与送达待核对会停止自动执行。真实原生 Agent 内部调用次数与费用由该服务管理。
 

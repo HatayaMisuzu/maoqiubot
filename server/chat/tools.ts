@@ -12,7 +12,7 @@ import type { ToolEntry, RegisteredTool } from '../plugins/registry.ts'
 import { parseTool, toolEntry } from '../plugins/registry.ts'
 import { readText,relativePath } from '../plugins/files.ts'
 import type { PluginHost } from '../plugins/host.ts'
-import type { NativeHistory,NativeSession } from '../../contracts/node.ts'
+import type { NativeHistory,NativeSession,NativeUsage } from '../../contracts/node.ts'
 import { calculate,dailyAction } from './daily.ts'
 import { projectWorkspaces } from '../tasks/workspaces.ts'
 import { listBots, routingBots,tasksForThread } from '../tasks/bots.ts'
@@ -26,9 +26,11 @@ import type { HistorySource } from './budget.ts'
 
 export type DesktopBridge={
   status():unknown; restart():Promise<unknown>; save(settings:unknown):unknown;
+  worktreeSource?(instance:{id:string;workspaceRef:string;adapterKey:string}):string|undefined;
   openPath(path:string):Promise<string>; notify?(body:string):void;
 }
-export type ToolServices={desktop?:DesktopBridge;listSessions?(inst:any,cursor:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>;
+export type ToolServices={desktop?:DesktopBridge;listSessions?(inst:any,cursor:string|null,projectId:string|null):Promise<{items:NativeSession[];nextCursor:string|null}>;
+  readUsage?(instanceId:string):Promise<NativeUsage>;
   readNativeHistory?(thread:any,before?:string):Promise<NativeHistory>}
 
 type Policy={task:boolean;memory:boolean;homeContent:boolean;homeSpace:boolean;personalInProject:boolean;readRoots:string[];writeRoots:string[];
@@ -171,24 +173,32 @@ const tools=[
     const raw=must(c.db,'SELECT capabilities FROM instances WHERE id=?',a.instanceId)
     return {...bot,capabilities:JSON.parse(raw.capabilities||'{}')}
   }}),
+  define('bot_usage','按需查询当前范围内工作 Bot 的官方额度窗口及更新时间。不可用时返回未知。',{instanceId:'string'},['instanceId'],{
+    async:true,execute:async(c,a)=>{
+      botAllowed(c,a.instanceId)
+      const usage=await c.readUsage?.(a.instanceId)
+      botAllowed(c,a.instanceId)
+      return usage??{source:null,fetchedAt:null,windows:[]}
+    }}),
   define('bot_sessions','按最近活动列出本范围的工作话题，可按名称片段查找或分页',{instanceId:'string',query:'string',offset:'integer'},['instanceId'],{execute:(c,a)=>{
     if(!c.allowedInstances.some(i=>i.id===a.instanceId))fail('实例不在当前授权范围',403)
-    return c.db.prepare(`SELECT id AS threadId,title,sessionId,taskId,createdAt,lastActivity,source,state FROM threads
-      WHERE instanceId=? AND projectId IS ? AND state IN ('active','archived') AND instr(lower(title),lower(?))>0
+    return c.db.prepare(`SELECT id AS threadId,title,sessionId,taskId,createdAt,lastActivity,source,state,
+      (SELECT status FROM runs r WHERE r.threadId=t.id ORDER BY r.rowid DESC LIMIT 1) AS latestRunStatus
+      FROM threads t WHERE instanceId=? AND projectId IS ? AND state IN ('active','archived') AND instr(lower(COALESCE(title,'')),lower(?))>0
+      AND NOT EXISTS(SELECT 1 FROM task_drafts d WHERE d.threadId=t.id)
       ORDER BY lastActivity DESC,id LIMIT 25 OFFSET ?`).all(a.instanceId,c.thread.projectId,String(a.query??''),Math.max(0,a.offset??0))
   }}),
   define('bot_native_catalog','读取当前工作区连接器实际提供的原生会话目录',{instanceId:'string',cursor:'string'},['instanceId'],{
     async:true,execute:(c,a)=>{
       botAllowed(c,a.instanceId)
       if(!c.listSessions)fail('原生连接器不可用',409)
-      return c.listSessions(nativeSessionCatalogTarget(c.db,a.instanceId,c.thread.projectId),a.cursor??null)
+      if(a.cursor?.length>2000)fail('原生会话游标无效')
+      return c.listSessions(nativeSessionCatalogTarget(c.db,a.instanceId,c.thread.projectId),a.cursor??null,c.thread.projectId)
     }}),
   define('bot_native_import','导入核对过的原生会话以便后续续接',{instanceId:'string',sessionId:'string',title:'string'},['instanceId','sessionId'],{
     group:'task',confirm:true,execute:(c,a)=>{
       botAllowed(c,a.instanceId)
-      const result=importNativeSession(c.db,c.dir,a.instanceId,{...a,projectId:c.thread.projectId})
-      if(result.thread.projectId!==c.thread.projectId)fail('原生会话已绑定其他范围',403)
-      return result
+      return importNativeSession(c.db,c.dir,a.instanceId,{...a,projectId:c.thread.projectId})
     }}),
   define('bot_thread_model','选择当前工作话题下一轮使用的原生模型',{threadId:'string',modelId:'string'},['threadId','modelId'],{
     group:'task',confirm:true,execute:(c,a)=>selectModel(c.db,workThread(c,a.threadId),a.modelId)}),

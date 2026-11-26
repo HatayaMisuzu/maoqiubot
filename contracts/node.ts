@@ -2,11 +2,13 @@ export type ModelOption = {id:string,label:string}
 export type ModelState = {current:string|null,options?:ModelOption[]}
 export type NativeSession={id:string;title:string;updatedAt:number;active:boolean}
 export type NativeAction='fork'|'archive'|'unarchive'|'delete'
-export type NativeHistory={items:{id:string;turnId:string;role:'user'|'assistant';text:string}[];nextBefore:string|null;archived?:boolean}
+export type NativeHistory={items:{id:string;turnId:string;role:'user'|'assistant';text:string}[];nextBefore:string|null;archived?:boolean;source?:'native';fetchedAt?:string}
+export type UsageWindow={usedPercent:number;durationMinutes:number|null;resetsAt:number|null}
+export type NativeUsage={source:'codex_app_server'|null;fetchedAt:string|null;windows:UsageWindow[]}
 export type NodeInstanceRegistration={id:string;name:string;adapterKey:string;workspaceRef:string;profileId?:string;runtimeScopeId?:string;
-  availableActions:string[];online?:boolean;version?:string;resume?:boolean;history?:boolean;sessionList?:boolean;nativeHistory?:boolean;
-  nativeActions?:NativeAction[];error?:string;models?:ModelOption[]}
-export type NodeHello={type:'hello';nodeId:string;receiptLookup?:boolean;instances:NodeInstanceRegistration[]}
+  availableActions:string[];online?:boolean;version?:string;resume?:boolean;history?:boolean;sessionList?:boolean;sessionImport?:boolean;nativeHistory?:boolean;
+  nativeActions?:NativeAction[];usage?:boolean;error?:string;models?:ModelOption[]}
+export type NodeHello={type:'hello';nodeId:string;receiptLookup?:boolean;cancelBeforeStart?:boolean;instances:NodeInstanceRegistration[]}
 export type Actor={kind:'user'|'main_bot'|'work_bot'|'system'|'tool';id:string}
 export type Audience={kind:'user'|'bot'|'task'|'system';id:string}
 export type Communication={sender:Actor;recipient:Audience;type:string;visibility:'user_visible'|'bot_internal'|'system';

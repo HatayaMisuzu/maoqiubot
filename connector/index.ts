@@ -5,6 +5,7 @@ import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
 import WebSocket from 'ws'
 import {registry} from './adapters/index.ts'
+import {runKeyedSerializedOperation} from './keyed-serialized-operations.ts'
 import {Store,type ReceiptStatus} from './store.ts'
 import type {Command,Instance,Adapter,Run,Input,Capabilities} from './types.ts'
 
@@ -19,9 +20,10 @@ baseUrl.protocol=url.protocol==='wss:'?'https:':'http:'
 const stateDir=resolve(config.stateDir)
 mkdirSync(stateDir,{recursive:true,mode:0o700})
 const store=new Store(join(stateDir,'connector.sqlite'))
-type Entry={config:Instance,adapter?:Adapter,caps:Capabilities,error?:string,restart?:NodeJS.Timeout}
+type Entry={config:Instance,adapter?:Adapter,caps:Capabilities,runtimeScopeId?:string,error?:string,restart?:NodeJS.Timeout}
 const instances=new Map<string,Entry>()
 const running=new Map<string,{run:Run,adapter:Adapter}>()
+const preparing=new Map<string,{command:Command,adapter:Adapter,cancelled:boolean}>()
 const handling=new Set<string>()
 const occupied=new Set<string>()
 const workspaceTails=new Map<string,Promise<void>>()
@@ -102,53 +104,76 @@ async function handle(c:Command) {
   let started=false
   let locked=false
   let cleanup=()=>{}
-  let releaseWorkspace=()=>{}
   try {
     receipt(c.id,'received')
     if(!inst?.adapter || !inst.caps.availableActions.includes(c.kind)) throw new Error('实例离线或不支持该操作')
     if(c.workspaceRef!==inst.config.workspaceRef || c.profileId!==inst.config.profileId) throw new Error('命令的工作区或 profile 与节点不一致')
     const adapter=inst.adapter
-    if(c.kind==='run'||c.kind==='prepare')releaseWorkspace=await lockWorkspace(inst.config.workspaceRef)
     if(c.kind==='run'||c.kind==='prepare') {
-      if(occupied.has(c.threadId)) throw new Error('话题正在处理上一轮输入')
-      occupied.add(c.threadId);locked=true
-      const runtimeKey=await runtimeIdentity(inst)
-      const bound=store.binding(c,inst.config.workspaceRef,runtimeKey)
-      if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
-      const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
-      const op=c.kind==='prepare'?c.payload.nativeOperation:undefined
-      if(op){
-        if(!adapter.sessionAction||!inst.caps.nativeActions?.includes(op.action)||
-          store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey)!==op.sourceSessionId||
-          (op.action==='fork'?bound||op.sourceThreadId===c.threadId:bound!==op.sourceSessionId))throw Error('原生操作能力或来源绑定不匹配')
-        store.submit(c.id)
-        started=true
-        const sessionId=await adapter.sessionAction(op.action,op.sourceSessionId)
-        if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
-        emit(c,'completed',{sessionId,nativeAction:op.action})
+      const pending={command:c,adapter,cancelled:false}
+      if(c.kind==='run'){
+        if(preparing.has(c.runId)||running.has(c.runId))throw Error('运行已经排队或已启动')
+        preparing.set(c.runId,pending)
+      }
+      const path=inst.config.workspaceRef
+      const key=process.platform==='win32'?path.toLowerCase():path
+      await runKeyedSerializedOperation(workspaceTails,key,async()=>{
+        if(pending.cancelled)return
+        if(stopping||inst.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
+        if(occupied.has(c.threadId)) throw new Error('话题正在处理上一轮输入')
+        occupied.add(c.threadId);locked=true
+        const runtimeKey=await checkedRuntime(inst,adapter)
+        if(pending.cancelled)return
+        const bound=store.binding(c,inst.config.workspaceRef,runtimeKey)
+        if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
+        const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
+        const op=c.kind==='prepare'?c.payload.nativeOperation:undefined
+        if(op){
+          if(!adapter.sessionAction||!inst.caps.nativeActions?.includes(op.action)||
+            store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey)!==op.sourceSessionId||
+            (op.action==='fork'?bound||op.sourceThreadId===c.threadId:bound!==op.sourceSessionId))throw Error('原生操作能力或来源绑定不匹配')
+          store.submit(c.id)
+          started=true
+          const sessionId=await adapter.sessionAction(op.action,op.sourceSessionId)
+          if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
+          emit(c,'completed',{sessionId,nativeAction:op.action})
+          receipt(c.id,'done')
+          return
+        }
+        if(incoming&&(bound&&bound!==incoming||!inst.caps.sessionImport||!adapter.importSession))throw Error('当前绑定或原生协议无法导入此会话')
+        const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
+        if(stopping||inst.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
+        store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
+        if(pending.cancelled)return
+        const run:Run={command:c,sessionId,emit:(kind,data)=>emit(c,kind,data)}
+        if(c.kind==='prepare'){
+          run.emit('model_state',{sessionId,...adapter.describeModels?.(sessionId)})
+          run.emit('completed',{sessionId})
+        }else{
+          const material=await input(c)
+          if(pending.cancelled)return
+          if(stopping||inst.adapter!==adapter) throw Error('原生进程已断开，输入尚未发送')
+          cleanup=grant(c,material)
+          running.set(c.runId,{run,adapter})
+          preparing.delete(c.runId)
+          store.submit(c.id)
+          started=true
+          await adapter.run(run,material)
+        }
+      })
+    } else {
+      const pending=preparing.get(c.runId)
+      if(c.kind==='cancel'&&pending?.adapter===adapter&&pending.command.threadId===c.threadId&&
+        pending.command.instanceId===c.instanceId&&pending.command.projectId===c.projectId){
+        pending.cancelled=true
+        emit(pending.command,'cancelled',{text:'运行已取消，输入尚未发送给原生端'})
+        receipt(pending.command.id,'done')
         receipt(c.id,'done')
         return
       }
-      if(incoming&&(bound&&bound!==incoming||!inst.caps.sessionList||!adapter.importSession))throw Error('当前绑定或原生协议无法导入此会话')
-      const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
-      store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
-      const run:Run={command:c,sessionId,emit:(kind,data)=>emit(c,kind,data)}
-      if(c.kind==='prepare'){
-        run.emit('model_state',{sessionId,...adapter.describeModels?.(sessionId)})
-        run.emit('completed',{sessionId})
-      }else{
-        const material=await input(c)
-        if(inst.adapter!==adapter) throw Error('原生进程已断开，输入尚未发送')
-        cleanup=grant(c,material)
-        running.set(c.runId,{run,adapter})
-        store.submit(c.id)
-        started=true
-        await adapter.run(run,material)
-      }
-    } else {
       const target=running.get(c.runId),run=target?.run
       if(!run || target.adapter!==adapter || run.command.threadId!==c.threadId || run.command.instanceId!==c.instanceId ||
-        c.payload.sessionId!==run.sessionId || c.projectId!==run.command.projectId ||
+        (c.payload.sessionId!==run.sessionId && !(c.kind==='cancel'&&!c.payload.sessionId)) || c.projectId!==run.command.projectId ||
         (c.payload.nativeRunId && c.payload.nativeRunId!==run.nativeRunId)) throw new Error('该运行不再接收控制命令')
       const material=c.kind==='steer'?await input(c):undefined
       if(inst.adapter!==adapter || running.get(c.runId)!==target) throw Error('原运行已结束或已断开')
@@ -175,22 +200,9 @@ async function handle(c:Command) {
     receipt(c.id,uncertain?'uncertain':'failed',detail)
   } finally {
     handling.delete(c.id)
+    if(preparing.get(c.runId)?.command===c)preparing.delete(c.runId)
     if(locked) {running.delete(c.runId);occupied.delete(c.threadId)}
-    releaseWorkspace()
     cleanup()
-  }
-}
-async function lockWorkspace(workspaceRef:string){
-  const key=resolve(workspaceRef).toLowerCase()
-  const previous=workspaceTails.get(key)??Promise.resolve()
-  let release!:()=>void
-  const current=new Promise<void>(resolveLock=>{release=resolveLock})
-  const tail=previous.then(()=>current)
-  workspaceTails.set(key,tail)
-  await previous
-  return ()=>{
-    release()
-    if(workspaceTails.get(key)===tail)workspaceTails.delete(key)
   }
 }
 async function runtimeIdentity(inst:{config:Instance,adapter?:Adapter}) {
@@ -198,10 +210,12 @@ async function runtimeIdentity(inst:{config:Instance,adapter?:Adapter}) {
   const runtimeKey=inst.config.runtimeKey??''
   return account?JSON.stringify([runtimeKey,account]):runtimeKey
 }
-async function scopeIdForInstance(inst:Entry):Promise<string|undefined>{
-  if(inst.config.adapterKey==='codex'&&!inst.adapter)return undefined
-  try{return createHash('sha256').update(await runtimeIdentity(inst)).digest('hex')}
-  catch{return undefined}
+const runtimeScope=(runtime:string)=>createHash('sha256').update(runtime).digest('hex')
+async function checkedRuntime(entry:Entry,adapter:Adapter,expected=entry.runtimeScopeId){
+  const runtime=await runtimeIdentity({config:entry.config,adapter})
+  if(stopping||entry.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
+  if(expected&&runtimeScope(runtime)!==expected)throw Error('原生账号或 profile 已变化，请检查实例配置')
+  return runtime
 }
 async function recover(inst:Entry) {
   for(const row of store.pending(inst.config.id)) {
@@ -240,14 +254,16 @@ async function startAdapter(entry:Entry,restarting=false) {
   let adapter:Adapter|undefined
   let ready=false
   try {
-    if(instance.adapterKey==='codex'&&!loopback)throw Error('个人 Codex 登录只支持同机运行')
+    const registration=registry.get(instance.adapterKey)
+    if(!registration)throw Error('未注册原生连接器：'+instance.adapterKey)
+    if(registration.localOnly&&!loopback)throw Error('该原生账号只支持同机运行')
     if(isAbsolute(instance.command)&&!existsSync(instance.command))throw Error('找不到配置的 Agent 可执行程序')
     instance.workspaceRef=realpathSync(instance.workspaceRef)
-    const key=instance.adapterKey==='codex'?'CODEX_HOME':'DSH_HOME'
-    const home=resolve(instance.env?.[key]||process.env[key]||join(homedir(),instance.adapterKey==='codex'?'.codex':'.dsh'))
+    const key=registration.homeVariable
+    const home=resolve(instance.env?.[key]||process.env[key]||join(homedir(),registration.homeDirectory))
     instance.env={...instance.env,[key]:home}
     instance.runtimeKey=JSON.stringify([instance.profileId,home,instance.command,instance.args])
-    adapter=new registry[instance.adapterKey](instance)
+    adapter=new registration.create(instance)
     entry.adapter=adapter
     adapter.onDisconnect(error=>{
       if(entry.adapter!==adapter)return
@@ -258,6 +274,7 @@ async function startAdapter(entry:Entry,restarting=false) {
       if(ready||restarting)retry(entry)
     })
     const caps=await adapter.probe()
+    entry.runtimeScopeId=runtimeScope(await checkedRuntime(entry,adapter))
     await recover(entry)
     if(stopping)return
     if(entry.adapter!==adapter)throw Error(entry.error??'原生进程已断开')
@@ -288,14 +305,14 @@ function connect(){
   ws=new WebSocket(url,{headers:{Authorization:'Bearer '+token,'X-Node-Id':config.nodeId},maxPayload:4*1024*1024,handshakeTimeout:15000})
   ws.on('open',async()=>{
     const socket=ws
-    const registrations=await Promise.all([...instances.values()].map(async entry=>{
-      const {config:i,caps,error}=entry
-      const runtimeScopeId=await scopeIdForInstance(entry)
+    const registrations=[...instances.values()].map(entry=>{
+      const {config:i,caps,error,adapter}=entry
+      const runtimeScopeId=adapter&&entry.runtimeScopeId
       return {id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,
-        ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,error,online:!error}
-    }))
+        ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,usage:typeof entry.adapter?.readUsage==='function',error,online:!error}
+    })
     if(ws!==socket||socket?.readyState!==WebSocket.OPEN)return
-    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,instances:registrations})
+    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,cancelBeforeStart:true,instances:registrations})
     for(const row of store.db.prepare('SELECT event FROM outbox ORDER BY rowid').iterate()) send({type:'event',event:JSON.parse(String(row.event))})
     for(const row of store.db.prepare('SELECT c.id,c.status,c.detail FROM commands c LEFT JOIN receipt_acks a ON c.id=a.id WHERE c.status IS NOT a.status ORDER BY c.rowid').iterate()) send({type:'receipt',commandId:row.id,status:row.status,detail:row.detail})
   })
@@ -306,23 +323,38 @@ function connect(){
       else if(frame.type==='read_history'&&typeof frame.id==='string'){
         const entry=instances.get(frame.instanceId),socket=ws
         try{
-          if(!entry?.caps.nativeHistory||!entry.adapter?.readHistory||entry.config.workspaceRef!==frame.workspaceRef||
-            entry.config.profileId!==frame.profileId||!frame.sessionId||
-            store.binding(frame,entry.config.workspaceRef,await runtimeIdentity(entry))!==frame.sessionId)throw Error('原生历史绑定不匹配')
-          const page=await entry.adapter.readHistory(frame.sessionId,frame.before)
+          const adapter=entry?.adapter
+          if(!entry?.caps.nativeHistory||!adapter?.readHistory||entry.config.workspaceRef!==frame.workspaceRef||
+            entry.config.profileId!==frame.profileId||!frame.sessionId)throw Error('原生历史绑定不匹配')
+          const runtime=await checkedRuntime(entry,adapter,frame.runtimeScopeId||undefined)
+          if(store.binding(frame,entry.config.workspaceRef,runtime)!==frame.sessionId)throw Error('原生历史绑定不匹配')
+          const page=await adapter.readHistory(frame.sessionId,frame.before)
           if(ws===socket)send({type:'history',id:frame.id,...page})
         }catch{if(ws===socket)send({type:'history',id:frame.id,error:true})}
       }
       else if(frame.type==='list_sessions'&&typeof frame.id==='string'){
-        const entry=instances.get(frame.instanceId)
-        if(!entry?.caps.sessionList||!entry.adapter?.listSessions||entry.config.workspaceRef!==frame.workspaceRef||entry.config.profileId!==frame.profileId){
+        const entry=instances.get(frame.instanceId),adapter=entry?.adapter
+        if(!entry?.caps.sessionList||!adapter?.listSessions||entry.config.workspaceRef!==frame.workspaceRef||entry.config.profileId!==frame.profileId){
           send({type:'sessions',id:frame.id,error:true});return
         }
         const socket=ws
         try{
-          const result=await entry.adapter.listSessions(frame.cursor)
+          await checkedRuntime(entry,adapter,frame.runtimeScopeId||undefined)
+          const result=await adapter.listSessions(frame.cursor)
           if(ws===socket)send({type:'sessions',id:frame.id,...result})
         }catch{if(ws===socket)send({type:'sessions',id:frame.id,error:true})}
+      }
+      else if(frame.type==='read_usage'&&typeof frame.id==='string'){
+        const entry=instances.get(frame.instanceId),adapter=entry?.adapter,socket=ws
+        try{
+          if(!entry||!adapter?.readUsage||entry.config.workspaceRef!==frame.workspaceRef||entry.config.profileId!==frame.profileId)
+            throw Error('原生额度范围不匹配')
+          if(!frame.runtimeScopeId)throw Error('缺少原生额度账号范围')
+          await checkedRuntime(entry,adapter,frame.runtimeScopeId)
+          const items=await adapter.readUsage()
+          await checkedRuntime(entry,adapter,frame.runtimeScopeId)
+          if(ws===socket)send({type:'usage',id:frame.id,items})
+        }catch{if(ws===socket)send({type:'usage',id:frame.id,error:true})}
       }
       else if(frame.type==='inspect_command'&&typeof frame.commandId==='string'){
         let saved=store.saved(frame.commandId)
