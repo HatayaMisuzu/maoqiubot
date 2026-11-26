@@ -71,7 +71,7 @@ function createWindow(root, login, restartConnector) {
     width: 1200, height: 840, minWidth: 390, minHeight: 530,
     show: false, autoHideMenuBar: true,
     ...(icon.isEmpty() ? {} : { icon }),
-    backgroundColor: '#f7f9f6',
+    backgroundColor: '#fafafa',
     webPreferences: {
       session: privateSession,
       nodeIntegration: false,
