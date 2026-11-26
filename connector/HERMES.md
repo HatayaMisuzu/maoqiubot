@@ -21,3 +21,9 @@
 ```
 
 「原生目录」只显示 Hermes 返回并属于当前工作区的会话。连接器重启后从该目录核对原生 ID 再续接。Hermes 会从目录隐藏没有消息的会话，因此仅预读了模型的空话题在重启后需要新建。若开启 Git Worktree，可以把它注册为新的 Hermes 执行实例。[Hermes ACP 官方协议说明](https://hermes-agent.nousresearch.com/docs/user-guide/features/acp)
+
+## 连接排查
+
+系统中有同名命令时，以能通过 `hermes --version` 和 `hermes acp --check` 的官方入口为准。如果启动报 `ModuleNotFoundError: No module named 'hermes_cli'`，需要先修复 Hermes 安装，或在实例配置中填写有效的官方启动器完整路径。
+
+「在线 · 已握手」表示协议初始化成功。首次创建会话还会启动 Hermes 网关、读取模型目录并检查模型配置；Hermes 适配器为会话初始化保留 120 秒等待时间。若报 `session/new 等待原生响应超时`，检查 Hermes 自身日志、模型目录网络访问和运行环境。连接测试通过不代表模型推理已经通过。
