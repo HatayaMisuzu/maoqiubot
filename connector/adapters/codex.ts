@@ -16,6 +16,7 @@ function terminal(turn:any,emit:Run['emit']) {
   return true
 }
 export class Codex extends Native implements Adapter {
+  turnStartTimeoutMs=30000
   models:ModelOption[]=[]
   sessionModels=new Map<string,string>()
   async identity(){
@@ -147,14 +148,24 @@ export class Codex extends Native implements Adapter {
     this.endings.set(run.sessionId,{finish:end.resolve,fail:end.reject})
     this.rpc.once('closed',end.reject)
     try {
-      const start=this.rpc.request('turn/start',{threadId:run.sessionId,input:inputs(input),...(model?{model}:{})})
+      const start=this.rpc.request('turn/start',{threadId:run.sessionId,input:inputs(input),...(model?{model}:{})},this.turnStartTimeoutMs)
       this.starts.set(run,start)
-      const {turn}=await start
-      if(run.nativeRunId && run.nativeRunId!==turn.id) throw new Error('原生回执运行 ID 不一致')
-      if(!run.nativeRunId) {run.nativeRunId=turn.id;run.emit('accepted',{sessionId:run.sessionId,nativeRunId:turn.id})}
-      if(model){
-        this.sessionModels.set(run.sessionId,model)
-        run.emit('model_state',{sessionId:run.sessionId,current:model,options:this.models})
+      try {
+        const result=await Promise.race([
+          start.then(({turn})=>({turn})),
+          end.promise.then(()=>({ended:true as const}))
+        ])
+        if(!('ended' in result)){
+          const {turn}=result
+          if(run.nativeRunId && run.nativeRunId!==turn.id) throw new Error('原生回执运行 ID 不一致')
+          if(!run.nativeRunId) {run.nativeRunId=turn.id;run.emit('accepted',{sessionId:run.sessionId,nativeRunId:turn.id})}
+          if(model){
+            this.sessionModels.set(run.sessionId,model)
+            run.emit('model_state',{sessionId:run.sessionId,current:model,options:this.models})
+          }
+        }
+      } catch(error) {
+        if(!run.nativeRunId)throw error
       }
       await end.promise
     } finally {
@@ -175,6 +186,10 @@ export class Codex extends Native implements Adapter {
       run.nativeRunId=p.turn.id
       run.emit('accepted',{sessionId:run.sessionId,nativeRunId:p.turn.id})
     } else if(msg.method==='turn/completed' && (!run.nativeRunId || run.nativeRunId===p.turn.id)) {
+      if(!run.nativeRunId&&typeof p.turn?.id==='string'){
+        run.nativeRunId=p.turn.id
+        run.emit('accepted',{sessionId:run.sessionId,nativeRunId:p.turn.id})
+      }
       if(terminal(p.turn,run.emit)) this.endings.get(run.sessionId)?.finish()
     } else if(msg.method==='model/rerouted' && typeof p.toModel==='string') {
       run.emit('activity',{text:'本轮原生路由使用 '+p.toModel,fromModel:p.fromModel,toModel:p.toModel,reason:p.reason})

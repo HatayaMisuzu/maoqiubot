@@ -113,7 +113,10 @@ export function route(db:DatabaseSync,ctx:any){
   if(path==='/instances'&&method==='GET')return [{id:'main',name:'小毛球',online:true,availableActions:['message','delegate']},
     ...listBots(db).map(bot=>({...bot,...bot.settings}))]
   if(path==='/threads/main'&&method==='GET')return mainThread(db)
-  if(path==='/threads'&&method==='GET')return listThreads(db,query)
+  if(path==='/threads'&&method==='GET'){
+    if(query.get('state')==='purged'&&(!principal.owner||!localRequest))fail('已清理原生绑定目录限本机所有者',403)
+    return listThreads(db,query)
+  }
   if(path==='/threads'&&method==='POST'){
     const instanceId=b.instanceId??'main'
     const thread=createThread(db,dataDir,{instanceId,projectId:b.projectId,title:b.title,modelId:b.modelId})
@@ -125,7 +128,10 @@ export function route(db:DatabaseSync,ctx:any){
   }
   if(area==='threads' && key){
     const thread=getThread(db,key)
-    if(sub==='impact'&&method==='GET')return threadImpact(db,key)
+    if(sub==='impact'&&method==='GET'){
+      if(thread.state==='purged'&&!localRequest)fail('已清理原生绑定限本机所有者核对',403)
+      return threadImpact(db,key)
+    }
     if(sub==='budget'&&['GET','POST'].includes(method)){
       if(!localRequest||thread.instanceId!=='main')fail('工具预算设置限本机小毛球会话',403)
       if(method==='GET')return {toolBudget:thread.toolBudget?JSON.parse(thread.toolBudget):null}
@@ -135,7 +141,8 @@ export function route(db:DatabaseSync,ctx:any){
       return {toolBudget}
     }
     if(sub==='lifecycle'&&method==='POST'){
-      if(thread.instanceId!=='main'&&thread.sessionId&&['archive','restore','fork','deleteNative'].includes(b.action))executionAccess(thread.instanceId)
+      if(b.action==='releaseNative'&&(!principal.owner||!localRequest))fail('原生会话解绑限本机所有者确认',403)
+      if(thread.instanceId!=='main'&&thread.sessionId&&['archive','restore','fork','deleteNative','releaseNative'].includes(b.action))executionAccess(thread.instanceId)
       return threadLifecycle(db,key,b,dataDir)
     }
     if(['deleted','purged'].includes(thread.state))fail('会话已移出工作台；可在最近删除查看可恢复的会话',410)

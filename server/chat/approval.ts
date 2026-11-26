@@ -4,6 +4,8 @@ import { message } from '../tasks/index.ts'
 import type { ToolCall, ToolExchange } from './provider.ts'
 
 export type Operation={id:string;tool:string;args:string;stamp:string;expires:number;approved?:boolean;call?:ToolCall;
+  pluginRevision?:number;
+  pluginAuthorization?:{digest:string;trustCode:boolean;allowNetwork:boolean};
   continuation?:{steps:number;seen:string[];toolResults:unknown[];exchanges:ToolExchange[]}}
 
 export function proposeOperation(db:DatabaseSync,job:any,operation:Operation){
@@ -19,7 +21,18 @@ export function resolveOperation(db:DatabaseSync,b:any){
   if(required(b.approvalId,'approvalId')!==operation.id)fail('确认内容已改变，请重新查看',409)
   if(operation.expires<Date.now())fail('该操作确认已过期，请重新发起',409)
   if(b.approved){
-    db.prepare("UPDATE chat_jobs SET operation=?,status='queued' WHERE id=?").run(JSON.stringify({...operation,approved:true}),job.id)
+    const args=JSON.parse(operation.args) as Record<string,unknown>
+    const requiresPluginAuthorization=operation.tool==='plugin_activate'||
+      operation.tool==='plugin_switch'&&args.action==='rollback'
+    let pluginAuthorization:Operation['pluginAuthorization']
+    if(requiresPluginAuthorization){
+      const submitted=b.pluginAuthorization
+      if(!submitted||submitted.digest!==args.digest||typeof submitted.trustCode!=='boolean'||typeof submitted.allowNetwork!=='boolean')
+        fail('插件授权须在查看版本摘要与差异后明确选择',403)
+      pluginAuthorization={digest:submitted.digest,trustCode:submitted.trustCode,allowNetwork:submitted.allowNetwork}
+    }
+    db.prepare("UPDATE chat_jobs SET operation=?,status='queued' WHERE id=?")
+      .run(JSON.stringify({...operation,approved:true,...(pluginAuthorization?{pluginAuthorization}:{})}),job.id)
   }else{
     db.prepare("UPDATE chat_jobs SET operation=NULL,status='cancelled' WHERE id=?").run(job.id)
     message(db,job.threadId,'system','activity','已拒绝这项操作',{replyTo:messageId})

@@ -8,6 +8,7 @@ import test from 'node:test'
 import {setTimeout as delay} from 'node:timers/promises'
 import {startServer} from '../server/index.ts'
 import {Store} from '../connector/store.ts'
+import {Rpc} from '../connector/rpc.ts'
 
 const fakeAcp=String.raw`
 const {createInterface}=require('node:readline')
@@ -46,6 +47,21 @@ for await (const line of createInterface({input:process.stdin})) {
   }
 }
 `
+
+test('connector filters Node launcher overrides while preserving ordinary environment',async()=>{
+  const keys=['NODE_OPTIONS','NODE_PATH','ELECTRON_RUN_AS_NODE']
+  const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]))
+  Object.assign(process.env,{NODE_OPTIONS:'--require=fixture-invalid',NODE_PATH:'C:/fixture-node-path',ELECTRON_RUN_AS_NODE:'1'})
+  const script=String.raw`(async()=>{const {createInterface}=require('node:readline');for await(const line of createInterface({input:process.stdin})){const q=JSON.parse(line);process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{nodeOptions:process.env.NODE_OPTIONS??null,nodePath:process.env.NODE_PATH??null,electronRunAsNode:process.env.ELECTRON_RUN_AS_NODE??null,path:!!process.env.PATH}})+String.fromCharCode(10))}})()`
+  const rpc=new Rpc({id:'fixture',name:'DSH fixture',adapterKey:'dsh',workspaceRef:process.cwd(),command:process.execPath,args:['-e',script]})
+  try{
+    const result=await rpc.request('environment',{},5000)
+    assert.deepEqual(result,{nodeOptions:null,nodePath:null,electronRunAsNode:null,path:true})
+  }finally{
+    rpc.close()
+    for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key]}
+  }
+})
 
 test('connector restarts a native DSH process without replaying the interrupted turn',async()=>{
   const temp=mkdtempSync(join(tmpdir(),'maoqiu-native-restart-'))
@@ -154,11 +170,25 @@ test('connector prevents duplicate native session bindings across matching runti
   const store=new Store(join(temp,'connector.sqlite'))
   const command=(id,threadId,instanceId)=>({id,threadId,runId:'run-'+id,taskId:null,kind:'run',instanceId,payload:{}})
   try {
-    const first=command('one','thread-one','codex-a')
+    const first={...command('one','thread-one','codex-a'),projectId:'project-a',profileId:'profile-a',workspaceRef:'C:/workspace',
+      payload:{text:'same operation',homeAccess:{token:'fixture-token-one',projectId:'project-a'}}}
+    store.command(first)
+    store.status('one','done')
     store.bind(first,'C:/workspace','session-one','runtime-a')
+    const replay={...first,payload:{text:'same operation',homeAccess:{token:'fixture-token-two',projectId:'project-a'}}}
+    assert.equal(store.command(replay).status,'done')
+    assert.throws(()=>store.command({...first,payload:{...first.payload,text:'different operation'}}),error=>error.code==='COMMAND_CONFLICT')
+    assert.throws(()=>store.command({...first,profileId:'profile-b'}),error=>error.code==='COMMAND_CONFLICT')
     assert.throws(()=>store.bind(command('two','thread-two','codex-b'),'C:/workspace','session-one','runtime-a'),/原生会话已绑定/)
     store.bind(command('three','thread-three','codex-c'),'C:/workspace','session-one','runtime-b')
     assert.throws(()=>store.bind(command('four','thread-four','codex-a'),'C:/workspace','session-one','runtime-a'),/原生会话已绑定/)
+    const release=command('release','thread-one','codex-a')
+    store.command(release)
+    const event=store.release(release,'C:/workspace','runtime-a','session-one')
+    assert.equal(event.data.released,true)
+    assert.equal(store.saved('release').status,'done')
+    assert.throws(()=>store.release(release,'C:/workspace','runtime-a','session-one'),/绑定已变化/)
+    store.bind(command('five','thread-five','codex-a'),'C:/workspace','session-one','runtime-a')
   } finally {
     store.db.close()
     rmSync(temp,{recursive:true,force:true,maxRetries:4,retryDelay:100})
@@ -203,6 +233,13 @@ test('connector serializes workspace writes, cancels queued inputs, and runs ind
     const secondThread=await request('/threads',{instanceId:'dsh'})
     const first=await request('/threads/'+firstThread.id+'/messages',{text:'wait-for-cancel first'})
     await wait('first native run started',()=>readFileSync(log,'utf8').includes('wait-for-cancel first'))
+    const setupThread=await request('/threads',{instanceId:'dsh'})
+    const setup=await request('/threads/'+setupThread.id+'/model',{prepare:true})
+    await wait('connector queued prepare behind the running session',()=>app.db.prepare('SELECT status FROM commands WHERE id=?').get(setup.commandId).status==='received')
+    await request('/runs/'+setup.runId+'/commands',{kind:'cancel'})
+    await wait('queued prepare cancelled before native invocation',async()=>
+      (await request('/threads/'+setupThread.id)).run?.status==='cancelled')
+    assert.equal((await request('/threads/'+setupThread.id)).thread.sessionId,null)
     const discardThread=await request('/threads',{instanceId:'dsh'})
     const discard=await request('/threads/'+discardThread.id+'/messages',{text:'must never reach native'})
     await wait('connector received queued input',()=>app.db.prepare('SELECT status FROM commands WHERE id=?').get(discard.commandId).status==='received')

@@ -19,6 +19,8 @@ npm.cmd run desktop
 npm.cmd run package:desktop
 ```
 
+浏览器回归使用临时数据和合成工作 Bot。在 Windows 上执行 `npx playwright install chromium --only-shell` 后运行 `npm.cmd run test:e2e`。窗口、托盘及系统选择器的验证需要启动 Electron。
+
 桌面首次启动会在 PATH 和常用安装目录查找官方执行入口。非标准 DSH 安装位置可在「Agent 设置」填写官方 `dsh.cmd` 的绝对路径，或在启动前设置 `MAOQIU_DSH_EXECUTABLE`。保存后点「测试连接」应用配置并查看各实例握手。托盘菜单也可重启连接器。有运行已送达时，工作台会提示等待或先停止该运行。实际推理还取决于原生账号与额度。
 
 需要让多个 Bot 并行修改同一 Git 项目时，在「Agent 设置」可从以仓库根目录为工作区的实例创建独立 Git 工作树。选择目标父目录后，应用会从当前提交建立分支和新实例。点「测试连接」登记新实例，再到项目中绑定并按需授权。运行旧桌面版时可用 `MAOQIU_PACKAGE_OUT` 指定另一个打包输出目录。[会话与工作区说明](docs/sessions.md)

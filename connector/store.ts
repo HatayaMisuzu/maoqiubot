@@ -2,7 +2,20 @@ import {DatabaseSync} from 'node:sqlite'
 import {createHash} from 'node:crypto'
 import type {Command} from './types.ts'
 export type ReceiptStatus='received'|'done'|'uncertain'|'failed'
-export type SavedCommand={id:string,body:string,status:ReceiptStatus,detail:string|null,submitted:number|null}
+export type SavedCommand={id:string,body:string,status:ReceiptStatus,detail:string|null,submitted:number|null,digest:string|null}
+function stable(value:any):any{
+  if(Array.isArray(value))return value.map(stable)
+  if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().map(key=>[key,stable(value[key])]))
+  return value
+}
+function commandDigest(c:Command){
+  const payload={...c.payload,
+    ...(c.payload.homeAccess?{homeAccess:{...c.payload.homeAccess,token:undefined}}:{}),
+    ...(c.payload.communicationAccess?{communicationAccess:{...c.payload.communicationAccess,token:undefined}}:{})}
+  const semantic={id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,
+    projectId:c.projectId??null,profileId:c.profileId??null,workspaceRef:c.workspaceRef??null,kind:c.kind,payload}
+  return createHash('sha256').update(JSON.stringify(stable(semantic))).digest('hex')
+}
 export class Store {
   db:DatabaseSync
   constructor(path:string) {
@@ -16,7 +29,7 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       const version=this.db.prepare('PRAGMA user_version').get()?.user_version
-      if(version!==0 && version!==1)throw Error('连接器数据库版本高于当前支持的版本')
+      if(version!==0 && version!==1 && version!==2)throw Error('连接器数据库版本高于当前支持的版本')
       if(version===0){
         this.db.exec(`
       CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,body TEXT NOT NULL,status TEXT NOT NULL,detail TEXT);
@@ -29,18 +42,25 @@ export class Store {
         if(!this.db.prepare('PRAGMA table_info(commands)').all().some(c=>c.name==='submitted')) this.db.exec('ALTER TABLE commands ADD COLUMN submitted INTEGER')
         this.db.exec('PRAGMA user_version=1')
       }
+      if(version<2){
+        if(!this.db.prepare('PRAGMA table_info(commands)').all().some(c=>c.name==='digest'))
+          this.db.exec('ALTER TABLE commands ADD COLUMN digest TEXT')
+        this.db.exec('PRAGMA user_version=2')
+      }
       this.db.exec('COMMIT')
     }catch(e){this.db.exec('ROLLBACK');throw e}
   }
   command(c:Command) {
     // The server owns the input and credentials. Local recovery needs only routing IDs.
     const body=JSON.stringify({id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,kind:c.kind})
+    const digest=commandDigest(c)
     const prior=this.saved(c.id)
-    if(prior && prior.body!==body) throw new Error('重复命令的目标不一致')
+    if(prior && prior.body!==body) throw Object.assign(new Error('重复命令的路由目标不一致'),{code:'COMMAND_CONFLICT'})
+    if(prior?.digest&&prior.digest!==digest)throw Object.assign(new Error('重复命令的执行内容、范围或配置不一致'),{code:'COMMAND_CONFLICT'})
     if(!prior) {
       this.db.exec('BEGIN IMMEDIATE')
       try {
-        this.db.prepare("INSERT INTO commands(id,body,status,submitted) VALUES(?,?,'received',0)").run(c.id,body)
+        this.db.prepare("INSERT INTO commands(id,body,status,submitted,digest) VALUES(?,?,'received',0,?)").run(c.id,body,digest)
         this.db.prepare('INSERT OR IGNORE INTO runs(id) VALUES(?)').run(c.runId)
         this.db.exec('COMMIT')
       } catch(e) {this.db.exec('ROLLBACK');throw e}
@@ -76,6 +96,25 @@ export class Store {
       this.db.prepare('UPDATE bindings SET runtime=? WHERE thread=? AND runtime IS NULL').run(runtime??null,c.threadId)
       this.db.exec('COMMIT')
     } catch(e) {this.db.exec('ROLLBACK');throw e}
+  }
+  release(c:Command,workspace:string,runtime:string|undefined,session:string){
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      if(this.binding(c,workspace,runtime)!==session)throw Error('待解除的原生会话绑定已变化')
+      this.db.prepare('DELETE FROM bindings WHERE thread=? AND instance=? AND workspace=? AND session=? AND (runtime IS ? OR runtime IS NULL)')
+        .run(c.threadId,c.instanceId,workspace,session,runtime??null)
+      const run:any=this.db.prepare('SELECT * FROM runs WHERE id=?').get(c.runId)
+      if(!run)throw Error('缺少解绑命令的持久运行记录')
+      const seq=run.seq+1
+      const key=createHash('sha256').update(JSON.stringify([c.instanceId,c.runId,seq])).digest('hex')
+      const data={sessionId:session,nativeAction:'release',released:true}
+      const event={key,seq,commandId:c.id,instanceId:c.instanceId,runId:c.runId,taskId:c.taskId,kind:'completed',data}
+      this.db.prepare('UPDATE runs SET seq=?,terminal=1 WHERE id=?').run(seq,c.runId)
+      this.db.prepare('INSERT INTO outbox VALUES(?,?)').run(key,JSON.stringify(event))
+      this.db.prepare("UPDATE commands SET status='done',detail='' WHERE id=?").run(c.id)
+      this.db.exec('COMMIT')
+      return event
+    }catch(e){this.db.exec('ROLLBACK');throw e}
   }
   emit(c:Command,kind:string,data:any) {
     this.db.exec('BEGIN IMMEDIATE')

@@ -9,17 +9,43 @@ import { daily, mainModels, mainPermissions, memories } from './main-settings.js
 import { extensions } from './extensions.js';
 
 const drafts = new Map();
+const uploads = new WeakMap();
 const expandedMessages = new Set();
 const selectedMessages = new Set();
 let selectionThreadId = null;
 
-const draftKeyFor = (instanceId, projectId) => 'new:' + (instanceId || 'main') + ':' + (projectId || '');
+const draftKeyFor = (instanceId, projectId) => 'new:' + JSON.stringify([instanceId || 'main', projectId || null]);
 const draftKey = () => state.thread || draftKeyFor(state.instance || 'main', state.project || '');
 const getDraftByKey = key => {
   if (!drafts.has(key)) drafts.set(key, { text: '', files: [], refs: [], modelId: null });
   return drafts.get(key);
 };
 const currentDraft = () => getDraftByKey(draftKey());
+
+function chatTarget() {
+  const thread = state.snapshot?.thread;
+  if (state.view !== 'chat' || (state.thread ? thread?.id !== state.thread : !state.draft)) return null;
+  const key = draftKey();
+  return {
+    hash: location.hash, revision: state.routeRevision, key, draft: getDraftByKey(key),
+    id: thread?.id || null, instanceId: thread?.instanceId || state.instance,
+    projectId: thread ? thread.projectId || null : state.project || null
+  };
+}
+
+function atTarget(target) {
+  return state.view === 'chat' && state.routeRevision === target.revision && location.hash === target.hash &&
+    draftKey() === target.key && (!target.id || state.snapshot?.thread?.id === target.id);
+}
+
+async function uploadedId(file, projectId) {
+  if (!uploads.has(file)) uploads.set(file, new Map());
+  const scopes = uploads.get(file);
+  if (!scopes.has(projectId)) scopes.set(projectId, { requestId: crypto.randomUUID() });
+  const entry = scopes.get(projectId);
+  if (!entry.id) entry.id = (await upload(file, projectId, entry.requestId)).id;
+  return entry.id;
+}
 
 const instance = id => state.instances.find(i => i.id === id);
 const actorLabel = actor => actor?.kind === 'user' ? '你' : actor?.id === 'main' && actor?.kind !== 'tool' ? '小毛球' :
@@ -33,7 +59,15 @@ const commLabel = comm => actorLabel(comm.sender) + ' → ' + actorLabel(comm.re
 
 const controls = (run, payload) => api('/runs/' + url(run.id) + '/commands', payload);
 const finished = run => !run || ['completed', 'failed', 'blocked', 'cancelled'].includes(run.status);
-const reading = snapshot => snapshot?.run?.modelSetup && !finished(snapshot.run);
+const reading = snapshot => snapshot?.run?.modelSetup && !finished(snapshot.run) && snapshot.run.status !== 'uncertain';
+const modelSetupStatus = {
+  queued: '等待工作区执行模型读取…',
+  running: '正在读取原生模型…',
+  cancelling: '正在确认是否已取消模型读取…',
+  completed: '原生模型读取完成。',
+  cancelled: '已取消模型读取。',
+  uncertain: '原生读取结果待核对。'
+};
 const canRead = agent => agent?.availableActions?.includes('prepare');
 const keepNative = { id: '', name: '跟随原生会话' };
 const modelOptions = (snapshot, agent) => snapshot?.model?.options ?? agent?.capabilities?.models ?? [];
@@ -89,6 +123,8 @@ export const chat = actions => {
 
   function preview(event) {
     if (state.view !== 'chat' || event.threadId !== state.thread) return;
+    if (event.text && !state.snapshot?.mainChat?.pending?.some(job => job.messageId === event.messageId && ['queued', 'working'].includes(job.status))) return;
+    if (!event.text && previewEvent?.messageId !== event.messageId) return;
     previewEvent = event.text ? event : null;
     const previewEl = $('chat-preview');
     if (!previewEl) return;
@@ -97,6 +133,12 @@ export const chat = actions => {
     previewEl.textContent = event.text;
     previewEl.hidden = !event.text;
     if (following) content.scrollTop = content.scrollHeight;
+  }
+
+  function clearPreview() {
+    previewEvent = null;
+    const node = $('chat-preview');
+    if (node) { node.textContent = ''; node.hidden = true; }
   }
 
   function modelPicker(snapshot, agent) {
@@ -114,11 +156,13 @@ export const chat = actions => {
           form('选择首轮模型', [
             { key: 'modelId', label: '首轮模型', value: draft.modelId || '', options: choicesFor(models) }
           ], '确定', ({ modelId }) => {
+            if (draft.sending || draft.unknownCreate) throw Error('请先处理这条待发送消息。');
             draft.modelId = modelId || null;
             draw();
           }, { description: '将在首次发送消息创建话题时应用所选模型。' });
         }, 'secondary model-tool');
         button.append(el('span', '', label));
+        button.disabled = Boolean(draft.sending || draft.unknownCreate);
         return button;
       }
       const infoBtn = btn('模型 · 原生决定', () => {
@@ -143,7 +187,19 @@ export const chat = actions => {
         : '模型 · 跟随原生';
 
     if (reading(snapshot)) {
-      const status = el('small', 'muted', '正在读取原生模型…');
+      const { run } = snapshot;
+      const status = el('small', 'muted', modelSetupStatus[run.status] || modelSetupStatus.running);
+      status.setAttribute('role', 'status');
+      const cancel = canRead(agent) && agent.online && run.status !== 'cancelling'
+        ? btn('取消读取', async () => {
+          await controls(run, { kind: 'cancel' });
+          await actions.refresh();
+        }, 'secondary btn-sm') : null;
+      return el('div', 'actions', status, cancel);
+    }
+
+    if (snapshot.run?.modelSetup && snapshot.run.status === 'uncertain') {
+      const status = el('small', 'muted', modelSetupStatus.uncertain);
       status.setAttribute('role', 'status');
       return status;
     }
@@ -187,16 +243,6 @@ export const chat = actions => {
 
   const projectOptions = () => [{ id: '', name: '个人话题' }, ...state.projects];
 
-  function carryDraft(contactId, projectId, threadId) {
-    const key = draftKeyFor(contactId, projectId);
-    const draft = drafts.get(key);
-    if (!state.thread && (state.instance || 'main') === contactId && draft && (!draft.pendingId || draft.pendingId === threadId)) {
-      delete draft.pendingId;
-      drafts.set(threadId, draft);
-      drafts.delete(key);
-    }
-  }
-
   function newThread(preset) {
     const id = preset || state.instance || 'main';
     const agent = instance(id);
@@ -204,7 +250,7 @@ export const chat = actions => {
       notice(agent.settings.enabled === false ? '此 Bot 已停用。' : '此 Bot 当前不允许直接聊天。', 'error');
       return;
     }
-    let projectId = state.snapshot?.thread?.projectId || state.project || undefined;
+    let projectId = chatTarget()?.projectId || undefined;
     if (agent?.settings?.allowedProjects) {
       if (!projectId || !agent.settings.allowedProjects.includes(projectId)) {
         if (agent.settings.allowedProjects.length === 1) {
@@ -221,25 +267,25 @@ export const chat = actions => {
     actions.openDraft(id, projectId);
   }
 
-  async function readDraftModels(threadId, stillOpen) {
+  async function readDraftModels(threadId, stillOpen, onStatus) {
     const path = '/threads/' + url(threadId);
     let snapshot = await api(path);
-    if (!modelOptions(snapshot).length && !reading(snapshot) && stillOpen()) {
+    if (!modelOptions(snapshot).length && finished(snapshot.run) && stillOpen()) {
       try { await api(modelPath(threadId), { prepare: true }); }
       catch (e) {
         snapshot = await api(path);
-        if (!reading(snapshot) && !modelOptions(snapshot).length) throw e;
+        if (finished(snapshot.run) && !modelOptions(snapshot).length) throw e;
       }
       snapshot = await api(path);
     }
-    const deadline = Date.now() + 45000;
-    while (stillOpen() && reading(snapshot) && Date.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 300));
+    while (stillOpen() && reading(snapshot)) {
+      onStatus(snapshot);
+      await new Promise(resolve => setTimeout(resolve, 500));
       if (stillOpen()) snapshot = await api(path);
     }
     if (!stillOpen()) return snapshot;
-    if (reading(snapshot)) throw Error('读取原生模型超时，可以稍后重试。');
-    if (finished(snapshot.run) && snapshot.run?.modelSetup && snapshot.run.status !== 'completed') {
+    onStatus(snapshot);
+    if (snapshot.run?.modelSetup && !['completed', 'cancelled', 'uncertain'].includes(snapshot.run.status)) {
       throw Error(previewError(snapshot) || '节点未能读取原生模型，可以重试。');
     }
     return snapshot;
@@ -257,12 +303,13 @@ export const chat = actions => {
       const preview = contexts.get(key);
       const models = modelOptions(preview?.snapshot, agent);
       const current = preview?.snapshot?.model?.current;
+      const setup = preview?.snapshot?.run?.modelSetup ? preview.snapshot.run : null;
       useModelOptions(select, models);
-      save.disabled = !!preview?.reading;
+      save.disabled = !!preview?.reading || setup?.status === 'uncertain';
       hint.textContent = preview?.reading
-        ? '正在读取原生模型…'
+        ? modelSetupStatus[setup?.status] || '正在提交模型读取…'
         : preview?.error || (
-          current
+          setup?.status === 'uncertain' || setup?.status === 'cancelled' ? modelSetupStatus[setup.status] : current
             ? '原生会话当前模型 · ' + modelName(models, current, true)
             : !agent?.online
               ? '节点离线，恢复连接后可读取原生模型。'
@@ -275,6 +322,20 @@ export const chat = actions => {
                     : '原生会话将决定首轮模型。'
         );
       action.replaceChildren();
+      if (preview?.reading && setup && ['queued', 'running'].includes(setup.status) && agent?.online) {
+        const cancel = btn('取消读取', async () => {
+          cancel.disabled = true;
+          try { await controls(setup, { kind: 'cancel' }); }
+          catch (e) { if (cancel.isConnected) cancel.disabled = false; throw e; }
+        }, 'secondary btn-sm');
+        action.append(cancel);
+      }
+      if (setup?.status === 'uncertain' && agent?.online) {
+        action.append(btn('查询原生回执', async () => {
+          await api('/runs/' + url(setup.id) + '/recovery', { action: 'inspect' });
+          notice('已请求核对，查询后可重新读取状态。');
+        }, 'secondary btn-sm'));
+      }
       if (!models.length && agent?.online && canRead(agent) && !preview?.reading) {
         action.append(btn(preview?.error ? '重试读取会话模型' : '读取会话模型', async () => {
           const [instanceId, projectId] = JSON.parse(key);
@@ -287,7 +348,11 @@ export const chat = actions => {
             const origin = await originThreadId();
             if (!activeForm(ui)) return;
             entry.thread ??= await api('/tasks/draft', { originThreadId: origin, instanceId, projectId: projectId || undefined });
-            entry.snapshot = await readDraftModels(entry.thread.id, () => activeForm(ui));
+            entry.snapshot = await readDraftModels(entry.thread.id, () => activeForm(ui), snapshot => {
+              const changed = entry.snapshot?.run?.id !== snapshot.run?.id || entry.snapshot?.run?.status !== snapshot.run?.status;
+              entry.snapshot = snapshot;
+              if (changed && activeForm(ui) && key === contextKey()) update();
+            });
           } catch (e) {
             entry.error = e.message;
           } finally {
@@ -308,33 +373,37 @@ export const chat = actions => {
     };
   }
 
-  async function ensureThread() {
-    if (state.thread) return state.thread;
-    const t = await api('/threads', { instanceId: state.instance || 'main', projectId: state.project || undefined });
-    return t.id;
-  }
-
   function delegate() {
+    const target = chatTarget();
+    if (!target) return;
     const contacts = getWorkBots().filter(b => b.settings?.enabled !== false && b.settings?.allowDelegate !== false);
     if (!contacts.length) {
       notice('暂无可委派的工作 Bot，请先接入或启用工作 Bot。', 'error');
       return;
     }
-    const sourceProject = state.snapshot?.thread?.projectId || '';
-    const unsavedOrigin = state.thread ? null : currentDraft();
-    let origin = state.thread || unsavedOrigin?.pendingId;
+    const sourceProject = target.projectId || '';
+    const unsavedOrigin = !target.id && target.instanceId === 'main' ? target.draft : null;
+    let origin = target.id;
+    const requestId = unsavedOrigin?.originRequestId || crypto.randomUUID();
     let submission;
 
     async function originThreadId() {
-      if (!origin) {
-        origin = api('/threads', { instanceId: 'main', projectId: state.project || undefined })
-          .then(t => {
-            if (unsavedOrigin) unsavedOrigin.pendingId = t.id;
-            return t.id;
-          })
-          .catch(e => { origin = null; throw e; });
+      if (origin) return origin;
+      if (unsavedOrigin?.pendingId) return unsavedOrigin.pendingId;
+      if (unsavedOrigin?.origin) return unsavedOrigin.origin;
+      if (unsavedOrigin?.sending || unsavedOrigin?.unknownCreate) throw Error('请先处理这条待发送消息。');
+      const creating = api('/threads', { instanceId: 'main', projectId: target.projectId || undefined, requestId })
+        .then(t => {
+          origin = t.id;
+          if (unsavedOrigin) unsavedOrigin.pendingId = t.id;
+          return t.id;
+        });
+      if (unsavedOrigin) {
+        unsavedOrigin.origin = creating;
+        unsavedOrigin.originRequestId = requestId;
       }
-      return origin;
+      try { return await creating; }
+      finally { if (unsavedOrigin?.origin === creating) delete unsavedOrigin.origin; }
     }
 
     const ui = form('委派任务', [
@@ -360,9 +429,14 @@ export const chat = actions => {
       const signature = JSON.stringify(payload);
       if (submission?.signature !== signature) submission = { signature, id: crypto.randomUUID() };
       await api('/tasks', { ...payload, requestId: submission.id });
-      carryDraft('main', state.project || '', originThreadIdValue);
-      await actions.load();
-      await actions.openThread(originThreadIdValue);
+      await actions.load({ full: false, threadOwners: ['main', target.instanceId, data.instanceId] });
+      if (atTarget(target)) {
+        if (unsavedOrigin && drafts.get(target.key) === unsavedOrigin && !unsavedOrigin.sending) {
+          drafts.set(originThreadIdValue, unsavedOrigin);
+          drafts.delete(target.key);
+        }
+        await actions.openThread(originThreadIdValue);
+      } else actions.renderChrome();
     });
 
     if (sourceProject) ui.controls.projectId.disabled = true;
@@ -370,8 +444,10 @@ export const chat = actions => {
   }
 
   async function openTask(id) {
+    const revision = state.routeRevision;
+    const hash = location.hash;
     const data = await api('/tasks/' + url(id));
-    await actions.openThread(data.task.workThreadId);
+    if (revision === state.routeRevision && hash === location.hash) await actions.openThread(data.task.workThreadId);
   }
 
   async function communication(taskId) {
@@ -536,13 +612,16 @@ export const chat = actions => {
   }
 
   async function replaceNative(thread) {
+    const origin = chatTarget();
     const created = await api('/threads/' + url(thread.id) + '/lifecycle', {
       action: 'replaceNative',
       title: (thread.title || '工作话题') + ' · 接续'
     });
     await actions.load();
-    await actions.openThread(created.id);
-    notice('已建立替代话题，发送首条消息时将开启新的原生会话。');
+    if (origin && atTarget(origin)) {
+      await actions.openThread(created.id);
+      notice('已建立替代话题，发送首条消息时将开启新的原生会话。');
+    }
   }
 
   async function afterDeleteNavigate(deletedThread) {
@@ -584,6 +663,8 @@ export const chat = actions => {
 
     if (thread.instanceId === 'main' && thread.kind === 'side' && !thread.projectId && thread.state === 'active' && state.mainThread) {
       actionsList.push(btn('设为默认主会话', async () => {
+        const origin = chatTarget();
+        const previousMainId = state.mainThread.id;
         const ok = await confirmDialog({
           title: '更换固定主会话',
           body: '将「' + (thread.title || '此侧聊') + '」设为新的小毛球主会话？原主会话将保留为侧边会话。',
@@ -592,12 +673,14 @@ export const chat = actions => {
         if (!ok) return;
         await api('/threads/' + url(thread.id) + '/lifecycle', {
           action: 'setMain',
-          previousMainId: state.mainThread.id,
+          previousMainId,
           confirm: true
         });
         await actions.load();
-        await actions.openThread(thread.id);
-        notice('已切换固定主会话。');
+        if (origin && atTarget(origin)) {
+          await actions.openThread(thread.id);
+          notice('已切换固定主会话。');
+        }
       }, 'settings-row', 'yarn'));
     }
 
@@ -618,10 +701,13 @@ export const chat = actions => {
       actionsList.push(btn('从此会话创建原生分支', () => form('创建原生分支', [
         { key: 'title', label: '新会话名称', value: (thread.title || '会话') + ' · 分支', required: true }
       ], '创建分支', async ({ title }) => {
+        const origin = chatTarget();
         const branch = await api('/threads/' + url(thread.id) + '/lifecycle', { action: 'fork', title });
         await actions.load();
-        await actions.openThread(branch.id);
-        notice('原生分支创建请求已提交。');
+        if (origin && atTarget(origin)) {
+          await actions.openThread(branch.id);
+          notice('原生分支创建请求已提交。');
+        }
       }, { back: backHere }), 'settings-row', 'branch'));
     }
 
@@ -654,6 +740,7 @@ export const chat = actions => {
 
     if (!permanent && thread.state !== 'deleted') {
       actionsList.push(btn('移至最近删除', async () => {
+        const origin = chatTarget();
         const ok = await confirmDialog({
           title: '移至最近删除',
           body: '将「' + (thread.title || '此会话') + '」移入最近删除？可随时在回收站中恢复。',
@@ -664,8 +751,10 @@ export const chat = actions => {
         await api('/threads/' + url(thread.id) + '/lifecycle', { action: 'delete' });
         await actions.load();
         actions.renderChrome();
-        await afterDeleteNavigate(thread);
-        notice('已移至最近删除。');
+        if (origin && atTarget(origin)) {
+          if (origin.id === thread.id) await afterDeleteNavigate(thread);
+          notice('已移至最近删除。');
+        }
       }, 'settings-row destructive-ghost', 'trash'));
     }
 
@@ -679,7 +768,8 @@ export const chat = actions => {
     const agents = state.instances;
     const projectName = id => id ? state.projects.find(project => project.id === id)?.name || '其他项目' : '个人范围';
 
-    form('分享会话', [
+    const origin = chatTarget();
+    const ui = form('分享会话', [
       {
         key: 'targetThreadId',
         label: '分享目标',
@@ -699,8 +789,10 @@ export const chat = actions => {
         : { newThread: { instanceId, title: title || '分享：' + (thread.title || '会话') } };
       const selection = messageIds?.length ? { messageIds } : {};
       const preview = await api('/threads/' + url(thread.id) + '/share', { ...destination, preview: true, ...selection });
+      if (!activeForm(ui) || !origin || !atTarget(origin)) return;
 
-      displayDialog('分享预览', [
+      const requestId = crypto.randomUUID();
+      const review = displayDialog('分享预览', [
         el('p', 'muted', preview.crossProject ? '跨项目分享 · 仅包含已授权的用户原文和附件' : '将分享 ' + (preview.items?.length || 0) + ' 条消息。'),
         ...(preview.items || []).map(item => el('article', 'record',
           el('small', 'muted', (item.role || '') + ' · ' + at(item.createdAt)),
@@ -710,17 +802,19 @@ export const chat = actions => {
       ], [
         btn('返回', () => shareThread(thread, messageIds), 'ghost'),
         btn(preview.crossProject ? '确认跨项目分享' : '确认分享', async () => {
+          if (!atTarget(origin)) return;
           await api('/threads/' + url(thread.id) + '/share', {
             ...destination,
             ...selection,
+            requestId,
             ...(preview.crossProject ? { confirmCrossProject: true } : {})
           });
-          $('dialog').close();
-          for (const id of messageIds || []) selectedMessages.delete(id);
+          if (review.dialog.contains(review.body)) review.dialog.close();
+          if (atTarget(origin)) for (const id of messageIds || []) selectedMessages.delete(id);
           await actions.load();
           actions.renderChrome();
           await actions.refresh();
-          notice('会话内容已分享。');
+          if (atTarget(origin)) notice('会话内容已分享。');
         }, 'primary')
       ]);
     });
@@ -1256,11 +1350,67 @@ export const chat = actions => {
           await actions.refresh();
         };
         const { tool, arguments: args, expires } = job.proposal;
+        const pluginAuthorizationRequired = tool === 'plugin_activate' ||
+          tool === 'plugin_switch' && args.action === 'rollback';
+        const approvePlugin = async () => {
+          const state = await api('/chat/plugins');
+          const plugin = state.plugins.find(item => item.id === args.id);
+          const version = tool === 'plugin_switch' ? 'previous' :
+            plugin?.pending?.digest === args.digest ? 'candidate' : 'current';
+          const review = await api('/chat/plugins', { action: 'review', id: args.id, version });
+          if (review.digest !== args.digest) throw Error('待确认版本已改变，请重新发起操作');
+          const manifest = review.manifest;
+          const hasCode = Boolean(manifest.entry && review.source !== 'bundled');
+          const hasNetwork = manifest.capabilities.some(capability => capability.startsWith('network.'));
+          const trust = el('input');
+          trust.type = 'checkbox';
+          const network = el('input');
+          network.type = 'checkbox';
+          const authorize = await new Promise(resolveAuthorization => {
+            const changedFiles = review.files.map(file => el('details', 'fold-card',
+              el('summary', '', file.path),
+              file.before ? el('div', 'muted', el('strong', '', '之前'), el('pre', 'text', file.before)) : null,
+              file.after ? el('div', '', el('strong', '', '新版本'), el('pre', 'text', file.after)) : null));
+            const permissions = [
+              hasCode ? el('label', 'field', trust, el('span', 'field-label', '我已审查这些文件，并授权该摘要版本在工作台宿主进程中执行代码')) : null,
+              hasNetwork ? el('label', 'field', network, el('span', 'field-label', '我授权该版本使用清单声明的网络能力')) : null
+            ];
+            const accept = btn('确认授权并执行', () => {
+              if (hasCode && !trust.checked || hasNetwork && !network.checked) {
+                notice('请分别勾选需要授予的权限');
+                return;
+              }
+              $('dialog').close();
+              resolveAuthorization({ digest: review.digest, trustCode: trust.checked, allowNetwork: network.checked });
+            }, 'primary');
+            const reject = btn('取消', () => {
+              $('dialog').close();
+              resolveAuthorization(null);
+            }, 'ghost');
+            displayDialog('审查插件授权', [
+              el('small', 'muted', manifest.name + ' · ' + manifest.version + ' · ' + review.source),
+              el('p', 'text', manifest.description),
+              el('p', 'muted', 'SHA-256 · ' + review.digest),
+              el('p', 'muted', '声明能力 · ' + manifest.capabilities.join('、')),
+              review.addedCapabilities.length ? el('p', 'muted', '相对当前版本新增 · ' + review.addedCapabilities.join('、')) : null,
+              hasCode ? el('p', 'form-err', '可执行 JavaScript 会继承工作台宿主进程的本机权限。静态检查不能证明代码安全。') : null,
+              hasNetwork ? el('p', 'muted', '网络能力允许插件向其实现或配置的网络服务发送请求。') : null,
+              ...permissions,
+              ...changedFiles
+            ], [reject, accept], { wide: true });
+          });
+          if (!authorize) return;
+          await api('/chat/approve', {
+            messageId: job.messageId, approvalId: job.proposal.id, approved: true,
+            pluginAuthorization: authorize
+          });
+          await actions.refresh();
+        };
         stream.append(el('article', 'pending-card tone-question',
           el('div', 'status-card-title', '请确认操作 · ' + tool),
           el('pre', 'text', JSON.stringify(args, null, 2)),
           el('small', 'muted', '有效至 ' + at(expires)),
-          el('div', 'actions', btn('确认执行', () => resolve(true), 'primary btn-sm'), btn('拒绝', () => resolve(false), 'ghost btn-sm'))
+          el('div', 'actions', btn('确认执行', () => pluginAuthorizationRequired ? approvePlugin() : resolve(true), 'primary btn-sm'), btn('拒绝', () => resolve(false), 'ghost btn-sm'))
         ));
         continue;
       }
@@ -1301,7 +1451,9 @@ export const chat = actions => {
       ));
     }
 
-    const activePreview = previewEvent?.threadId === t?.id && snap.mainChat?.pending?.some(job => job.messageId === previewEvent?.messageId);
+    const activePreview = previewEvent?.threadId === t?.id && snap.mainChat?.pending?.some(job =>
+      job.messageId === previewEvent?.messageId && ['queued', 'working'].includes(job.status));
+    if (!activePreview) previewEvent = null;
     const previewNode = el('div', 'msg text', activePreview ? previewEvent.text : '');
     previewNode.id = 'chat-preview';
     previewNode.hidden = !activePreview;
@@ -1323,10 +1475,17 @@ export const chat = actions => {
   }
 
   function drawComposer() {
+    const target = chatTarget();
+    if (!target) {
+      $('compose').replaceChildren();
+      return;
+    }
     const t = state.snapshot?.thread;
     const ctx = resolveActiveContext();
-    const contact = instance(t?.instanceId || ctx.instanceId);
-    const key = draftKey() + ':' + (t?.state || '') + ':' + (t?.nativeInvalid || '') + ':' + (contact?.settings?.enabled) + ':' + (contact?.settings?.allowDirect);
+    const contact = instance(target.instanceId);
+    const scopes = target.id ? [] : buildScopeOptions(contact);
+    const key = JSON.stringify([target.key, target.revision, t?.state, t?.nativeInvalid, contact?.settings?.enabled,
+      contact?.settings?.allowDirect, scopes]);
     if ($('compose').dataset.key === key && $('input')) return;
 
     $('compose').dataset.key = key;
@@ -1360,10 +1519,11 @@ export const chat = actions => {
       return;
     }
 
-    const draft = currentDraft();
+    const { draft } = target;
     let draftBar = null;
+    let permitted = true;
     if (!t && state.draft) {
-      const options = buildScopeOptions(contact);
+      const options = scopes;
       if (!options.length) {
         $('compose').replaceChildren(el('div', 'compose-disabled',
           el('span', '', '此 Bot 暂无获准项目范围，请先在 Bot 设置中授权。'),
@@ -1373,19 +1533,11 @@ export const chat = actions => {
       }
       const scopeSelect = el('select', '', ...options.map(o => Object.assign(el('option', '', o.name), { value: o.id })));
       scopeSelect.setAttribute('aria-label', '新话题所属范围');
-      scopeSelect.value = options.some(o => o.id === (state.project || '')) ? (state.project || '') : options[0].id;
+      permitted = options.some(o => o.id === (target.projectId || ''));
+      if (!permitted) scopeSelect.prepend(Object.assign(el('option', '', '请选择获准范围'), { value: '', disabled: true }));
+      scopeSelect.selectedIndex = permitted ? options.findIndex(o => o.id === (target.projectId || '')) : 0;
       scopeSelect.onchange = () => {
-        const nextProj = scopeSelect.value || '';
-        const targetKey = draftKeyFor(contact?.id || 'main', nextProj);
-        if (targetKey !== draftKey()) {
-          const nextDraft = getDraftByKey(targetKey);
-          nextDraft.text = draft.text;
-          nextDraft.files = [...draft.files];
-          nextDraft.refs = [...draft.refs];
-          nextDraft.modelId = draft.modelId;
-          drafts.delete(draftKey());
-        }
-        actions.openDraft(contact?.id || 'main', nextProj || undefined);
+        if (atTarget(target)) void actions.openDraft(target.instanceId, scopeSelect.value || undefined);
       };
       draftBar = el('div', 'draft-bar',
         el('span', '', ctx.isMain ? '新侧边会话草稿 · 首次发送时创建' : (contact?.name || '工作 Bot') + ' 新话题草稿 · 首次发送时创建'),
@@ -1412,7 +1564,7 @@ export const chat = actions => {
     );
 
     picker.onchange = () => {
-      draft.files.push(...Array.from(picker.files));
+      if (atTarget(target) && !input.readOnly) draft.files.push(...Array.from(picker.files));
       picker.value = '';
       renderFiles();
     };
@@ -1421,18 +1573,24 @@ export const chat = actions => {
       input.style.height = 'auto';
       input.style.height = Math.min(180, input.scrollHeight) + 'px';
     }
-    input.oninput = () => { draft.text = input.value; resizeInput(); };
+    input.oninput = () => {
+      if (!atTarget(target) || input.readOnly) return;
+      draft.text = input.value;
+      resizeInput();
+    };
     input.onpaste = event => {
       const pasted = Array.from(event.clipboardData?.files || []);
-      if (pasted.length) {
+      if (pasted.length && atTarget(target) && !input.readOnly) {
         draft.files.push(...pasted);
         renderFiles();
       }
     };
 
-    let busy = false;
+    const feedback = el('small', 'compose-feedback');
+    feedback.setAttribute('role', 'status');
+    const addAttachment = iconBtn('添加附件', () => picker.click(), 'clip');
     const send = btn('', async () => {
-      if (busy) return;
+      if (!atTarget(target) || draft.sending || !permitted) return;
       const text = input.value.trim();
       if (!text && !draft.files.length) {
         input.focus();
@@ -1443,68 +1601,108 @@ export const chat = actions => {
         input.focus();
         return;
       }
-      const risk = state.snapshot?.run?.recovery?.action === 'abandon' && !state.snapshot.run.modelSetup;
-      if (risk) {
-        const ok = await confirmDialog({
-          title: '确认继续发送',
-          body: '原生运行可能仍在执行，确认在当前会话继续发送？',
-          confirmLabel: '确认发送'
-        });
-        if (!ok) return;
+      const run = state.snapshot?.run;
+      const riskId = run?.recovery?.action === 'abandon' && !run.modelSetup ? run.id : null;
+      const inputFiles = [...draft.files];
+      const inputRefs = [...draft.refs];
+      const refs = inputRefs.map(({ type, id }) => ({ type, id }));
+      const modelId = target.instanceId === 'main' ? null : target.id ? state.snapshot.model?.selected ?? null : draft.modelId;
+      const signature = JSON.stringify([text, refs, modelId]);
+      let attempt = draft.attempt;
+      if (!attempt || attempt.signature !== signature || attempt.files.length !== inputFiles.length ||
+          !attempt.files.every((file, index) => file === inputFiles[index]) || (!attempt.submitted && attempt.riskId !== riskId)) {
+        attempt = { signature, files: inputFiles, riskId, requestId: crypto.randomUUID() };
+        draft.attempt = attempt;
       }
-
-      busy = true;
-      input.readOnly = true;
-      picker.disabled = true;
-      files.inert = true;
-
+      const { requestId } = attempt;
+      const pendingOrigin = draft.origin;
+      const originRequestId = draft.originRequestId;
+      let id = target.id || draft.pendingId;
+      let creating = false;
+      let created = false;
+      let sent = false;
+      draft.sending = true;
+      delete draft.error;
+      updateStatus();
       try {
-        const initialId = state.thread;
-        const projectId = state.snapshot?.thread?.projectId || state.project || undefined;
+        if (attempt.riskId && !attempt.acknowledged) {
+          const ok = await confirmDialog({
+            title: '确认继续发送',
+            body: '原生运行可能仍在执行，确认在「' + (t.title || '原会话') + '」继续发送？',
+            confirmLabel: '确认发送'
+          });
+          if (!ok) return;
+          attempt.acknowledged = true;
+        }
+        const projectId = target.projectId;
         const attachmentIds = [];
-        for (const f of draft.files) {
-          if (!f.uploadId) f.uploadId = (await upload(f, projectId)).id;
-          attachmentIds.push(f.uploadId);
+        for (const file of inputFiles) attachmentIds.push(await uploadedId(file, projectId));
+        if (!id && originRequestId) {
+          id = pendingOrigin ? await pendingOrigin : (await api('/threads', {
+            instanceId: target.instanceId, projectId: projectId || undefined, requestId: originRequestId
+          })).id;
+          draft.pendingId = id;
         }
-        const refs = draft.refs.map(({ type, id }) => ({ type, id }));
-        const fingerprint = JSON.stringify([text, attachmentIds, refs, draft.modelId || null]);
-        if (draft.fingerprint !== fingerprint) {
-          draft.fingerprint = fingerprint;
-          draft.requestId = crypto.randomUUID();
-        }
-        let id = initialId;
-        if (!id && state.draft) {
+        attempt.submitted = true;
+        if (!id) {
+          creating = true;
           const created = await api('/threads', {
-            instanceId: state.instance || 'main',
-            projectId,
-            modelId: (state.instance || 'main') !== 'main' && draft.modelId ? draft.modelId : undefined,
-            firstMessage: { text, refs, attachmentIds, requestId: draft.requestId },
-            requestId: draft.requestId
+            instanceId: target.instanceId, projectId: projectId || undefined, modelId: modelId || undefined,
+            firstMessage: { text, refs, attachmentIds, requestId }, requestId
           });
           id = created.thread.id;
         } else {
-          id = draft.pendingId || await ensureThread();
-          draft.pendingId = id;
           await api('/threads/' + url(id) + '/messages', {
-            text, refs, attachmentIds, requestId: draft.requestId, acknowledge: risk || undefined
+            text, refs, attachmentIds, requestId,
+            ...(target.instanceId !== 'main' ? { expectedModelId: modelId } : {}),
+            ...(attempt.acknowledged ? { acknowledge: true, acknowledgeRunId: attempt.riskId } : {})
           });
         }
-        drafts.delete(draftKey());
-        if (state.view === 'chat' && state.thread === initialId) {
-          await actions.load();
-          $('compose').dataset.key = '';
-          await actions.openThread(id);
-          if (state.thread === id && !$('dialog').open) $('input')?.focus({ preventScroll: true });
-        }
+        sent = true;
+        created = !target.id;
+        draft.unknownCreate = false;
+        if (draft.text.trim() === text) draft.text = '';
+        draft.files = draft.files.filter(file => !inputFiles.includes(file));
+        draft.refs = draft.refs.filter(ref => !inputRefs.includes(ref));
+        if (draft.modelId === modelId) draft.modelId = null;
+        delete draft.attempt;
+        if (drafts.get(target.key) === draft && !draft.text && !draft.files.length && !draft.refs.length && !draft.modelId) {
+          drafts.delete(target.key);
+        } else if (created) draft.pendingId = id;
+      } catch (error) {
+        draft.unknownCreate = creating && (!error.status || error.status >= 500);
+        if (error.status && error.status < 500) attempt.submitted = false;
+        draft.error = (error.message || '发送失败') + (draft.unknownCreate ? '。请重试同一条消息以确认结果。' : '');
       } finally {
-        busy = false;
-        input.readOnly = false;
-        picker.disabled = false;
-        files.inert = false;
+        draft.sending = false;
+        if (state.view === 'chat' && draftKey() === target.key && (sent || !input.isConnected)) {
+          $('compose').dataset.key = '';
+          draw();
+        } else if (input.isConnected) updateStatus();
+      }
+      if (!sent) return;
+      try {
+        if (created) await actions.load({ full: false, threadOwners: [target.instanceId] });
+        if (!atTarget(target)) return;
+        if (created) await actions.openThread(id);
+        else await actions.refresh();
+        if (state.view === 'chat' && state.thread === id && !$('dialog').open) $('input')?.focus({ preventScroll: true });
+      } catch (error) {
+        if (atTarget(target)) notice('消息已发送，刷新失败：' + error.message, 'error');
       }
     }, 'primary send', 'send');
     send.title = '发送';
     send.setAttribute('aria-label', '发送');
+
+    function updateStatus() {
+      input.readOnly = draft.sending || draft.unknownCreate || !permitted;
+      picker.disabled = addAttachment.disabled = input.readOnly;
+      files.inert = input.readOnly;
+      send.disabled = Boolean(draft.sending || !permitted);
+      send.setAttribute('aria-busy', String(Boolean(draft.sending)));
+      feedback.textContent = draft.sending ? '正在发送…' : draft.error || '';
+      feedback.hidden = !feedback.textContent;
+    }
 
     input.onkeydown = e => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
@@ -1519,8 +1717,9 @@ export const chat = actions => {
       el('div', 'composer-inner',
         files,
         input,
+        feedback,
         el('div', 'composer-bar',
-          iconBtn('添加附件', () => picker.click(), 'clip'),
+          addAttachment,
           picker,
           el('small', 'key-hint', 'Enter 发送 · Shift + Enter 换行'),
           send
@@ -1534,13 +1733,14 @@ export const chat = actions => {
       e.preventDefault();
       composerBox.classList.remove('drag-over');
       const dropped = Array.from(e.dataTransfer?.files || []);
-      if (dropped.length) {
+      if (dropped.length && atTarget(target) && !input.readOnly) {
         draft.files.push(...dropped);
         renderFiles();
       }
     };
 
     $('compose').replaceChildren(composerBox);
+    updateStatus();
     if (draft.text) resizeInput();
   }
 
@@ -1563,6 +1763,7 @@ export const chat = actions => {
     replaceNative,
     markNativeInvalid,
     preview,
-    seedReferences: (id, refs) => drafts.set(id, { text: '', files: [], refs: [...refs], modelId: null })
+    clearPreview,
+    seedReferences: (id, refs) => { getDraftByKey(id).refs.push(...refs); }
   };
 };

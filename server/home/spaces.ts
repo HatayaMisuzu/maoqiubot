@@ -241,7 +241,6 @@ function editStructure(db:DB,space:Space,ops:any[],h:Hooks) {
           for(const e of readEntries(db,c.id)){
             const values={...(migrated.get(e.id)?.values ?? e.values)};
             if(values[f.id]==null) continue;
-            if(Object.hasOwn(op.entryRevisions??{},e.id))revision(e.revision,op.entryRevisions[e.id],visibleEntry(e,new Map(c.fields.map(f=>[f.id,f.type])),h));
             if(f.type!==replacement.type) {
               if(!op.migration || !Object.hasOwn(op.migration,e.id)) fail(409,'字段迁移需要为每个现有条目指定新值');
               values[f.id]=op.migration[e.id];
@@ -249,7 +248,10 @@ function editStructure(db:DB,space:Space,ops:any[],h:Hooks) {
               values[f.id]=op.migration[e.id];
             }
             valueOk(values[f.id],replacement,h);
-            migrated.set(e.id,{id:e.id,values});
+            if(JSON.stringify(values[f.id])!==JSON.stringify(e.values[f.id])) {
+              revision(e.revision,op.entryRevisions?.[e.id],visibleEntry(e,new Map(c.fields.map(f=>[f.id,f.type])),h));
+              migrated.set(e.id,{id:e.id,values});
+            }else migrated.delete(e.id);
           }
         }
         c.fields[c.fields.indexOf(f)]=replacement; break;
@@ -378,7 +380,6 @@ function restoreSpace(db:DB,s:Space,h:Hooks,b:any){
       const entries=readEntries(db,c.id),types=entryFields(db,s,s.structure.collections.find(x=>x.id===c.id)??{...c,fields:[]},entries);
       for(const e of entries){
         const edits=replacements[e.id], values={...e.values};
-        if(Object.hasOwn(b.entryRevisions??{},e.id))revision(e.revision,b.entryRevisions[e.id],visibleEntry(e,types,h));
         let changed=false;
         for(const f of c.fields) {
           if(Object.hasOwn(edits??{},f.id)){
@@ -391,7 +392,12 @@ function restoreSpace(db:DB,s:Space,h:Hooks,b:any){
             valueOk(values[f.id],f);
           }catch { conflicts.push({collectionId:c.id,entryId:e.id,entryRevision:e.revision,fieldId:f.id}); }
         }
-        if(changed)migrations.push({id:e.id,values});
+        if(changed) {
+          if(JSON.stringify(values)!==JSON.stringify(e.values)) {
+            revision(e.revision,b.entryRevisions?.[e.id],visibleEntry(e,types,h));
+          }
+          migrations.push({id:e.id,values});
+        }
       }
     }
   }

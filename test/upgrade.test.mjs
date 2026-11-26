@@ -17,7 +17,7 @@ import { Store } from '../connector/store.ts'
 import { transfer } from '../scripts/backup.ts'
 import { hash } from '../server/api/auth.ts'
 import { addressAllowed, checkedAddresses, readHttp } from '../server/plugins/http.ts'
-import { extractHtml } from '../plugins/web/index.ts'
+import { extractHtml, readPage, search } from '../plugins/web/index.ts'
 import { fileURLToPath } from 'node:url'
 
 async function eventually(fn){
@@ -322,9 +322,18 @@ test('网页读取限制公开地址与重定向，声明式业务 API 和 SearX
   for(const ip of ['127.0.0.1','0.0.0.0','169.254.169.254','198.18.0.1','::1','::ffff:10.1.2.3','fe80::1']){
     assert.equal(addressAllowed(ip,'public'),false,ip)
   }
+  assert.equal(addressAllowed('8.8.8.8','lan'),false)
+  assert.equal(addressAllowed('8.8.8.8','api'),true)
+  assert.equal(addressAllowed('10.0.0.2','lan'),true)
+  const webContext={actor:'user',threadId:'fixture',messageId:'fixture',projectId:null,
+    signal:new AbortController().signal,maxResultBytes:4000,requestText:'核对公开资料',authorizedDestinations:[]}
+  await assert.rejects(search({}, {query:'https://example.org/search?api_key=fixture-secret'},webContext),/凭据/)
+  await assert.rejects(readPage({},'https://example.org/source?access%255ftoken%253Dfixture-secret',800,webContext,true),/凭据/)
   const publicUrl=new URL('https://example.org/')
   await assert.rejects(checkedAddresses(publicUrl,'public',async()=>[
     {address:'8.8.8.8',family:4},{address:'10.0.0.2',family:4}]),/不可访问/)
+  await assert.rejects(checkedAddresses(new URL('https://searx.example/'),'lan',async()=>[
+    {address:'8.8.8.8',family:4}]),/私网地址|关闭局域网选项/)
   const article=extractHtml('<html><head><title>验收文章</title></head><body><nav>菜单内容</nav><article><p>'+
     '独立正文内容 '.repeat(100)+'</p><p><a href="/more">后续资料</a><a href="javascript:alert(1)">坏链接</a></p>'+
     '<script>SHOULD_NOT_APPEAR</script></article></body></html>','https://example.org/article')
@@ -423,6 +432,7 @@ test('网页研究经环境代理核对 robots、正文和后续链接，后续�
       return
     }
     if(req.url==='/source'||req.url==='/next'){res.writeHead(200,{'Content-Type':'text/plain'}).end('源证据 '+req.url);return}
+    if(req.url==='/credential-redirect'){res.writeHead(302,{Location:publicOrigin+'/next?access_token=fixture-secret'}).end();return}
     res.writeHead(302,{Location:'http://127.0.0.1/admin'}).end()
   }).listen(0,'127.0.0.1')
   await once(target,'listening')
@@ -464,6 +474,9 @@ test('网页研究经环境代理核对 robots、正文和后续链接，后续�
   assert.match((await replyTo(api,thread.id,next.messageId)).text,/源证据 \/next/)
   const redirect=await api('/chat/plugins',{action:'test',id:'web',input:{kind:'read',value:publicOrigin+'/redirect'}},{status:403})
   assert.match(redirect.error,/授权范围|不可访问/)
+  const credentialRedirect=await api('/chat/plugins',{action:'test',id:'web',input:{kind:'read',value:publicOrigin+'/credential-redirect'}},{status:403})
+  assert.match(credentialRedirect.error,/凭据/)
+  assert.ok(flows.every(([path])=>!path.includes('fixture-secret')))
   assert.ok(flows.every(([path])=>path!=='/admin'))
   assert.ok(seen.length>=6)
   assert.ok(seen.every(([host,auth])=>host==='93.184.215.14:80'&&auth==='Basic '+Buffer.from('proxy-user:proxy-pass').toString('base64')))
@@ -488,6 +501,12 @@ test('非项目通信令牌只能报告本运行，重要消息幂等入队且�
   await api('/runs/a-different-run/communication',body,{token,status:403})
   await api(path,{kind:'progress',text:'已开始',requestId:'non-project-progress'},{token})
   assert.equal(count(),0)
+  app.db.prepare("UPDATE runs SET status='cancelling' WHERE id=?").run(run.id)
+  assert.equal((await api(path,{kind:'progress',text:'正在停止',requestId:'during-cancel'},{token})).status,'recorded')
+  assert.equal(count(),0)
+  app.db.prepare("UPDATE runs SET status='cancelled' WHERE id=?").run(run.id)
+  await api(path,{kind:'progress',text:'终态后迟到',requestId:'after-terminal'},{token,status:401})
+  app.db.prepare("UPDATE runs SET status='running' WHERE id=?").run(run.id)
   const report=await api(path,body,{token})
   assert.deepEqual(await api(path,body,{token}),report)
   assert.equal(count(),1)
@@ -802,6 +821,41 @@ test('主聊使用宿主工具保存长期记忆，权限可撤销，遗忘使�
   assert.ok((await api('/threads/'+thread.id)).messages.some(m=>m.text.includes('偏好使用黑胶')))
 })
 
+test('兼容模型仅接收当前配置允许共享的历史和用户明确附加的资料',async t=>{
+  const calls=[]
+  const endpoint=await modelEndpoint(t,(_req,_res,input,json)=>{
+    calls.push(inputContext(input))
+    json(modelChoice('合成回复'))
+  })
+  const {api}=await server(t,{chat:true})
+  const project=await api('/projects',{name:'共享测试项目'})
+  const cases=[
+    {sharePersonal:false,shareAttachments:false},
+    {sharePersonal:false,shareAttachments:true},
+    {sharePersonal:true,shareAttachments:false},
+    {sharePersonal:true,shareAttachments:true},
+    {shareProject:false,shareAttachments:true,projectId:project.id},
+    {shareProject:true,shareAttachments:true,projectId:project.id}
+  ]
+  for(const [index,{projectId,...settings}] of cases.entries()){
+    await configure(api,endpoint,settings)
+    const thread=await api('/threads',{title:'隔离共享 '+index,projectId})
+    const path='/threads/'+thread.id+'/messages'
+    const previous='ONLY_PREVIOUS_HISTORY_'+index
+    const old=await api(path,{text:previous})
+    await replyTo(api,thread.id,old.messageId)
+    const explicit='EXPLICIT_ATTACHMENT_'+index
+    const attachment=await api('/attachments',{name:'fixture.txt',contentType:'text/plain',projectId,data:Buffer.from(explicit).toString('base64')})
+    const current='CURRENT_USER_INPUT_'+index
+    const sent=await api(path,{text:current,attachmentIds:[attachment.id]})
+    await replyTo(api,thread.id,sent.messageId)
+    const context=calls.find(call=>call.currentUserRequest===current)
+    assert.ok(context)
+    assert.equal(JSON.stringify(context).includes(previous),Boolean(projectId?settings.shareProject:settings.sharePersonal))
+    assert.equal(context.attachments.some(file=>file.text===explicit),Boolean(settings.shareAttachments&&(!projectId||settings.shareProject)))
+  }
+})
+
 test('同项目的 Bot 澄清、转达、交接、接手、交付和用户验收保留真实主体及回执',async t=>{
   let question,firstTask,archive,modelCalls=0
   const tool=(name,args)=>JSON.stringify({action:'tool',tool:name,arguments:JSON.stringify(args)})
@@ -906,7 +960,7 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   await once(socket,'open')
   socket.send(JSON.stringify({type:'hello',receiptLookup:true,instances:[
     {id:'codex-catalog',name:'Codex',workspaceRef:f.dir,adapterKey:'codex',profileId:'native-profile',
-      availableActions:['run','prepare'],history:true,sessionList:true},
+      availableActions:['run','prepare'],history:true,sessionList:true,nativeBindingRelease:true},
     {id:'dsh-no-catalog',name:'DSH',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare']},
     {id:'dsh-list-only',name:'DSH 只读',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare'],sessionList:true,sessionImport:false}
   ]}))
@@ -955,6 +1009,31 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   const next=await eventually(()=>frames.find(f=>f.command?.runId===followup.runId)?.command)
   assert.equal(next.payload.sessionId,'existing-native')
   assert.equal(next.payload.communication.sender.kind,'user')
+  for(const [seq,kind,data] of [[1,'accepted',{sessionId:'existing-native',nativeRunId:'followup-turn'}],[2,'completed',{sessionId:'existing-native',text:'续接完成'}]]){
+    const key='native-followup-'+seq
+    socket.send(JSON.stringify({type:'event',event:{seq,key,kind,data,instanceId:next.instanceId,runId:next.runId,commandId:next.id}}))
+    await eventually(()=>frames.some(frame=>frame.type==='ack'&&frame.key===key))
+  }
+  await api('/threads/'+first.thread.id+'/lifecycle',{action:'delete'})
+  await api('/threads/'+first.thread.id+'/lifecycle',{action:'purge',confirm:true})
+  assert.equal((await api('/threads?instanceId=codex-catalog&state=purged')).find(thread=>thread.id===first.thread.id).sessionId,'existing-native')
+  const releaseRequest=await api('/threads/'+first.thread.id+'/lifecycle',{action:'releaseNative',confirm:true,sessionId:'existing-native'})
+  const release=await eventually(()=>frames.find(frame=>frame.type==='command'&&frame.command?.payload?.nativeOperation?.action==='release')?.command)
+  assert.equal(release.payload.nativeOperation.sourceThreadId,first.thread.id)
+  assert.deepEqual((await api('/threads/'+first.thread.id+'/impact')).nativeRelease,{runId:releaseRequest.runId,status:'queued'})
+  await api('/runs/'+release.runId+'/commands',{kind:'cancel'},{status:409})
+  await api('/runs/'+release.runId+'/recovery',{action:'abandon',acknowledge:true,reason:'旧解绑测试'},{status:409})
+  const releaseKey='native-release-1'
+  socket.send(JSON.stringify({type:'event',event:{seq:1,key:releaseKey,kind:'completed',
+    data:{sessionId:'existing-native',nativeAction:'release',released:true},instanceId:release.instanceId,runId:release.runId,commandId:release.id}}))
+  await eventually(()=>frames.some(frame=>frame.type==='ack'&&frame.key===releaseKey))
+  assert.deepEqual((await api('/threads/'+first.thread.id+'/impact')).nativeRelease,{runId:releaseRequest.runId,status:'completed'})
+  assert.deepEqual((await api(endpoint+'?projectId='+p.id)).items,[{id:'existing-native',title:'现有原生会话',updatedAt:150,active:false}])
+  assert.deepEqual((await api(endpoint+'?projectId='+another.id)).items,[])
+  await api(endpoint,{sessionId:'existing-native',title:'越范围导入',projectId:another.id},{status:409})
+  const reimport=await api(endpoint,{sessionId:'existing-native',title:'重新导入原生会话',projectId:p.id})
+  assert.notEqual(reimport.thread.id,first.thread.id)
+  assert.equal(reimport.thread.sessionId,null)
 })
 
 test('活动中备份恢复进入待核对，停机检查与附件摘要阻止错误恢复',async t=>{
@@ -1020,7 +1099,8 @@ test('重连先查回执，撤权后不重发旧正文，放弃不把迟到事�
   const held=(await api(path)).commands.find(command=>command.status==='held')
   const controls='/runs/'+pending.runId+'/commands'
   await api(controls,{kind:'resume',commandId:held.id},{status:409})
-  const continued=await api(controls,{kind:'resume',commandId:held.id,acknowledge:true})
+  await api(controls,{kind:'resume',commandId:held.id,acknowledge:true,acknowledgeRunId:'stale-run'},{status:409})
+  const continued=await api(controls,{kind:'resume',commandId:held.id,acknowledge:true,acknowledgeRunId:pending.runId})
   const fresh=await n.command(continued.runId)
   await n.event(sent,'completed',{text:'迟到的旧完成'})
   assert.ok((await api(path)).messages.some(m=>m.kind==='late_evidence'))
@@ -1194,7 +1274,7 @@ test('中文检索分页与 ACL 生效，空间恢复保留条目并可显式转
   const first=await api(entries,{values:{title:'2'}})
   await api(space+'/changes',{expectedRevision:1,mode:'apply',operations:[
     {op:'updatePage',pageId:p.pageId,title:'更新后'},
-    {op:'updateField',collectionId:c.id,fieldId:'title',field:{type:'number'},migration:{[first.id]:2}}
+    {op:'updateField',collectionId:c.id,fieldId:'title',field:{type:'number'},migration:{[first.id]:2},entryRevisions:{[first.id]:first.revision}}
   ]})
   const later=await api(entries,{values:{title:3}})
   const layout={expectedRevision:2,targetRevision:1,scope:'layout'}
@@ -1206,7 +1286,13 @@ test('中文检索分页与 ACL 生效，空间恢复保留条目并可显式转
   const historical={expectedRevision:3,targetRevision:1,scope:'structure'}
   assert.equal((await api(space+'/restore',{...historical,mode:'preview'})).conflicts.length,2)
   await api(space+'/restore',historical,{status:409})
-  await api(space+'/restore',{...historical,migrations:{[first.id]:{title:'二'},[later.id]:{title:'三'}}})
+  const restorePreview=await api(space+'/restore',{...historical,mode:'preview'})
+  const entryRevisions=Object.fromEntries(restorePreview.conflicts.map(conflict=>[conflict.entryId,conflict.entryRevision]))
+  const migrations={[first.id]:{title:'二'},[later.id]:{title:'三'}}
+  await api(space+'/restore',{...historical,migrations},{status:400})
+  await api(space+'/restore',{...historical,migrations,entryRevisions:{...entryRevisions,[first.id]:0}},{status:409})
+  assert.deepEqual((await api(entries)).items.map(entry=>entry.values.title),[2,3])
+  await api(space+'/restore',{...historical,migrations,entryRevisions})
   assert.deepEqual((await api(entries)).items.map(e=>e.values.title),['二','三'])
 })
 
@@ -1310,7 +1396,7 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
   legacyConnector.close()
   for(let i=0;i<2;i++){
     const migrated=openDatabase(old)
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,7)
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,9)
     assert.equal(migrated.prepare('SELECT sessionId FROM threads WHERE id=?').get('old-thread').sessionId,'old-session')
     assert.equal(migrated.prepare('SELECT count(*) n FROM run_grants').get().n,0)
     assert.ok(Date.parse(migrated.prepare('SELECT expiresAt FROM grants').get().expiresAt)>Date.now())
@@ -1318,13 +1404,21 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
     assert.equal(result.items[0].id,source.sourceId)
     migrated.close()
     const store=new Store(join(connector,'connector.sqlite'))
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version,1)
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version,2)
     assert.equal(store.db.prepare('SELECT session FROM bindings').get().session,'old-session')
     store.db.close()
   }
   writeFileSync(join(old,'persona.md'),'测试人格')
+  const legacyCache=new DatabaseSync(join(old,'workbench.sqlite'))
+  legacyCache.prepare('INSERT INTO requests VALUES(?,?,?,?)').run('fixture','old-grant','old-signature',
+    JSON.stringify({token:'fixture-old-grant-token',projectId:p.id,expiresAt:'future'}))
+  legacyCache.close()
   const backup=join(root,'backup'),restored=join(root,'restored')
   transfer(old,backup,false,{connectorDir:connector})
+  const backupDb=new DatabaseSync(join(backup,'workbench.sqlite'),{readOnly:true})
+  assert.deepEqual(JSON.parse(backupDb.prepare("SELECT result FROM requests WHERE requestId='old-grant'").get().result),{_sensitiveResult:'grant-token'})
+  backupDb.close()
+  assert.equal(readFileSync(join(backup,'workbench.sqlite')).includes(Buffer.from('fixture-old-grant-token')),false)
   assert.throws(()=>transfer(backup,old,true),/尚未存在/)
   transfer(backup,restored,true)
   assert.equal(readFileSync(join(restored,'persona.md'),'utf8'),'测试人格')

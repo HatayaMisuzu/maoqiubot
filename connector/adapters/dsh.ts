@@ -163,29 +163,29 @@ export class Dsh extends Native implements Adapter {
   }
   async run(run:Run,input:Input) {
     this.reportModels(run)
-    const selected=run.command.payload.modelId
-    if(selected){
-      try{
-        await this.setModel(run.sessionId,selected)
-        if(this.describeModels(run.sessionId).current!==selected)throw Error('原生会话已更新模型')
-      }catch(err){
-        this.reportModels(run)
-        throw Object.assign(new Error('未开始运行，DSH 模型切换失败：'+(err as Error).message),{code:-32602})
-      }
-      this.reportModels(run)
-    }
-    if(this.cancelBeforePrompt.delete(run.command.runId)){
-      run.emit('cancelled',{text:'提示尚未发送时运行已取消',sessionId:run.sessionId})
-      return
-    }
-    const prompt:any[]=[{type:'text',text:input.text}]
-    for(const file of input.files) {
-      if(this.images && file.mime.startsWith('image/'))
-        prompt.push({type:'image',mimeType:file.mime,data:readFileSync(file.path).toString('base64')})
-      else prompt.push({type:'resource_link',name:file.name,uri:pathToFileURL(file.path).href,mimeType:file.mime})
-    }
-    this.active.set(run.sessionId,run)
     try {
+      const selected=run.command.payload.modelId
+      if(selected){
+        try{
+          await this.setModel(run.sessionId,selected)
+          if(this.describeModels(run.sessionId).current!==selected)throw Error('原生会话已更新模型')
+        }catch(err){
+          this.reportModels(run)
+          throw Object.assign(new Error('未开始运行，DSH 模型切换失败：'+(err as Error).message),{code:-32602})
+        }
+        this.reportModels(run)
+      }
+      if(this.cancelBeforePrompt.delete(run.command.runId)){
+        run.emit('cancelled',{text:'提示尚未发送时运行已取消',sessionId:run.sessionId})
+        return
+      }
+      const prompt:any[]=[{type:'text',text:input.text}]
+      for(const file of input.files) {
+        if(this.images && file.mime.startsWith('image/'))
+          prompt.push({type:'image',mimeType:file.mime,data:readFileSync(file.path).toString('base64')})
+        else prompt.push({type:'resource_link',name:file.name,uri:pathToFileURL(file.path).href,mimeType:file.mime})
+      }
+      this.active.set(run.sessionId,run)
       const result=await this.rpc.request('session/prompt',{sessionId:run.sessionId,prompt},0,()=>{
         run.emit('activity',{sessionId:run.sessionId,controlReady:true,text:'已写入原生 ACP 提示'})
       })
@@ -196,6 +196,7 @@ export class Dsh extends Native implements Adapter {
     } finally {
       this.flush(run)
       this.accepted.delete(run.command.runId)
+      this.cancelBeforePrompt.delete(run.command.runId)
       this.finish(run)
     }
   }

@@ -10,12 +10,18 @@ export async function extensions(back) {
     ...state.plugins.map(p => {
       const current = p.current;
       const pending = p.pending;
+      const manifest = current?.manifest || pending?.manifest;
+      const types = [
+        manifest?.entry ? '可执行 JavaScript 扩展' : null,
+        manifest?.httpTools?.length ? '声明式 API 工具' : null,
+        manifest?.skills?.length ? 'Skill 文档' : null
+      ].filter(Boolean);
       return el('article', 'record',
         el('div', 'record-head',
           el('strong', '', current?.manifest.name || pending?.manifest.name || p.id),
           el('span', 'badge ' + (p.loaded ? 'online' : ''), p.loaded ? '已加载' : p.enabled ? '等待加载' : '已停用')
         ),
-        el('small', 'muted', [current?.manifest.version, current?.source, current?.projectId].filter(Boolean).join(' · ')),
+        el('small', 'muted', [...types, current?.manifest.version, current?.source, current?.projectId].filter(Boolean).join(' · ')),
         pending ? el('small', 'muted', '待审查 ' + pending.manifest.version) : null,
         p.error ? el('p', 'form-err', p.error) : null,
         p.restartRequired ? el('small', 'muted', '外部代码的进程级效果须重启工作台清理。') : null,
@@ -46,7 +52,10 @@ export async function extensions(back) {
     })
   ];
 
-  displayDialog('插件与 Skill', body, [
+  displayDialog('插件与 Skill', [
+    el('p', 'muted', 'Skill 是供模型读取的文档。声明式 API 按固定参数向配置的服务发送请求。可执行 JavaScript 扩展运行在工作台宿主进程中，并继承其本机权限。'),
+    ...body
+  ], [
     btn('导入目录或 ZIP', () => importLocal(back), 'primary'),
     btn('导入固定 Git 提交', () => importGit(back), 'secondary'),
     btn('添加声明式 API', () => apiTool(back), 'secondary'),
@@ -123,17 +132,9 @@ async function review(p, version, canActivate = true, back) {
     ...files
   ], [
     canActivate ? btn(mode === 'rollback' ? '确认回滚' : '确认启用', async () => {
-      const action = mode === 'rollback' ? '回滚' : '启用';
-      const ok = await confirmDialog({
-        title: action + '扩展',
-        body: action + ' ' + manifest.name + ' ' + manifest.version +
-          (hasCode ? '，授予本机代码执行权限' : '') +
-          (hasNetwork ? '，允许清单声明的网络能力' : '') + '？',
-        confirmLabel: '确认' + action,
-        destructive: hasCode
-      });
-      if (!ok) { await review(p, version, canActivate, back); return; }
-      await plug({ action: mode, id: p.id, digest: data.digest, trustCode: hasCode, allowNetwork: hasNetwork });
+      const authorization = await choosePluginAuthorization(manifest, data, mode);
+      if (!authorization) { await review(p, version, canActivate, back); return; }
+      await plug({ action: mode, id: p.id, digest: data.digest, ...authorization });
       await extensions(back);
     }, 'primary') : null,
     version !== 'previous' ? btn('静态验证', async () => {
@@ -152,13 +153,58 @@ async function review(p, version, canActivate = true, back) {
   ], { back: () => extensions(back), wide: true });
 }
 
+function choosePluginAuthorization(manifest, data, mode) {
+  const hasCode = Boolean(manifest.entry && data.source !== 'bundled');
+  const hasNetwork = manifest.capabilities.some(capability => capability.startsWith('network.'));
+  const trust = el('input');
+  trust.type = 'checkbox';
+  const network = el('input');
+  network.type = 'checkbox';
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const buttons = [];
+    buttons.push(btn('取消', () => {
+      $('dialog').close();
+      finish(null);
+    }, 'ghost'));
+    buttons.push(btn(mode === 'rollback' ? '授权并回滚' : '授权并启用', () => {
+      if (hasCode && !trust.checked || hasNetwork && !network.checked) {
+        notice('请分别勾选需要授予的权限');
+        return;
+      }
+      $('dialog').close();
+      finish({ trustCode: trust.checked, allowNetwork: network.checked });
+    }, 'primary'));
+    const dialog = displayDialog(mode === 'rollback' ? '确认插件回滚' : '确认插件授权', [
+      el('p', 'text', manifest.name + ' ' + manifest.version),
+      el('p', 'muted', 'SHA-256 · ' + data.digest),
+      el('p', 'muted', '声明能力 · ' + manifest.capabilities.join('、')),
+      data.addedCapabilities.length ? el('p', 'muted', '新增能力 · ' + data.addedCapabilities.join('、')) : null,
+      hasCode ? el('p', 'form-err', '可执行代码会继承工作台宿主进程的本机权限。静态检查不能证明代码安全。') : null,
+      hasNetwork ? el('p', 'muted', '网络能力会允许插件向其实现或配置的网络服务发送请求。') : null,
+      hasCode ? el('label', 'field', trust, el('span', 'field-label', '我已审查此摘要版本的代码，并授权其执行')) : null,
+      hasNetwork ? el('label', 'field', network, el('span', 'field-label', '我授权此摘要版本使用声明的网络能力')) : null,
+      ...data.files.map(file => el('details', 'fold-card',
+        el('summary', '', file.path),
+        file.before ? el('div', 'muted', el('strong', '', '之前'), el('pre', 'text', file.before)) : null,
+        file.after ? el('div', '', el('strong', '', '新版本'), el('pre', 'text', file.after)) : null))
+    ], buttons, { wide: true }).dialog;
+    dialog.addEventListener('close', () => finish(null), { once: true });
+  });
+}
+
 function configure(p, back) {
   const web = p.id === 'web';
   const fields = web ? [
     { key: 'provider', label: '搜索服务', options: [{ id: '', name: '仅网页读取' }, { id: 'brave', name: 'Brave Search' }, { id: 'searxng', name: 'SearXNG' }], value: p.config.provider || '' },
     { key: 'endpoint', label: 'SearXNG JSON 搜索端点', value: p.config.endpoint, placeholder: 'https://example.org/search' },
     { key: 'keyEnv', label: 'Brave 密钥的环境变量名', value: p.config.keyEnv, placeholder: 'MAOQIU_PLUGIN_KEY_BRAVE' },
-    { key: 'privateLan', label: '允许连接指定局域网 SearXNG', options: [{ id: 'off', name: '关闭' }, { id: 'on', name: '开启（HTTP 为明文）' }], value: p.config.privateLan ? 'on' : 'off' },
+    { key: 'privateLan', label: '允许连接指定局域网 SearXNG', options: [{ id: 'off', name: '关闭' }, { id: 'on', name: '仅访问私网目标，HTTP 为明文' }], value: p.config.privateLan ? 'on' : 'off' },
     { key: 'proxy', label: '公开网页代理', options: [{ id: 'environment', name: '使用代理设置或环境变量' }, { id: 'direct', name: '始终直连' }], value: p.config.proxy || 'environment' },
     { key: 'proxyUrl', label: 'HTTP CONNECT 代理地址（可选）', value: p.config.proxyUrl, placeholder: 'http://127.0.0.1:7890' },
     { key: 'language', label: '默认语言', value: p.config.language },

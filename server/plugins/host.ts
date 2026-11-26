@@ -267,6 +267,9 @@ export function pluginHost(dir:string){
   async function manage(body:any,signal:AbortSignal){
     return exclusive(async()=>{
       signal.throwIfAborted()
+      if(['activate','rollback'].includes(body.action)&&body.expectedRevision!==undefined&&
+        (!Number.isSafeInteger(body.expectedRevision)||body.expectedRevision!==state.revision))
+        fail('插件授权发生变化，请重新审查并确认',409)
       if(body.action==='stage'){
         if(body.github){
           const repo=required(body.github,'GitHub 仓库'),commit=required(body.commit,'Git commit')

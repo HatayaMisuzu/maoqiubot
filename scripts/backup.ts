@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import {resolve,join,basename,dirname,relative,isAbsolute,sep} from 'node:path'
 import {pathToFileURL} from 'node:url'
 import { tree,writeTree } from '../server/plugins/files.ts'
+import { scrubCachedGrantTokens } from '../server/db/index.ts'
 
 type Options={connectorDir?:string,connectorConfig?:string,offline?:boolean,includeAccess?:boolean}
 const fileDigest=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -57,6 +58,10 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
         throw Error('仍有待处理运行或主聊，请在结束或人工放弃后执行停机备份')
       if(table(snap,'run_grants'))snap.exec('DELETE FROM run_grants')
       if(table(snap,'communication_grants'))snap.exec('DELETE FROM communication_grants')
+      if(table(snap,'requests')){
+        snap.exec('PRAGMA secure_delete=ON')
+        scrubCachedGrantTokens(snap)
+      }
       if(restore){
         // An online or older snapshot may predate a durable receipt on the connector.
         snap.exec(`UPDATE commands SET status='uncertain',detail='从备份恢复，原生送达需核对'

@@ -11,7 +11,32 @@ type Config={provider?:'brave'|'searxng';endpoint?:string;keyEnv?:string;private
 const reference=(url:string,title:string,retrievedAt:string):ToolReference=>({
   id:'web-'+createHash('sha256').update(url).digest('hex').slice(0,16),url,title,retrievedAt})
 const text=(value:unknown,max:number)=>typeof value==='string'?value.replace(/\s+/g,' ').trim().slice(0,max):''
-function publicLink(value:unknown,base?:string){
+function containsCredential(value:string){
+  const candidates=[value]
+  let decoded=value
+  for(let i=0;i<2;i++){
+    try{decoded=decodeURIComponent(decoded)}catch{break}
+    candidates.push(decoded)
+  }
+  const markers=['-----begin ', 'sk-', 'ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'akia']
+  const credentialNames=['api_key','api-key','api key','access_token','access-token','access token',
+    'refresh_token','refresh-token','authorization','password','passwd','secret','密码','密钥','token']
+  for(const candidate of candidates){
+    const normalized=candidate.toLowerCase()
+    if(markers.some(marker=>normalized.includes(marker)))return true
+    for(const name of credentialNames){
+      const start=normalized.indexOf(name)
+      if(start<0)continue
+      const tail=normalized.slice(start+name.length).trimStart()
+      if((tail.startsWith('=')||tail.startsWith(':'))&&tail.slice(1).trimStart().replace(/^["']/, '').split(/[&\s"'<>]/,1)[0])return true
+    }
+  }
+  try{
+    const url=new URL(value)
+    return [...url.searchParams].some(([name,entry])=>
+      credentialNames.includes(name.toLowerCase().replace(/[- ]/g,'_'))&&entry.length>0)
+  }catch{return false}
+}function publicLink(value:unknown,base?:string){
   if(typeof value!=='string')return
   try{return networkUrl(new URL(value,base).href,'public').href}catch{}
 }
@@ -21,7 +46,7 @@ const proxyOptions=(config:Config)=>({proxy:config.proxy??'environment',proxyUrl
 export async function search(config:Config,a:Record<string,unknown>,ctx:ToolContext){
   const query=asString(a,'query')?.trim()
   if(ctx.actor!=='user'||!query||!ctx.requestText?.trim())fail('公开搜索需要真实用户请求',403)
-  if(/-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{16,}|github_pat_[\w]{16,}|AKIA[A-Z0-9]{16})\b|(?:api[_ -]?key|access[_ -]?token|password|密码|密钥)\s*[:=]\s*\S+|https?:\/\/[^/\s]+:[^/\s]+@/i.test(query))
+  if(containsCredential(query))
     fail('公开检索词中疑似包含凭据，请删去后重试',403)
   const provider=config.provider
   if(!provider)fail('请在网页插件设置里配置 Brave Search 或 SearXNG',409)
@@ -93,13 +118,17 @@ export function extractHtml(html:string,url:string){
 }
 export async function readPage(config:Config,value:string,maxChars:number,ctx:ToolContext,explicit=false){
   const url=networkUrl(value,'public')
+  if(containsCredential(url.href))fail('网页地址中的凭据不可发送',403)
   if(!explicit&&!ctx.authorizedDestinations.includes(url.href)&&!ctx.requestText?.includes(value))
     fail('只读取用户提供或当前研究已发现的公开网页',403)
   const started=Date.now()
   const signal=AbortSignal.any([ctx.signal,AbortSignal.timeout(config.timeoutMs??12000)])
   await checkRobots(url,signal,config)
   const res=await readHttp(url.href,{network:'public',signal,...proxyOptions(config),redirects:4,maxBytes:2*1024*1024,
-    beforeRedirect:(target,redirectSignal)=>checkRobots(target,redirectSignal,config),
+    beforeRedirect:async(target,redirectSignal)=>{
+      if(containsCredential(target.href))fail('重定向地址中的凭据不可发送',403)
+      await checkRobots(target,redirectSignal,config)
+    },
     headers:{accept:'text/html,text/plain,application/json;q=0.8'}})
   if(res.status!==200)fail('网页返回 HTTP '+res.status,502)
   const mime=res.type.split(';')[0].trim().toLowerCase()

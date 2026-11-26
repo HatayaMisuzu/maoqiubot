@@ -1,0 +1,46 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test from 'node:test';
+import { grantFiles } from '../connector/grant-files.ts';
+
+test('connector credential cleanup isolates live grants and removes only expired orphaned files', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'maoqiu-grant-test-'));
+  const root = join(dir, 'connector-grants');
+  const grants = grantFiles(root);
+  const live = grants.create();
+  const second = grants.create();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  live.write('project.json', { token: 'synthetic-first' });
+  second.write('communication.json', { token: 'synthetic-second' });
+  assert.throws(() => second.write('communication.json', { token: 'synthetic-third' }), { code: 'EEXIST' });
+  live.dispose();
+  live.dispose();
+  assert.equal(existsSync(live.dir), false);
+  assert.equal(existsSync(second.dir), true);
+
+  const script = `import { grantFiles } from './connector/grant-files.ts';
+    const item = grantFiles(process.argv[1]).create();
+    item.write('communication.json', { token: 'synthetic-orphan' });
+    process.stdout.write(item.dir);`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script, root], { windowsHide: true });
+  let orphan = '';
+  child.stdout.on('data', value => { orphan += value; });
+  assert.equal((await once(child, 'close'))[0], 0);
+  assert.ok(existsSync(orphan));
+  grants.sweep();
+  assert.ok(existsSync(orphan));
+  const extra = join(orphan, 'unrelated.txt');
+  writeFileSync(extra, 'leave intact');
+  const afterExpiry = Date.now() + 25 * 60 * 60 * 1000;
+  grants.sweep(afterExpiry);
+  assert.ok(existsSync(extra));
+  rmSync(extra);
+  grants.sweep(afterExpiry);
+  assert.equal(existsSync(orphan), false);
+  assert.equal(existsSync(second.dir), true);
+  second.dispose();
+});

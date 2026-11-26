@@ -23,7 +23,7 @@ export function access(dir:string) {
       const digest=hash(token)
       const communication=one(db,`SELECT g.runId FROM communication_grants g
         JOIN runs r ON r.id=g.runId JOIN threads t ON t.id=r.threadId
-        WHERE g.tokenHash=? AND g.expiresAt>? AND r.taskId IS NOT NULL AND r.status IN ('queued','running','waiting_input')
+        WHERE g.tokenHash=? AND g.expiresAt>? AND r.taskId IS NOT NULL AND r.status IN ('queued','running','waiting_input','cancelling')
           AND (t.projectId IS NULL OR EXISTS(SELECT 1 FROM project_workspaces p WHERE p.projectId=t.projectId AND p.instanceId=r.instanceId))`,digest,now())
       if(communication)return {id:'run:'+communication.runId+':communication',owner:false,projects:[],communicationOnly:true}
       const grant=one(db,'SELECT id,projectId FROM grants WHERE tokenHash=? AND (expiresAt IS NULL OR expiresAt>?)',digest,now())

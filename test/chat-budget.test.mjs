@@ -59,6 +59,76 @@ test('主聊工具软预算按需增加并在配置的硬上限停止',async t=>
   assert.deepEqual((await api('/threads/'+thread.id+'/budget')).toolBudget,{softLimit:4,hardLimit:6})
 })
 
+test('成功重复工具返回原回执，失败的只读工具最多重试一次后可改用其他工具',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'maoqiu-budget-duplicates-'))
+  const contexts=[]
+  const provider={name:'duplicate tool fixture',async generate(prompt){
+    const context=JSON.parse(prompt.slice(prompt.indexOf('\n')+1))
+    contexts.push(context)
+    if(context.currentUserRequest==='重复成功写操作'){
+      if(context.toolResults.length<2)return {action:'tool',tool:'utility_daily',arguments:'{"action":"create","kind":"todo","body":"只创建一次"}'}
+      return {action:'reply',text:'写操作回执已核对'}
+    }
+    if(context.currentUserRequest==='重复成功操作'){
+      if(context.toolResults.length<2)return {action:'tool',tool:'utility_calculate',arguments:'{"expression":"20+22"}'}
+      return {action:'reply',text:'重复成功回执已核对'}
+    }
+    if(context.currentUserRequest==='重复只读失败后改用其他路径'){
+      if(context.toolResults.length<2)return {action:'tool',tool:'utility_calculate',arguments:'{"expression":"1/0"}'}
+      if(context.toolResults.length===2)return {action:'tool',tool:'utility_clock',arguments:'{}'}
+      return {action:'reply',text:'已使用替代工具'}
+    }
+    return {action:'reply',text:'完成'}
+  }}
+  const app=startServer({port:0,dataDir:dir,chat:true,chatProvider:provider})
+  t.after(async()=>{await app.close();rmSync(dir,{recursive:true,force:true})})
+  await once(app.server,'listening')
+  const base='http://127.0.0.1:'+app.server.address().port+'/api/v1'
+  const api=async(path,body)=>{
+    const response=await fetch(base+path,{method:body?'POST':'GET',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'},body:body&&JSON.stringify(body)})
+    const data=await response.json()
+    assert.equal(response.status,200,data.error)
+    return data
+  }
+  const thread=await api('/threads',{title:'重复工具回归'})
+  const success=await api('/threads/'+thread.id+'/messages',{text:'重复成功操作'})
+  let snapshot
+  for(let attempt=0;attempt<200;attempt++){
+    snapshot=await api('/threads/'+thread.id)
+    if(snapshot.messages.some(message=>message.role==='assistant'&&message.data?.replyTo===success.messageId))break
+    await sleep(15)
+  }
+  assert.equal(snapshot.messages.filter(message=>message.kind==='tool'&&message.data?.replyTo===success.messageId&&message.data?.ok===true).length,1)
+  assert.ok(contexts.some(context=>context.toolResults.some(result=>result.duplicateReceipt===true&&result.ok===true)))
+
+  const write=await api('/threads/'+thread.id+'/messages',{text:'重复成功写操作'})
+  let proposal
+  for(let attempt=0;attempt<200&&!proposal;attempt++){
+    snapshot=await api('/threads/'+thread.id)
+    proposal=snapshot.mainChat.pending.find(job=>job.messageId===write.messageId)?.proposal
+    if(!proposal)await sleep(15)
+  }
+  assert.ok(proposal)
+  await api('/chat/approve',{messageId:write.messageId,approvalId:proposal.id,approved:true})
+  for(let attempt=0;attempt<200;attempt++){
+    snapshot=await api('/threads/'+thread.id)
+    if(snapshot.messages.some(message=>message.role==='assistant'&&message.data?.replyTo===write.messageId))break
+    await sleep(15)
+  }
+  assert.equal((await api('/chat/daily?threadId='+thread.id)).items.filter(item=>item.body==='只创建一次').length,1)
+  assert.equal(snapshot.messages.filter(message=>message.kind==='tool'&&message.data?.replyTo===write.messageId&&message.data?.ok===true).length,1)
+
+  const failed=await api('/threads/'+thread.id+'/messages',{text:'重复只读失败后改用其他路径'})
+  for(let attempt=0;attempt<200;attempt++){
+    snapshot=await api('/threads/'+thread.id)
+    if(snapshot.messages.some(message=>message.role==='assistant'&&message.data?.replyTo===failed.messageId))break
+    await sleep(15)
+  }
+  assert.equal(snapshot.messages.filter(message=>message.kind==='tool'&&message.data?.replyTo===failed.messageId&&message.data?.tool==='utility_calculate'&&message.data?.ok===false).length,2)
+  assert.equal(snapshot.messages.filter(message=>message.kind==='tool'&&message.data?.replyTo===failed.messageId&&message.data?.tool==='utility_clock'&&message.data?.ok===true).length,1)
+  assert.equal(snapshot.messages.find(message=>message.role==='assistant'&&message.data?.replyTo===failed.messageId)?.text,'已使用替代工具')
+})
+
 test('重启后从已写入的工具回执恢复同一轮，不重复执行已完成操作',async t=>{
   const dir=mkdtempSync(join(tmpdir(),'maoqiu-budget-recovery-'))
   let app

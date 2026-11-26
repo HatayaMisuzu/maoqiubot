@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { changed, fail, id, must, now, one, required, unpack } from './db/index.ts'
 import { assertBotAllowed } from './tasks/bots.ts'
-import { createThread, getThread, homeRead, message, messages } from './tasks/index.ts'
+import { createThread, getThread, homeRead, message, messages, queueNativeBindingRelease } from './tasks/index.ts'
 import { modelSettings, selectedModel, type ModelConfig } from './chat/model-settings.ts'
 
 type Sharing = Pick<ModelConfig,'shareProject'|'sharePersonal'|'shareAttachments'> | undefined
@@ -26,7 +26,7 @@ export function mainThread(db:DatabaseSync){
 
 export function listThreads(db:DatabaseSync,query:URLSearchParams){
   const state=query.get('state')??'active'
-  if(!['active','deleted','archived'].includes(state))fail('未知会话状态')
+  if(!['active','deleted','archived','purged'].includes(state))fail('未知会话状态')
   const instance=query.get('instanceId')
   const title=(query.get('q')??'').trim()
   if(title.length>120)fail('会话检索词最多 120 字符')
@@ -35,9 +35,10 @@ export function listThreads(db:DatabaseSync,query:URLSearchParams){
   const limit=query.has('limit')?integer(query.get('limit'),50,200):-1
   return db.prepare(`SELECT t.* FROM threads t WHERE state=? AND (? IS NULL OR instanceId=?)
     AND (?=0 OR projectId IS ?) AND instr(lower(COALESCE(title,'')),lower(?))>0
+    AND (?<>'purged' OR (t.kind='native' AND t.sessionId IS NOT NULL AND COALESCE(t.nativeReleased,0)=0))
     AND NOT EXISTS(SELECT 1 FROM task_drafts d WHERE d.threadId=t.id)
     ORDER BY (kind='main') DESC,lastActivity DESC,t.id LIMIT ? OFFSET ?`)
-    .all(state,instance,instance,Number(query.has('projectId')),project,title,limit,integer(query.get('offset'),0,Number.MAX_SAFE_INTEGER,0))
+    .all(state,instance,instance,Number(query.has('projectId')),project,title,state,limit,integer(query.get('offset'),0,Number.MAX_SAFE_INTEGER,0))
 }
 
 function historyScope(thread:any,model:Sharing){
@@ -162,12 +163,16 @@ export function markSharesSent(db:DatabaseSync,threadId:string,refs:{type:string
 }
 
 export function threadImpact(db:DatabaseSync,key:string){
+  const thread=getThread(db,key)
   const tasks=db.prepare('SELECT t.id,t.status,t.workThreadId,l.relation FROM tasks t JOIN task_threads l ON l.taskId=t.id WHERE l.threadId=?').all(key)
   const runs=db.prepare('SELECT id,status FROM runs WHERE threadId=? OR taskId IN(SELECT taskId FROM task_threads WHERE threadId=?)').all(key,key)
   const jobs=db.prepare("SELECT id,status FROM chat_jobs WHERE threadId=? AND status IN ('queued','working','awaiting_approval','budget_paused')").all(key)
   const held=one(db,"SELECT count(*) AS n FROM commands WHERE threadId=? AND status IN ('held','waiting','uncertain','sent','queued','received') AND (status IN ('held','waiting','uncertain') OR runId IN(SELECT id FROM runs WHERE status NOT IN ('completed','failed','blocked','cancelled')))",key).n
   const shares=one(db,"SELECT COUNT(*) n FROM messages WHERE kind='shared_context' AND (threadId=? OR json_extract(data,'$.sourceThreadId')=?)",key,key).n
-  return {tasks,runs,jobs,shares,held,canPurge:getThread(db,key).kind!=='main'&&!jobs.length&&!held&&runs.every(r=>['completed','failed','blocked','cancelled'].includes(String(r.status))),
+  const nativeRelease=thread.state==='purged'&&thread.kind==='native' ? one(db,`SELECT r.id AS runId,r.status
+    FROM commands c JOIN runs r ON r.id=c.runId WHERE c.threadId=? AND c.kind='prepare'
+    AND json_extract(c.payload,'$.nativeOperation.action')='release' ORDER BY c.rowid DESC LIMIT 1`,key) : undefined
+  return {tasks,runs,jobs,shares,held,nativeRelease,canPurge:thread.kind!=='main'&&!jobs.length&&!held&&runs.every(r=>['completed','failed','blocked','cancelled'].includes(String(r.status))),
     scope:'仅清理本话题的工作台聊天缓存。任务、交付、来源以外的快照、长期记忆、导出及原生会话单独保留。'}
 }
 
@@ -190,18 +195,22 @@ export function nativeLifecycle(db:DatabaseSync,dir:string,thread:any,action:'fo
   const payload={nativeOperation:{action,sourceThreadId:thread.id,sourceSessionId:thread.sessionId},...(actor==='user'?{}:{communication:{sender:{kind:'main_bot',id:'main'}}})}
   db.prepare("INSERT INTO commands(id,threadId,runId,instanceId,kind,payload,status,createdAt) VALUES(?,?,?,?,'prepare',?,'queued',?)")
     .run(commandId,target.id,runId,inst.id,JSON.stringify(payload),created)
-  changed(db,'thread',{threadId:target.id,runId})
+  changed(db,'thread',{threadId:target.id,instanceId:target.instanceId,runId})
   return {...target,runId,commandId,scope:'native_pending'}
 }
 
 export function threadLifecycle(db:DatabaseSync,key:string,b:any,dir=''){
   const thread=getThread(db,key)
-  if(thread.state==='purged')fail('本地聊天缓存已永久清理',410)
+  if(thread.state==='purged'&&b.action!=='releaseNative')fail('本地聊天缓存已永久清理',410)
   if(thread.kind==='main'&&['archive','delete','purge'].includes(b.action))fail('固定主会话无法归档或删除',409)
   const updateState=(state:string)=>db.prepare('UPDATE threads SET state=? WHERE id=?').run(state,key)
   if(one(db,`SELECT 1 FROM commands c JOIN runs r ON r.id=c.runId WHERE (c.threadId=? OR json_extract(c.payload,'$.nativeOperation.sourceThreadId')=?)
     AND json_extract(c.payload,'$.nativeOperation.action') IS NOT NULL AND r.status NOT IN ('completed','cancelled','failed','blocked')`,key,key))
     fail('原生会话操作仍在处理或等待核对',409)
+  if(b.action==='releaseNative'){
+    if(b.confirm!==true)fail('请确认只解除工作台绑定，原生客户端历史可能仍然存在',409)
+    return queueNativeBindingRelease(db,thread,required(b.sessionId,'原生会话 ID'))
+  }
   switch(b.action){
     case 'markInvalid': {
       if(thread.kind!=='native'||!thread.sessionId||b.sessionId!==thread.sessionId||b.confirm!==true||!threadImpact(db,key).canPurge)
@@ -226,7 +235,8 @@ export function threadLifecycle(db:DatabaseSync,key:string,b:any,dir=''){
         fail('请核对原主会话并明确选择个人侧聊',409)
       db.prepare("UPDATE threads SET kind='side' WHERE id=?").run(previous.id)
       db.prepare("UPDATE threads SET kind='main',source='owner_selected' WHERE id=?").run(key)
-      changed(db,'thread',{threadId:previous.id,action:'setMain'})
+      changed(db,'thread',{threadId:previous.id,instanceId:previous.instanceId,action:'setMain'})
+      changed(db,'thread',{threadId:key,instanceId:thread.instanceId,action:'setMain'})
       break
     }
     case 'deleteNative':
@@ -296,7 +306,7 @@ export function threadLifecycle(db:DatabaseSync,key:string,b:any,dir=''){
     }
     default:fail('未知会话操作')
   }
-  changed(db,'thread',{threadId:key,action:b.action})
+  changed(db,'thread',{threadId:key,instanceId:thread.instanceId,action:b.action})
   return {...getThread(db,key),scope:'workbench'}
 }
 export function exportThread(db:DatabaseSync,key:string){

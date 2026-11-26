@@ -56,7 +56,7 @@ export function createThread(db: DatabaseSync,dir:string,b:any) {
   const created=now()
   db.prepare('INSERT INTO threads(id,title,instanceId,projectId,taskId,sessionId,createdAt,kind,state,source,lastActivity) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
     .run(key,String(b.title || '新话题'),instanceId,b.projectId||null,null,null,created,kind,'active',source,created)
-  changed(db,'thread',{threadId:key})
+  changed(db,'thread',{threadId:key,instanceId})
   const thread=getThread(db,key)
   if(b.modelId!=null)selectModel(db,thread,b.modelId)
   return thread
@@ -172,11 +172,14 @@ export function checkQueuedInput(db:DatabaseSync,dir:string,c:any,payload:any){
   if(op){
     const source=getThread(db,required(op.sourceThreadId,'原生来源话题 ID'))
     if(source.instanceId!==thread.instanceId||source.projectId!==thread.projectId||source.sessionId!==op.sourceSessionId||
-      !['active','archived','deleted'].includes(source.state)||(!['delete','unarchive'].includes(op.action)&&source.state==='deleted')||
+      !['active','archived','deleted','purged'].includes(source.state)||(!['delete','unarchive','release'].includes(op.action)&&source.state==='deleted')||
+      (source.state==='purged')!==(op.action==='release')||
+      (op.action==='release'&&source.nativeReleased)||
       (op.action==='fork'?source.id===thread.id:source.id!==thread.id))fail('原生操作来源或绑定已变化',409)
   }
-  if(thread.nativeInvalid||thread.state!=='active'&&!['delete','unarchive'].includes(op?.action))fail('话题已归档、删除或原生绑定失效，已阻止新的执行',409)
-  if(c.instanceId!=='main'){
+  if(thread.nativeInvalid&&op?.action!=='release'||thread.state!=='active'&&!['delete','unarchive'].includes(op?.action)&&op?.action!=='release')
+    fail('话题已归档、删除或原生绑定失效，已阻止新的执行',409)
+  if(c.instanceId!=='main'&&op?.action!=='release'){
     const action=payload.communication?.sender?.kind==='main_bot'?'delegate':'direct'
     assertBotAllowed(db,c.instanceId,action,c.projectId??thread.projectId)
   }
@@ -239,6 +242,7 @@ export function reconcileRun(db:DatabaseSync,key:string,b:any){
     const commands=db.prepare("SELECT id,kind,status,detail,createdAt FROM commands WHERE runId=? ORDER BY rowid").all(key)
     return {runId:key,status:run.status,sessionId:thread.sessionId,nativeRunId:run.nativeRunId,commands}
   }
+  if(thread.state==='purged')fail('已清理会话的解绑回执只能核对，不能放弃',409)
   if(b.action!=='abandon'||b.acknowledge!==true)fail('请确认停止继续等待，并说明原生运行可能仍在执行',400)
   if(run.status!=='uncertain'||latestRun(db,thread.id)?.id!==key)fail('仅能放弃当前待核对的运行',409)
   const reason=required(b.reason,'放弃原因').slice(0,2000)
@@ -253,6 +257,12 @@ export function reconcileRun(db:DatabaseSync,key:string,b:any){
   return {...result,status:'cancelled'}
 }
 function checkManualRetry(db:DatabaseSync,run:any,b:any){
+  if(b.acknowledgeRunId!==undefined){
+    const latest=run&&latestRun(db,run.threadId)
+    const recovery=run&&one(db,"SELECT 1 FROM messages WHERE threadId=? AND kind='recovery' AND json_extract(data,'$.runId')=?",run.threadId,run.id)
+    if(typeof b.acknowledgeRunId!=='string'||!run||b.acknowledgeRunId!==run.id||latest?.id!==run.id||!recovery)
+      fail('原生运行状态已变化，请重新核对恢复提示',409)
+  }
   if(run&&!run.modelSetup&&b.acknowledge!==true&&one(db,`SELECT 1 FROM messages WHERE threadId=? AND kind='recovery'
     AND json_extract(data,'$.runId')=?`,run.threadId,run.id)){
     fail('原生运行可能仍在执行。确认过风险再继续，或另开工作话题',409)
@@ -361,6 +371,29 @@ export function nativeSessionCatalogTarget(db:DatabaseSync,instanceId:string,pro
   assertBotProjectAllowed(db,instanceId,projectId)
   return checkNativeCatalogTarget(db,inst,projectId)
 }
+function nativeSessionReleaseTarget(db:DatabaseSync,instanceId:string,projectId:string|null){
+  const inst=instance(db,instanceId)
+  projectWorkspace(db,projectId,instanceId)
+  const capabilities=JSON.parse(inst.capabilities)
+  if(capabilities.nativeBindingRelease!==true)fail('连接器版本不支持安全解绑，请先升级连接器',409)
+  if(capabilities.sessionList!==true)fail('此实例未声明可核对的原生会话目录能力',409)
+  if(!inst.online)fail('原生实例离线，无法确认解绑',409)
+  return inst
+}
+export function queueNativeBindingRelease(db:DatabaseSync,thread:any,sessionId:string){
+  if(thread.state!=='purged'||thread.kind!=='native'||thread.nativeReleased||!thread.sessionId||thread.sessionId!==sessionId)
+    fail('只能核对已永久清理且仍绑定原生会话的话题',409)
+  const active=one(db,"SELECT 1 FROM runs WHERE threadId=? AND status NOT IN ('completed','failed','blocked','cancelled') LIMIT 1",thread.id)
+  const jobs=one(db,"SELECT 1 FROM chat_jobs WHERE threadId=? AND status IN ('queued','working','awaiting_approval','budget_paused') LIMIT 1",thread.id)
+  const held=one(db,`SELECT 1 FROM commands WHERE threadId=? AND status IN ('held','waiting','uncertain','sent','queued','received')
+    AND (status IN ('held','waiting','uncertain') OR runId IN(SELECT id FROM runs WHERE status NOT IN ('completed','failed','blocked','cancelled'))) LIMIT 1`,thread.id)
+  if(active||jobs||held)fail('原生会话仍有未完成或待核对的操作',409)
+  nativeSessionReleaseTarget(db,thread.instanceId,thread.projectId)
+  const run=startRun(db,thread)
+  const commandId=enqueue(db,run,'prepare',{nativeOperation:{action:'release',sourceThreadId:thread.id,sourceSessionId:sessionId}})
+  changed(db,'thread',{threadId:thread.id,instanceId:thread.instanceId,action:'releaseNative',status:'queued'})
+  return {threadId:thread.id,runId:run.id,commandId,status:'queued',scope:'native_binding_release_pending'}
+}
 function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null){
   projectWorkspace(db,projectId,inst.id)
   if(JSON.parse(inst.capabilities).sessionList!==true)fail('此实例未声明可核对的原生会话目录能力',409)
@@ -369,7 +402,7 @@ function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null
 }
 export function nativeSessionBinding(db:DatabaseSync,inst:any,native:string){
   const existing=one(db,`SELECT t.* FROM threads t JOIN instances i ON i.id=t.instanceId
-    WHERE t.sessionId=? AND i.workspaceRef=? AND i.adapterKey=? AND
+    WHERE t.sessionId=? AND COALESCE(t.nativeReleased,0)=0 AND i.workspaceRef=? AND i.adapterKey=? AND
       ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
        (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
     native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId)
@@ -381,6 +414,17 @@ export function nativeSessionBinding(db:DatabaseSync,inst:any,native:string){
        (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
     inst.workspaceRef,inst.adapterKey,native,inst.runtimeScopeId,inst.nodeId,inst.profileId)
   if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending' as const}
+}
+export function nativeSessionReleaseScope(db:DatabaseSync,inst:any,native:string){
+  const rows=db.prepare(`SELECT t.instanceId,t.projectId FROM threads t JOIN instances i ON i.id=t.instanceId
+    WHERE t.sessionId=? AND t.nativeReleased=1 AND i.workspaceRef=? AND i.adapterKey=? AND
+      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
+       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`).all(
+    native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId) as {instanceId:string;projectId:string|null}[]
+  if(!rows.length)return null
+  const scope=rows[0]
+  if(rows.some(row=>row.instanceId!==scope.instanceId||row.projectId!==scope.projectId))return {conflict:true as const}
+  return {instanceId:scope.instanceId,projectId:scope.projectId,conflict:false as const}
 }
 
 export function nativeBindingInScope(binding:{thread:any},instanceId:string,projectId:string|null){
@@ -398,6 +442,9 @@ export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any)
     if(!nativeBindingInScope(binding,key,projectId))fail('原生会话已绑定，请从原工作话题管理',409)
     return binding
   }
+  const released=nativeSessionReleaseScope(db,inst,native)
+  if(released&&(released.conflict||released.instanceId!==key||released.projectId!==projectId))
+    fail('已解除绑定的原生会话只能在原实例和项目范围重新导入',409)
   const previous=one(db,`SELECT t.* FROM threads t JOIN commands c ON t.id=c.threadId
     WHERE t.instanceId=? AND t.projectId IS ? AND t.sessionId IS NULL AND c.kind='prepare'
     AND json_extract(c.payload,'$.importSessionId')=? AND t.taskId IS NULL
@@ -532,6 +579,10 @@ export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMess
   if(thread.instanceId!=='main')assertBotAllowed(db,thread.instanceId,sourceMessageId?'delegate':'direct',thread.projectId)
   projectWorkspace(db,thread.projectId,thread.instanceId)
   const target=thread.instanceId==='main'?undefined:instance(db,thread.instanceId)
+  if(Object.hasOwn(b,'expectedModelId')&&thread.kind==='native'&&thread.sessionId){
+    const selected=one(db,'SELECT selected FROM thread_models WHERE threadId=?',thread.id)?.selected??null
+    if(b.expectedModelId!==selected)fail('原生模型选择已变化，请重新核对后发送',409)
+  }
   const pendingShares=pendingShareRefs(db,thread.id)
   const requestedRefs=b.materialRefs??b.refs??[]
   if(!Array.isArray(requestedRefs))fail('引用须为数组')
@@ -576,6 +627,7 @@ export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMess
 }
 export function control(db:DatabaseSync,dir:string,key:string,b:any,sourceMessageId?:string){
   const run=unpack(must(db,'SELECT * FROM runs WHERE id=?',key),['pendingRequest']), thread=getThread(db,run.threadId)
+  if(thread.state==='purged')fail('已清理会话的解绑回执只能核对，不能控制',409)
   if(['edit','withdraw','resume'].includes(b.kind)){
     const cmd=must(db,'SELECT * FROM commands WHERE id=? AND runId=?',required(b.commandId,'commandId'),key)
     if(!['waiting','held'].includes(cmd.status)) fail('仅可编辑或撤回尚未发送的下一轮输入',409)
@@ -607,20 +659,23 @@ export function control(db:DatabaseSync,dir:string,key:string,b:any,sourceMessag
     return {commandId:cmd.id,status:b.kind==='withdraw'?'withdrawn':cmd.status}
   }
   const active=latestRun(db,thread.id)
-  if(active?.id!==run.id || active.modelSetup || terminal.has(run.status) || run.status==='uncertain'&&b.kind!=='cancel') fail('该运行已结束、尚未开始推理或需要核对',409)
+  if(active?.id!==run.id || active.modelSetup&&b.kind!=='cancel' || terminal.has(run.status) || run.status==='uncertain'&&b.kind!=='cancel')
+    fail('该运行已结束、尚未开始推理或需要核对',409)
   if (b.kind==='steer') return sendInput(db,dir,thread,b,sourceMessageId)
   const actions=JSON.parse(instance(db,thread.instanceId).availableActions)
   if(!['answer','cancel'].includes(b.kind) || !actions.includes(b.kind)) fail('实例不支持此操作',409)
   if(b.kind==='cancel'){
     if(run.status==='cancelling') fail('已请求取消',409)
     db.prepare("UPDATE commands SET status='held' WHERE runId=? AND status='waiting'").run(key)
-    const unsent=one(db,"SELECT id,payload FROM commands WHERE runId=? AND kind='run' AND status='queued'",key)
+    const unsent=one(db,"SELECT id,payload,kind FROM commands WHERE runId=? AND kind IN ('run','prepare') AND status='queued'",key)
     if(run.status==='queued'&&unsent){
-      const text='待发指令已取消，原生会话尚未收到'
+      const text=unsent.kind==='prepare'?'排队中的原生准备操作已取消，原生端尚未收到':'待发指令已取消，原生会话尚未收到'
       db.prepare("UPDATE commands SET status='withdrawn' WHERE id=?").run(unsent.id)
       db.prepare("UPDATE runs SET status='cancelled' WHERE id=?").run(key)
-      const {modelId}=JSON.parse(unsent.payload)
-      if(modelId)db.prepare('UPDATE thread_models SET selected=? WHERE threadId=? AND selected IS NULL').run(modelId,thread.id)
+      if(unsent.kind==='run'){
+        const {modelId}=JSON.parse(unsent.payload)
+        if(modelId)db.prepare('UPDATE thread_models SET selected=? WHERE threadId=? AND selected IS NULL').run(modelId,thread.id)
+      }
       if(run.taskId){
         db.prepare("UPDATE tasks SET status='cancelled' WHERE id=?").run(run.taskId)
         addTaskRecord(db,thread.projectId,run.taskId,'result',text,{runId:key,instanceId:thread.instanceId,status:'cancelled'})
@@ -666,7 +721,7 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   const task=run.taskId && getTask(db,run.taskId)
   if(data.sessionId && thread.sessionId && thread.sessionId!==data.sessionId) fail('原线程绑定冲突',409)
   if(data.nativeRunId && run.nativeRunId && run.nativeRunId!==data.nativeRunId) fail('原运行绑定冲突',409)
-  if(data.sessionId && one(db,'SELECT 1 FROM threads WHERE instanceId=? AND sessionId=? AND id<>?',run.instanceId,data.sessionId,thread.id))fail('原生会话已绑定到另一话题',409)
+  if(data.sessionId && one(db,'SELECT 1 FROM threads WHERE instanceId=? AND sessionId=? AND id<>? AND COALESCE(nativeReleased,0)=0',run.instanceId,data.sessionId,thread.id))fail('原生会话已绑定到另一话题',409)
   if(data.sessionId) db.prepare('UPDATE threads SET sessionId=? WHERE id=?').run(data.sessionId,thread.id)
   if(data.nativeRunId) db.prepare('UPDATE runs SET nativeRunId=? WHERE id=?').run(data.nativeRunId,run.id)
   if(kind==='model_state'){
@@ -678,21 +733,33 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
     return
   }
   if(run.commandKind==='prepare'){
+    if(kind==='accepted'){
+      if(['queued','uncertain'].includes(run.status))db.prepare("UPDATE runs SET status='running' WHERE id=?").run(run.id)
+      changed(db,'run',{threadId:thread.id,instanceId:run.instanceId,runId:run.id,status:'running',activity:'accepted'})
+      return
+    }
     if(!terminal.has(kind))fail('读取模型的命令没有开始推理')
     const op=JSON.parse(run.commandPayload).nativeOperation
     if(op&&kind==='completed'){
+      if(op.action==='release'){
+        if(data.nativeAction!=='release'||data.released!==true||data.sessionId!==op.sourceSessionId||thread.state!=='purged'||thread.sessionId!==op.sourceSessionId)
+          fail('原生解绑回执与待核对绑定不匹配',409)
+        db.prepare('UPDATE threads SET nativeReleased=1 WHERE id=?').run(thread.id)
+        changed(db,'thread',{threadId:thread.id,instanceId:thread.instanceId,action:'releaseNative',status:'completed'})
+      }else{
       if(data.nativeAction!==op.action||!data.sessionId||(op.action==='fork'?data.sessionId===op.sourceSessionId:data.sessionId!==op.sourceSessionId))
         fail('原生操作与回执不匹配',409)
       if(op.action==='delete')db.prepare("UPDATE threads SET nativeInvalid='原生删除已确认',nativeArchived=0 WHERE id=?").run(thread.id)
       else if(op.action!=='fork')db.prepare('UPDATE threads SET nativeArchived=?,state=? WHERE id=?')
         .run(Number(op.action==='archive'),op.action==='archive'?'archived':'active',thread.id)
-      message(db,thread.id,'system','activity','已收到原生会话操作回执：'+op.action,{runId:run.id,sourceThreadId:op.sourceThreadId})
+      }
+      if(op.action!=='release')message(db,thread.id,'system','activity','已收到原生会话操作回执：'+op.action,{runId:run.id,sourceThreadId:op.sourceThreadId})
     }
     db.prepare('UPDATE runs SET status=? WHERE id=?').run(kind,run.id)
-    changed(db,'model',{threadId:thread.id,runId:run.id,status:kind})
+    changed(db,'model',{threadId:thread.id,instanceId:thread.instanceId,runId:run.id,status:kind})
     if(kind==='completed'&&JSON.parse(run.commandPayload).importSessionId)
       message(db,thread.id,'system','activity','已绑定选定的 Codex 会话。后续消息在原生线程中继续。',{runId:run.id,sessionId:data.sessionId})
-    if(kind!=='completed')message(db,thread.id,'system','error',String(data.text??'读取原生模型失败'),{runId:run.id})
+    if(kind!=='completed'&&JSON.parse(run.commandPayload).nativeOperation?.action!=='release')message(db,thread.id,'system','error',String(data.text??'读取原生模型失败'),{runId:run.id})
     return
   }
   let status=run.status
@@ -724,7 +791,7 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
         {sender:system,type:kind==='input_required'?'question_notice':'delivery_notice',replyTo:addressed?.sourceMessageId})
     }
   }
-  changed(db,'run',{taskId:run.taskId,runId:run.id,threadId:thread.id,status,activity:kind})
+  changed(db,'run',{taskId:run.taskId,runId:run.id,threadId:thread.id,instanceId:thread.instanceId,status,activity:kind})
   if(terminal.has(kind)){
     db.prepare('DELETE FROM run_grants WHERE runId=?').run(run.id)
     db.prepare('DELETE FROM communication_grants WHERE runId=?').run(run.id)

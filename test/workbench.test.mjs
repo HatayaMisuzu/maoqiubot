@@ -4,11 +4,49 @@ import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { mkdtempSync,rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import WebSocket from 'ws'
 import {startServer} from '../server/index.ts'
 import {transfer} from '../scripts/backup.ts'
 const sleep=ms=>new Promise(r=>setTimeout(r,ms))
 async function waitFor(fn){for(let i=0;i<150;i++){const v=await fn();if(v)return v;await sleep(15)}throw Error('condition timed out')}
+test('Origin errors are client responses, query-aware retries stay stable, and grant tokens are not cached',async()=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-request-boundaries-'))
+  let app=startServer({port:0,dataDir:temp,chat:false})
+  try{
+    await once(app.server,'listening')
+    const base=()=> 'http://127.0.0.1:'+app.server.address().port+'/api/v1'
+    const send=(path,body,headers={})=>fetch(base()+path,{method:'POST',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json',...headers},body:JSON.stringify(body)})
+    assert.equal((await send('/projects',{name:'malformed'},{Origin:'not a url'})).status,400)
+    assert.equal((await send('/projects',{name:'opaque'},{Origin:'null'})).status,403)
+    const first=await send('/projects?ref=a&id=b',{name:'查询签名',requestId:'query-signature'})
+    assert.equal(first.status,200)
+    const reordered=await send('/projects?id=b&ref=a',{name:'查询签名',requestId:'query-signature'})
+    assert.equal(reordered.status,200)
+    assert.deepEqual(await reordered.json(),await first.json())
+    assert.equal((await send('/projects?ref=a&id=c',{name:'查询签名',requestId:'query-signature'})).status,409)
+    const project=await (await send('/projects',{name:'授权项目'})).json()
+    const issued=await send('/grants',{projectId:project.id,requestId:'grant-token-test'})
+    assert.equal(issued.status,200)
+    const grant=await issued.json()
+    assert.equal(typeof grant.token,'string')
+    assert.equal((await send('/grants',{projectId:project.id,requestId:'grant-token-test'})).status,409)
+    const cached=app.db.prepare('SELECT result FROM requests WHERE requestId=?').get('grant-token-test').result
+    assert.equal(JSON.parse(cached)._sensitiveResult,'grant-token')
+    assert.equal(JSON.parse(cached).token,undefined)
+    app.db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run('owner','legacy-sensitive','legacy-signature',JSON.stringify({id:'legacy',projectId:project.id,token:'synthetic-token',expiresAt:'2099-01-01T00:00:00Z'}))
+    app.db.exec('PRAGMA user_version=8')
+    await app.close()
+    app=startServer({port:0,dataDir:temp,chat:false})
+    await once(app.server,'listening')
+    const legacy=app.db.prepare('SELECT result FROM requests WHERE requestId=?').get('legacy-sensitive').result
+    assert.deepEqual(JSON.parse(legacy),{_sensitiveResult:'grant-token'})
+    const oversized=await fetch(base()+'/projects',{method:'POST',headers:{Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'},
+      body:'{"name":"'+('x'.repeat(24*1024*1024))+'"}'})
+    assert.equal(oversized.status,413)
+    assert.match((await oversized.json()).error,/24 MiB/)
+  }finally{if(app.server.listening)await app.close();rmSync(temp,{recursive:true,force:true})}
+})
 test('HTTP → authenticated node → project result → exact retry → restored snapshot',async()=>{
   const temp=mkdtempSync(join(tmpdir(),'maoqiu-integration-'))
   let app=startServer({port:0,dataDir:join(temp,'live'),chat:false}),ws
@@ -259,13 +297,18 @@ test('native model setup and dispatch reuse one scoped session, and held input r
     await api('/tasks',{...args,workThreadId:draft.id,goal:'先读取模型'},409)
     const options=[{id:'[\"provider-a\",\"flash\"]',label:'Flash A'},{id:'[\"provider-b\",\"flash\"]',label:'Flash B'}]
     const sessionId='prepared-native-session'
-    await emit(prepare,1,'model_state',{sessionId,current:options[0].id,options})
-    await emit(prepare,2,'completed',{sessionId})
+    await emit(prepare,1,'accepted',{})
+    assert.equal((await api(path)).run.status,'running')
+    await emit(prepare,2,'model_state',{sessionId,current:options[0].id,options})
+    await emit(prepare,3,'completed',{sessionId})
     const preflight=await api(path)
     assert.equal(preflight.thread.sessionId,sessionId)
     assert.equal(preflight.model.previewError,null)
     assert.equal(preflight.run.modelSetup,1)
     await api(path+'/model',{modelId:options[1].id})
+    const beforeStaleSend=(await api(path)).messages.length
+    await api(path+'/messages',{text:'使用过期模型快照',expectedModelId:options[0].id},409)
+    assert.equal((await api(path)).messages.length,beforeStaleSend)
     await api('/tasks',{...args,originThreadId:otherOrigin.id,workThreadId:draft.id,goal:'不同发起话题'},409)
     const privateSource=(await api('/submissions',{source:{title:'私人原件',text:'不可跨项目转交'}})).source
     await api('/tasks',{...args,workThreadId:draft.id,goal:'越权引用',refs:[{type:'source',id:privateSource.id}]},403)

@@ -2,7 +2,7 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import type { DatabaseSync } from 'node:sqlite'
 import { transaction, changed, now, required, one, must, fail } from '../db/index.ts'
-import { applyEvent, addProjectContext, checkQueuedInput, markUncertain, nativeBindingInScope, nativeSessionBinding, nativeSessionCatalogTarget } from '../tasks/index.ts'
+import { applyEvent, addProjectContext, checkQueuedInput, markUncertain, nativeBindingInScope, nativeSessionBinding, nativeSessionReleaseScope, nativeSessionCatalogTarget } from '../tasks/index.ts'
 import type { NativeSession, NativeHistory, NativeUsage, NodeCommand } from '../../contracts/node.ts'
 import { secret,hash } from './auth.ts'
 import { isLocal } from './local.ts'
@@ -43,7 +43,8 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                 if(!Array.isArray(i.availableActions)) fail('缺少实例能力')
                 const blocked=i.adapterKey==='codex'&&!isLocal(req)
                 const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,nativeHistory:i.nativeHistory===true,
-                  sessionImport:i.sessionList===true&&i.sessionImport!==false,usage:i.adapterKey==='codex'&&i.usage===true,
+                  sessionImport:i.sessionList===true&&i.sessionImport!==false,nativeBindingRelease:i.nativeBindingRelease===true,
+                  usage:i.adapterKey==='codex'&&i.usage===true,
                   nativeActions:['fork','archive','unarchive','delete'].filter(action=>Array.isArray(i.nativeActions)&&i.nativeActions.includes(action)),
                   error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
                 db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
@@ -77,6 +78,16 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           }else if(m.type==='receipt_missing'){
             const link=online.get(nodeId)!
             if(link.lookups.delete(m.commandId))link.missing.add(m.commandId)
+          }else if(m.type==='command_conflict'){
+            const detail=String(m.detail??'节点检测到同一命令 ID 的内容冲突').slice(0,1200)
+            transaction(db,()=>{
+              const c=must(db,'SELECT c.* FROM commands c JOIN instances i ON c.instanceId=i.id WHERE c.id=? AND i.nodeId=?',m.commandId,nodeId)
+              if(['done','failed','withdrawn'].includes(c.status))return
+              db.prepare("UPDATE commands SET status='uncertain',detail=? WHERE id=?").run(detail,c.id)
+              if(['run','prepare'].includes(c.kind))markUncertain(db,c,'连接器检测到命令内容冲突，原生操作待核对')
+              changed(db,'receipt',{threadId:c.threadId,instanceId:c.instanceId,runId:c.runId,commandId:c.id,status:'uncertain'})
+            })
+            ws.send(JSON.stringify({type:'receipt_ack',commandId:m.commandId,status:'uncertain'}))
           }else if(m.type==='receipt'){
             const link=online.get(nodeId)!
             if(link.lookups.delete(m.commandId))link.sent.add(m.commandId)
@@ -108,7 +119,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
   const timer=setInterval(()=>{
     db.prepare('DELETE FROM run_grants WHERE expiresAt<=?').run(now())
     db.prepare(`DELETE FROM communication_grants WHERE expiresAt<=? OR runId IN
-      (SELECT id FROM runs WHERE status NOT IN ('queued','running','waiting_input'))`).run(now())
+      (SELECT id FROM runs WHERE status NOT IN ('queued','running','waiting_input','cancelling'))`).run(now())
     db.prepare('DELETE FROM grants WHERE expiresAt<=?').run(now())
     for(const c of online.values()){if(!c.alive)c.ws.terminate();else{c.alive=false;c.ws.ping()}}
   },30000)
@@ -204,7 +215,8 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           const ready=c.adapterKey==='dsh'&&c.sessionId&&one(db,`SELECT 1 FROM messages
             WHERE threadId=? AND kind='activity' AND json_extract(data,'$.runId')=?
               AND json_extract(data,'$.controlReady')=1 LIMIT 1`,c.threadId,c.runId)
-          if(!ready&&!(c.kind==='cancel'&&link.cancelBeforeStart&&JSON.parse(c.payload).priorStatus==='queued'))continue
+          const preparing= c.kind==='cancel'&&one(db,"SELECT 1 FROM commands WHERE runId=? AND kind='prepare' LIMIT 1",c.runId)
+          if(!ready&&!preparing&&!(c.kind==='cancel'&&link.cancelBeforeStart&&JSON.parse(c.payload).priorStatus==='queued'))continue
         }
         try {
           const command=transaction(db,()=>freeze(c))
@@ -247,7 +259,9 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       if(typeof item?.id!=='string'||!/^[\w-]{1,128}$/.test(item.id)||seen.has(item.id))return false
       seen.add(item.id)
       const binding=nativeSessionBinding(db,inst,item.id)
-      return !binding||nativeBindingInScope(binding,inst.id,projectId)
+      const released=nativeSessionReleaseScope(db,inst,item.id)
+      const isReleasedScope=released&&!released.conflict&&released.instanceId===inst.id&&released.projectId===projectId
+      return (!binding||nativeBindingInScope(binding,inst.id,projectId))&&(!released||isReleasedScope)
     })
       .map((item:any)=>({id:item.id,title:String(item.title??'').slice(0,140),updatedAt:Number(item.updatedAt)||0,active:item.active===true}))
     return {items,nextCursor:typeof frame.nextCursor==='string'&&frame.nextCursor.length<=2000?frame.nextCursor:null}
@@ -264,7 +278,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     if(typeof frame.archived==='boolean'&&Boolean(thread.nativeArchived)!==frame.archived){
       transaction(db,()=>{
         db.prepare('UPDATE threads SET nativeArchived=?,state=? WHERE id=?').run(Number(frame.archived),frame.archived?'archived':'active',thread.id)
-        changed(db,'thread',{threadId:thread.id,source:'native'})
+      changed(db,'thread',{threadId:thread.id,instanceId:thread.instanceId,source:'native'})
       })
     }
     return {items,nextBefore:typeof frame.nextBefore==='string'&&frame.nextBefore.length<=2000?frame.nextBefore:null,archived:frame.archived,source:'native' as const,fetchedAt:now()}

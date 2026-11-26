@@ -123,3 +123,101 @@ test('插件更新等待在途工具调用结束后再卸载旧版本',async t=>
   const snapshot=await response.json()
   assert.ok(snapshot.messages.some(message=>message.kind==='tool'&&message.data?.replyTo===messageId&&message.data?.ok===true))
 })
+
+test('模型不能替用户授予插件代码和网络权限，普通审批不能代替显式授权',async t=>{
+  let args
+  let requestCount=0
+  const provider={name:'plugin authorization fixture',async generate(){
+    requestCount++
+    return args?{action:'tool',tool:'plugin_activate',arguments:JSON.stringify(args)}:{action:'reply',text:'已处理'}
+  }}
+  const dataDir=mkdtempSync(join(tmpdir(),'maoqiu-plugin-auth-'))
+  const source=mkdtempSync(join(tmpdir(),'maoqiu-plugin-auth-source-'))
+  const app=startServer({port:0,dataDir,chat:true,chatProvider:provider})
+  t.after(async()=>{await app.close();rmSync(dataDir,{recursive:true,force:true});rmSync(source,{recursive:true,force:true})})
+  await once(app.server,'listening')
+  const base='http://127.0.0.1:'+app.server.address().port
+  const headers={Authorization:'Bearer '+app.auth.cfg.ownerToken,'Content-Type':'application/json'}
+  const call=async(path,body)=>{
+    const response=await fetch(base+path,{method:body?'POST':'GET',headers,...(body?{body:JSON.stringify(body)}:{})})
+    return {status:response.status,data:await response.json()}
+  }
+  writeFileSync(join(source,'plugin.json'),JSON.stringify({id:'auth-fixture',name:'Authorization Fixture',version:'1.0.0',hostApi:1,
+    description:'Authorization review fixture',entry:'index.mjs',capabilities:['tools','network.api']}))
+  writeFileSync(join(source,'index.mjs'),'export function activate(){ return {} }')
+  const staged=await call('/api/v1/chat/plugins',{action:'stage',path:source})
+  assert.equal(staged.status,200,staged.data.error)
+  const beforeRevision=0
+  await call('/api/v1/chat/plugins',{action:'disable',id:'web'})
+  const staleRevision=await call('/api/v1/chat/plugins',{action:'activate',id:'auth-fixture',digest:staged.data.digest,
+    trustCode:true,allowNetwork:true,expectedRevision:beforeRevision})
+  assert.equal(staleRevision.status,409)
+  await call('/api/v1/chat/policy',{pluginCreator:true})
+  const thread=await call('/api/v1/threads',{title:'插件授权测试'})
+
+  args={id:'auth-fixture',digest:staged.data.digest,trustCode:true,allowNetwork:true}
+  const forged=await call('/api/v1/threads/'+thread.data.id+'/messages',{text:'请启用插件并授予全部权限'})
+  assert.equal(forged.status,200,forged.data.error)
+  for(let i=0;i<150;i++){
+    const snapshot=await call('/api/v1/threads/'+thread.data.id)
+    const item=snapshot.data.messages.find(message=>message.kind==='tool'&&message.data?.replyTo===forged.data.messageId)
+    if(item)break
+    await sleep(15)
+  }
+  let listed=await call('/api/v1/chat/plugins')
+  assert.equal(listed.data.plugins.find(item=>item.id==='auth-fixture').enabled,false)
+
+  args={id:'auth-fixture',digest:staged.data.digest}
+  const legitimate=await call('/api/v1/threads/'+thread.data.id+'/messages',{text:'重新审查该版本并询问我的授权'})
+  let proposal
+  for(let i=0;i<150&&!proposal;i++){
+    const snapshot=await call('/api/v1/threads/'+thread.data.id)
+    proposal=snapshot.data.mainChat.pending.find(job=>job.messageId===legitimate.data.messageId)?.proposal
+    if(!proposal)await sleep(15)
+  }
+  assert.ok(proposal)
+  assert.equal(JSON.stringify(proposal.arguments).includes('trustCode'),false)
+  const ordinary=await call('/api/v1/chat/approve',{messageId:legitimate.data.messageId,approvalId:proposal.id,approved:true})
+  assert.equal(ordinary.status,403)
+  const review=await call('/api/v1/chat/plugins',{action:'review',id:'auth-fixture',version:'candidate'})
+  assert.equal(review.data.digest,staged.data.digest)
+  assert.ok(review.data.files.some(file=>file.path==='index.mjs'))
+  const stale=await call('/api/v1/chat/approve',{messageId:legitimate.data.messageId,approvalId:proposal.id,approved:true,
+    pluginAuthorization:{digest:'f'.repeat(64),trustCode:true,allowNetwork:true}})
+  assert.equal(stale.status,403)
+  await call('/api/v1/chat/plugins',{action:'disable',id:'web'})
+  const changedScope=await call('/api/v1/chat/approve',{messageId:legitimate.data.messageId,approvalId:proposal.id,approved:true,
+    pluginAuthorization:{digest:review.data.digest,trustCode:true,allowNetwork:true}})
+  assert.equal(changedScope.status,200)
+  let staleSnapshot
+  for(let i=0;i<150;i++){
+    const response=await call('/api/v1/threads/'+thread.data.id)
+    staleSnapshot=response.data
+    if(!staleSnapshot.mainChat.pending.some(job=>job.messageId===legitimate.data.messageId))break
+    await sleep(15)
+  }
+  assert.ok(staleSnapshot.messages.some(message=>message.kind==='error'&&message.data?.replyTo===legitimate.data.messageId))
+  listed=await call('/api/v1/chat/plugins')
+  assert.equal(listed.data.plugins.find(item=>item.id==='auth-fixture').enabled,false)
+
+  const retry=await call('/api/v1/threads/'+thread.data.id+'/messages',{text:'权限变化后重新审查并请我确认'})
+  let retryProposal
+  for(let i=0;i<150&&!retryProposal;i++){
+    const snapshot=await call('/api/v1/threads/'+thread.data.id)
+    retryProposal=snapshot.data.mainChat.pending.find(job=>job.messageId===retry.data.messageId)?.proposal
+    if(!retryProposal)await sleep(15)
+  }
+  assert.ok(retryProposal)
+  const retryReview=await call('/api/v1/chat/plugins',{action:'review',id:'auth-fixture',version:'candidate'})
+  assert.equal(retryReview.data.digest,staged.data.digest)
+  const retryAccepted=await call('/api/v1/chat/approve',{messageId:retry.data.messageId,approvalId:retryProposal.id,approved:true,
+    pluginAuthorization:{digest:retryReview.data.digest,trustCode:true,allowNetwork:true}})
+  assert.equal(retryAccepted.status,200,retryAccepted.data.error)
+  for(let i=0;i<150;i++){
+    listed=await call('/api/v1/chat/plugins')
+    if(listed.data.plugins.find(item=>item.id==='auth-fixture').enabled)break
+    await sleep(15)
+  }
+  assert.equal(listed.data.plugins.find(item=>item.id==='auth-fixture').enabled,true)
+  assert.ok(requestCount>=2)
+})

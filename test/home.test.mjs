@@ -108,7 +108,10 @@ test('字段类型改变必须显式转换已有值，失败批次不会部分�
   const apply=(operation)=>api('POST',base+'/changes',{mode:'apply',expectedRevision:1,operations:[{op:'updatePage',pageId:p.pageId,title:'修订'},operation]});
   assert.throws(()=>apply(op),{status:409});
   assert.equal(api('GET',base).structure.pages[0].title,'首页');
-  apply({...op,migration:{[e.id]:2}});
+  assert.throws(()=>apply({...op,migration:{[e.id]:2}}),{status:400});
+  assert.equal(api('GET',base).structure.pages[0].title,'首页');
+  assert.throws(()=>apply({...op,migration:{[e.id]:2},entryRevisions:{[e.id]:0}}),{status:409});
+  apply({...op,migration:{[e.id]:2},entryRevisions:{[e.id]:e.revision}});
   const current=api('GET',url).items[0];
   assert.equal(current.values.title,2);
   assert.equal(current.revision,2);

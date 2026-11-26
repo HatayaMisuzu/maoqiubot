@@ -292,18 +292,20 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
           .run(JSON.stringify(checkpoint),inFlight?JSON.stringify(inFlight):null,Number(clearOperation),job.id)
       }
       persistCheckpoint()
-      async function execute(tool:string,args:string,step:number,approval=false,nativeCall?:ToolCall){
+      async function execute(tool:string,args:string,step:number,approval=false,nativeCall?:ToolCall,
+        pluginAuthorization?:{digest:string;trustCode:boolean;allowNetwork:boolean;pluginRevision?:number}){
         check()
         const signature=fingerprint(tool,args)
         const evidence={replyTo:current.id,tool,step,fingerprint:signature}
         try{
-          const call=toolCall(core,tool,args)
+          const call=toolCall(core,tool,args,pluginAuthorization)
           if(call.confirm&&!approval){
             steps=step-1
             transaction(db,()=>{
               persistCheckpoint()
               proposeOperation(db,job,{id:id(),tool,args,stamp:stamp(),expires:Date.now()+10*60_000,
-                call:nativeCall,continuation:{steps:step-1,seen:[...seen],toolResults,exchanges}})
+                call:nativeCall,pluginRevision:authorizedPluginRevision,
+                continuation:{steps:step-1,seen:[...seen],toolResults,exchanges}})
             })
             return null
           }
@@ -375,7 +377,9 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
           return
         }
         const version=authorizedContext
-        const result=await execute(approved.tool,approved.args,++steps,true,approved.call)
+        const pluginAuthorization=approved.pluginAuthorization&&approved.pluginRevision!==undefined
+          ?{...approved.pluginAuthorization,pluginRevision:approved.pluginRevision}:approved.pluginAuthorization
+        const result=await execute(approved.tool,approved.args,++steps,true,approved.call,pluginAuthorization)
         seen.add(fingerprint(approved.tool,approved.args))
         if(result)remember(result,approved.call,version)
         persistCheckpoint(null,true)
@@ -419,22 +423,58 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
           return
         }
         if(steps>=softStepLimit)softStepLimit=Math.min(hardStepLimit,softStepLimit+10)
-        const signature=fingerprint(d.tool!,d.arguments!)
-        if(seen.has(signature))fail('模型重复请求同一操作，已保留此前工具记录')
+        const tool=d.tool!,args=d.arguments!
+        const signature=fingerprint(tool,args)
+        if(seen.has(signature)){
+          const prior=one(db,`SELECT data FROM messages WHERE threadId=? AND kind='tool'
+            AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.fingerprint')=?
+            AND json_extract(data,'$.ok') IS NOT NULL ORDER BY rowid DESC LIMIT 1`,thread.id,current.id,signature)
+          if(prior){
+            const receipt=JSON.parse(String(prior.data))
+            if(receipt.ok===true){
+              if(tool.startsWith('web__'))captureWeb(receipt.webResult??receipt.result)
+              const result={tool,ok:true,result:smallResult(tool.startsWith('web__')
+                ?webModelResult(receipt.webResult??receipt.result):receipt.result),duplicateReceipt:true}
+              remember(result,d.nativeCall,authorizedContext)
+              steps++
+              persistCheckpoint()
+              continue
+            }
+            let retrySafe=false
+            try{retrySafe=toolCall(core,tool,args).retrySafe===true}catch{}
+            const failedCount=Number(one(db,`SELECT count(*) AS n FROM messages WHERE threadId=? AND kind='tool'
+              AND json_extract(data,'$.replyTo')=? AND json_extract(data,'$.fingerprint')=?
+              AND json_extract(data,'$.ok')=0`,thread.id,current.id,signature)?.n??0)
+            if(retrySafe&&failedCount<2){
+              // One bounded retry follows the original failed read. The regular tool budget still applies.
+            }else{
+              remember({tool,ok:false,error:String(receipt.error??'此前的只读工具调用失败'),duplicateReceipt:true},
+                d.nativeCall,authorizedContext)
+              steps++
+              persistCheckpoint()
+              continue
+            }
+          }else{
+            remember({tool,ok:false,error:'重复操作没有可核对的持久回执，未再次执行',duplicateReceipt:true},
+              d.nativeCall,authorizedContext)
+            steps++
+            persistCheckpoint()
+            continue
+          }
+        }
         seen.add(signature)
-        const {tool,args}={tool:d.tool!,args:d.arguments!}
         const version=authorizedContext
         const outcome=await execute(tool,args,++steps,false,d.nativeCall)
         if(!outcome)return
         check()
         remember(outcome,d.nativeCall,version)
-        if((outcome as any).ok===false){
+        if((outcome as any).ok===false&&!(outcome as any).duplicateReceipt){
           consecutiveFailures++
           if(consecutiveFailures>=3){
             d={...d,action:'reply',text:'连续三次工具操作失败，已停止本轮自动执行。请查看上方回执后调整目标或稍后继续。'}
             break
           }
-        }else consecutiveFailures=0
+        }else if((outcome as any).ok===true)consecutiveFailures=0
         persistCheckpoint()
       }
       check()

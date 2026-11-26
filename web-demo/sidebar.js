@@ -164,17 +164,18 @@ export function createSidebar(actions) {
     const mainArchived = state.archivedThreads.filter(t => t.instanceId === 'main');
     const mainDeleted = state.deletedThreads.filter(t => t.instanceId === 'main');
     let archiveBlock = null;
-    if (mainArchived.length || mainDeleted.length) {
+    {
       const archToggle = el('button', 'fold-toggle',
         icon(archiveOpen ? 'chevronDown' : 'chevronRight'),
         el('span', '', '归档与回收站'),
-        el('span', 'side-section-count', String(mainArchived.length + mainDeleted.length))
+        mainArchived.length || mainDeleted.length ? el('span', 'side-section-count', String(mainArchived.length + mainDeleted.length)) : null
       );
       archToggle.type = 'button';
       archToggle.setAttribute('aria-expanded', String(archiveOpen));
       archToggle.onclick = () => {
         setLocalFlag(foldKeyMainArchive, !archiveOpen);
         render();
+        if (!archiveOpen) void actions.loadArchives('main').then(render).catch(error => notice(error.message, 'error'));
       };
       const archTree = el('div', 'tree-list');
       if (archiveOpen) {
@@ -325,8 +326,8 @@ export function createSidebar(actions) {
         const footerActions = el('div', 'bot-footer-actions',
           btn('搜索', () => actions.findThreads(bot), 'ghost', 'search'),
           bot.capabilities?.sessionList ? btn('原生目录', () => actions.nativeCatalog(bot), 'ghost', 'folderOpen') : null,
-          archived.length ? btn('归档 (' + archived.length + ')', () => actions.showBotArchive(bot, 'archived'), 'ghost', 'archive') : null,
-          deleted.length ? btn('回收站 (' + deleted.length + ')', () => actions.showBotArchive(bot, 'deleted'), 'ghost', 'trash') : null
+          btn(archived.length ? '归档 (' + archived.length + ')' : '归档', () => actions.showBotArchive(bot, 'archived'), 'ghost', 'archive'),
+          btn(deleted.length ? '回收站 (' + deleted.length + ')' : '回收站', () => actions.showBotArchive(bot, 'deleted'), 'ghost', 'trash')
         );
 
         card.append(el('div', 'bot-tree', tree, footerActions));

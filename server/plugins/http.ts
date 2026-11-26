@@ -24,7 +24,7 @@ function parsedAddress(address:string){
 }
 export function addressAllowed(address:string,network:Network){
   const ip=parsedAddress(address),range=ip.range()
-  if(network==='lan'&&['private','uniqueLocal'].includes(range))return true
+  if(network==='lan')return ['private','uniqueLocal'].includes(range)
   if(range!=='unicast')return false
   return ip.kind()==='ipv4'||(ip.toByteArray()[0]&0xe0)===0x20
 }
@@ -47,7 +47,10 @@ async function resolveAddresses(url:URL,resolve:typeof lookup=lookup){
   return ipaddr.isValid(host)?[{address:host,family:host.includes(':')?6:4}]:await resolve(host,{all:true,verbatim:true})
 }
 function validateAddresses(addresses:Address[],network:Network){
-  if(!addresses.length||addresses.some(a=>!addressAllowed(a.address,network)))fail('目标的 DNS 或 IP 包含不可访问的地址',403)
+  if(!addresses.length)fail('目标的 DNS 没有可访问的地址',403)
+  if(network==='lan'&&addresses.some(a=>!addressAllowed(a.address,network)))
+    fail('此局域网配置仅允许私网地址，目标不可访问。公网 API 请关闭局域网选项并改用 HTTPS。',403)
+  if(addresses.some(a=>!addressAllowed(a.address,network)))fail('目标的 DNS 或 IP 包含不可访问的地址',403)
   return addresses
 }
 const port=(url:URL)=>url.port||(url.protocol==='https:'?'443':'80')

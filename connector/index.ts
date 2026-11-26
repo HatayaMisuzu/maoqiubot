@@ -1,5 +1,5 @@
-import {existsSync,mkdirSync,mkdtempSync,readFileSync,unlinkSync,writeFileSync,rmdirSync,realpathSync} from 'node:fs'
-import {tmpdir,homedir} from 'node:os'
+import {existsSync,mkdirSync,readFileSync,writeFileSync,realpathSync} from 'node:fs'
+import {homedir} from 'node:os'
 import {basename,isAbsolute,resolve,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
@@ -7,6 +7,7 @@ import WebSocket from 'ws'
 import {registry} from './adapters/index.ts'
 import {runKeyedSerializedOperation} from './keyed-serialized-operations.ts'
 import {Store,type ReceiptStatus} from './store.ts'
+import {grantFiles} from './grant-files.ts'
 import type {Command,Instance,Adapter,Run,Input,Capabilities} from './types.ts'
 
 const config=JSON.parse(readFileSync(process.argv[2]||'connector/config.example.json','utf8').replace(/^\uFEFF/,''))
@@ -20,14 +21,17 @@ baseUrl.protocol=url.protocol==='wss:'?'https:':'http:'
 const stateDir=resolve(config.stateDir)
 mkdirSync(stateDir,{recursive:true,mode:0o700})
 const store=new Store(join(stateDir,'connector.sqlite'))
-type Entry={config:Instance,adapter?:Adapter,caps:Capabilities,runtimeScopeId?:string,error?:string,restart?:NodeJS.Timeout}
+type Entry={config:Instance,adapter?:Adapter,caps:Capabilities,runtimeScopeId?:string,error?:string,restart?:NodeJS.Timeout,
+  generation:number,starting?:Promise<void>}
 const instances=new Map<string,Entry>()
 const running=new Map<string,{run:Run,adapter:Adapter}>()
-const preparing=new Map<string,{command:Command,adapter:Adapter,cancelled:boolean}>()
+const preparing=new Map<string,{command:Command,adapter:Adapter,cancelled:boolean,started:boolean}>()
 const handling=new Set<string>()
 const occupied=new Set<string>()
 const workspaceTails=new Map<string,Promise<void>>()
 const grantCleanups=new Set<()=>void>()
+const credentials=grantFiles()
+try{credentials.sweep()}catch{console.warn('连接器无法检查过期的临时凭据')}
 let ws:WebSocket|undefined
 let stopping=false
 function send(frame:object) {
@@ -73,23 +77,22 @@ function grant(c:Command,i:Input) {
   const access=c.payload.homeAccess
   const communication=c.payload.communicationAccess
   if(!access&&!communication) return ()=>{}
-  const dir=mkdtempSync(join(tmpdir(),'maoqiu-project-'))
+  const files=credentials.create()
+  const dir=files.dir
   const path=join(dir,'project.json'),report=join(dir,'communication.json')
   const cleanup=()=>{
     grantCleanups.delete(cleanup)
-    if(existsSync(path))unlinkSync(path)
-    if(existsSync(report))unlinkSync(report)
-    if(existsSync(dir))rmdirSync(dir)
+    try{files.dispose()}catch{console.warn('连接器无法清理临时凭据，将在重启后重新检查')}
   }
   try {
     grantCleanups.add(cleanup)
     const credentials={baseUrl:baseUrl.href.replace(/\/$/,'')}
     if(access){
-      writeFileSync(path,JSON.stringify({...credentials,token:access.token,projectId:access.projectId}),{mode:0o600,flag:'wx'})
+      files.write('project.json',{...credentials,token:access.token,projectId:access.projectId})
       const permission=access.permission??'read'
       i.text+='\n\n本次运行拥有项目 '+access.projectId+' 的资料权限（'+permission+'）。读取简报：node "'+helper+'" "'+path+'" GET /projects/'+encodeURIComponent(access.projectId)+'/brief 。请勿读取或输出凭据文件内容。'
     }
-    if(communication)writeFileSync(report,JSON.stringify({...credentials,token:communication.token}),{mode:0o600,flag:'wx'})
+    if(communication)files.write('communication.json',{...credentials,token:communication.token})
     if(c.taskId)i.text+='\n向小毛球报告：node "'+helper+'" "'+(communication?report:path)+'" POST /runs/'+encodeURIComponent(c.runId)+
       '/communication <JSON> ，提交 kind（question、progress、blocked、handoff、delivery 或 request）、text 和唯一 requestId。报告保留 Bot 身份，不代表用户已验收。需要等待答复时先结束或挂起当前推理，之后续接原生会话。'
   } catch(e){cleanup();throw e}
@@ -97,7 +100,13 @@ function grant(c:Command,i:Input) {
 }
 async function handle(c:Command) {
   if(!c.id || !c.instanceId || !c.runId || !c.threadId || !c.payload) throw new Error('节点命令缺少标识')
-  const prior=store.command(c)
+  let prior
+  try{prior=store.command(c)}catch(e:any){
+    const detail=String(e.message||e).slice(0,1000)
+    if(e.code==='COMMAND_CONFLICT')send({type:'command_conflict',commandId:c.id,detail})
+    else send({type:'receipt',commandId:c.id,status:'failed',detail:'连接器未能持久化原生命令'})
+    return
+  }
   if(prior) {send({type:'receipt',commandId:c.id,status:prior.status,detail:prior.detail});return}
   handling.add(c.id)
   const inst=instances.get(c.instanceId)
@@ -110,11 +119,9 @@ async function handle(c:Command) {
     if(c.workspaceRef!==inst.config.workspaceRef || c.profileId!==inst.config.profileId) throw new Error('命令的工作区或 profile 与节点不一致')
     const adapter=inst.adapter
     if(c.kind==='run'||c.kind==='prepare') {
-      const pending={command:c,adapter,cancelled:false}
-      if(c.kind==='run'){
-        if(preparing.has(c.runId)||running.has(c.runId))throw Error('运行已经排队或已启动')
-        preparing.set(c.runId,pending)
-      }
+      if(preparing.has(c.runId)||running.has(c.runId))throw Error('运行已经排队或已启动')
+      const pending={command:c,adapter,cancelled:false,started:false}
+      preparing.set(c.runId,pending)
       const path=inst.config.workspaceRef
       const key=process.platform==='win32'?path.toLowerCase():path
       await runKeyedSerializedOperation(workspaceTails,key,async()=>{
@@ -128,12 +135,24 @@ async function handle(c:Command) {
         if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
         const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
         const op=c.kind==='prepare'?c.payload.nativeOperation:undefined
+        if(op?.action==='release'){
+          const busy=[...running.values()].some(value=>value.run.sessionId===op.sourceSessionId)||
+            [...preparing.values()].some(value=>value.command.threadId===op.sourceThreadId&&value.command.id!==c.id)
+          if(!inst.caps.sessionList||op.sourceThreadId!==c.threadId||bound!==op.sourceSessionId||busy)
+            throw Error('原生绑定的会话、范围或运行状态已变化')
+          const event=store.release(c,inst.config.workspaceRef,runtimeKey,op.sourceSessionId)
+          send({type:'event',event})
+          receipt(c.id,'done')
+          return
+        }
         if(op){
           if(!adapter.sessionAction||!inst.caps.nativeActions?.includes(op.action)||
             store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey)!==op.sourceSessionId||
             (op.action==='fork'?bound||op.sourceThreadId===c.threadId:bound!==op.sourceSessionId))throw Error('原生操作能力或来源绑定不匹配')
-          store.submit(c.id)
           started=true
+          pending.started=true
+          store.submit(c.id)
+          emit(c,'accepted',{sessionId:op.sourceSessionId})
           const sessionId=await adapter.sessionAction(op.action,op.sourceSessionId)
           if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
           emit(c,'completed',{sessionId,nativeAction:op.action})
@@ -141,6 +160,9 @@ async function handle(c:Command) {
           return
         }
         if(incoming&&(bound&&bound!==incoming||!inst.caps.sessionImport||!adapter.importSession))throw Error('当前绑定或原生协议无法导入此会话')
+        pending.started=true
+        store.submit(c.id)
+        if(c.kind==='prepare')emit(c,'accepted',{})
         const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
         if(stopping||inst.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
         store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
@@ -165,8 +187,9 @@ async function handle(c:Command) {
       const pending=preparing.get(c.runId)
       if(c.kind==='cancel'&&pending?.adapter===adapter&&pending.command.threadId===c.threadId&&
         pending.command.instanceId===c.instanceId&&pending.command.projectId===c.projectId){
+        if(pending.started)throw Error('原生准备操作已开始，无法安全撤销，请等待回执或核对节点状态')
         pending.cancelled=true
-        emit(pending.command,'cancelled',{text:'运行已取消，输入尚未发送给原生端'})
+        emit(pending.command,'cancelled',{text:'排队中的原生操作已取消，尚未调用原生端'})
         receipt(pending.command.id,'done')
         receipt(c.id,'done')
         return
@@ -250,6 +273,16 @@ function retry(entry:Entry) {
 }
 async function startAdapter(entry:Entry,restarting=false) {
   if(stopping)return
+  if(entry.starting)return entry.starting
+  const generation=entry.generation+1
+  entry.generation=generation
+  const starting=startAdapterOnce(entry,restarting,generation)
+  entry.starting=starting
+  try{await starting}
+  finally{if(entry.starting===starting)entry.starting=undefined}
+}
+async function startAdapterOnce(entry:Entry,restarting:boolean,generation:number) {
+  if(stopping)return
   const instance=entry.config
   let adapter:Adapter|undefined
   let ready=false
@@ -266,7 +299,7 @@ async function startAdapter(entry:Entry,restarting=false) {
     adapter=new registration.create(instance)
     entry.adapter=adapter
     adapter.onDisconnect(error=>{
-      if(entry.adapter!==adapter)return
+      if(entry.generation!==generation||entry.adapter!==adapter)return
       entry.error=error.message
       entry.caps=offline()
       entry.adapter=undefined
@@ -276,13 +309,14 @@ async function startAdapter(entry:Entry,restarting=false) {
     const caps=await adapter.probe()
     entry.runtimeScopeId=runtimeScope(await checkedRuntime(entry,adapter))
     await recover(entry)
-    if(stopping)return
+    if(stopping||entry.generation!==generation)return
     if(entry.adapter!==adapter)throw Error(entry.error??'原生进程已断开')
     entry.caps=caps
     entry.error=undefined
     ready=true
     if(restarting)ws?.terminate()
   } catch(e:any) {
+    if(stopping||entry.generation!==generation){adapter?.close();return}
     entry.adapter=undefined
     entry.error=String(e.message)
     adapter?.close()
@@ -298,7 +332,7 @@ for(const instance of config.instances as Instance[]) {
     const configured=process.env.MAOQIU_DSH_EXECUTABLE
     if(configured&&isAbsolute(configured)&&/^dsh(?:\.cmd|\.exe)?$/i.test(basename(configured)))instance.command=configured
   }
-  instances.set(instance.id,{config:instance,caps:offline()})
+  instances.set(instance.id,{config:instance,caps:offline(),generation:0})
 }
 function connect(){
   if(stopping) return
@@ -309,7 +343,8 @@ function connect(){
       const {config:i,caps,error,adapter}=entry
       const runtimeScopeId=adapter&&entry.runtimeScopeId
       return {id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,
-        ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,usage:typeof entry.adapter?.readUsage==='function',error,online:!error}
+        ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,nativeBindingRelease:caps.sessionList===true,
+        usage:typeof entry.adapter?.readUsage==='function',error,online:!error}
     })
     if(ws!==socket||socket?.readyState!==WebSocket.OPEN)return
     send({type:'hello',nodeId:config.nodeId,receiptLookup:true,cancelBeforeStart:true,instances:registrations})

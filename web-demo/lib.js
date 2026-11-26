@@ -307,11 +307,10 @@ export function confirmDialog({
       if (settled) return;
       settled = true;
       dialog.removeEventListener('close', onClose);
-      if (dialog.open) dialog.close();
+      if (dialog.open && dialog.contains(shell)) dialog.close();
       resolve(result);
     };
-    const onClose = () => finish(false);
-    dialog.addEventListener('close', onClose, { once: true });
+    const onClose = () => { if (!dialog.open || !dialog.contains(shell)) finish(false); };
 
     const head = el('div', 'dialog-head',
       destructive ? icon('warning') : null,
@@ -327,13 +326,15 @@ export function confirmDialog({
     cancelBtn.type = 'button';
     cancelBtn.onclick = () => finish(false);
 
-    dialog.replaceChildren(el('div', 'dialog-shell', head, bodyBox, el('div', 'dialog-foot', cancelBtn, confirmBtn)));
+    const shell = el('div', 'dialog-shell', head, bodyBox, el('div', 'dialog-foot', cancelBtn, confirmBtn));
+    dialog.addEventListener('close', onClose);
+    dialog.replaceChildren(shell);
     dialog.showModal();
     requestAnimationFrame(() => confirmBtn.focus());
   });
 }
 
-export async function upload(file, projectId) {
+export async function upload(file, projectId, requestId) {
   if (file.size > 16 * 1024 * 1024) throw Error('单个附件不能超过 16 MiB');
   const data = await new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -345,7 +346,8 @@ export async function upload(file, projectId) {
     name: file.name,
     contentType: file.type || 'application/octet-stream',
     data,
-    ...(projectId ? { projectId } : {})
+    ...(projectId ? { projectId } : {}),
+    ...(requestId ? { requestId } : {})
   });
 }
 
@@ -372,6 +374,7 @@ export const state = {
   draft: false,
   project: null,
   page: null,
+  routeRevision: 0,
   mainThread: null,
   snapshot: null,
   connection: '正在连接'

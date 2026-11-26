@@ -33,6 +33,13 @@ export function migrate(db:DatabaseSync, migrations:readonly ((db:DatabaseSync)=
     }
   })
 }
+export function scrubCachedGrantTokens(db:DatabaseSync) {
+  db.exec(`UPDATE requests SET result=json_object('_sensitiveResult','grant-token')
+    WHERE json_valid(result)
+      AND json_type(result,'$.token')='text'
+      AND json_type(result,'$.projectId')='text'
+      AND json_type(result,'$.expiresAt')='text';`)
+}
 export function openDatabase(dir: string) {
   mkdirSync(dir, { recursive: true })
   const db = new DatabaseSync(join(dir, 'workbench.sqlite'))
@@ -87,7 +94,9 @@ export function openDatabase(dir: string) {
       CREATE TABLE memory_candidates(id TEXT PRIMARY KEY,threadId TEXT NOT NULL REFERENCES threads(id),
         messageId TEXT NOT NULL UNIQUE REFERENCES messages(id), projectId TEXT REFERENCES projects(id),
         body TEXT NOT NULL,factKey TEXT,recordType TEXT NOT NULL,important INTEGER NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL);
-    `),db=>{initSessions(db);initBotSchema(db);initChatBudget(db)}])
+    `),db=>{initSessions(db);initBotSchema(db);initChatBudget(db)},db=>db.exec(`
+      ALTER TABLE threads ADD COLUMN nativeReleased INTEGER NOT NULL DEFAULT 0;
+    `),scrubCachedGrantTokens])
     db.exec('UPDATE instances SET online=0')
     db.function('maoqiu_fact_key',{deterministic:true},value=>typeof value==='string'?normalizeFactKey(value):null)
     return db

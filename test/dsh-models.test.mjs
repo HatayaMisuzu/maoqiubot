@@ -30,6 +30,9 @@ test('DSH reads setup notifications and stops when the session changes model bef
   const command={id:'command',runId:'run',threadId:'thread',taskId:null,kind:'run',instanceId:'fixture',payload:{modelId:'second'}}
   const models=[]
   const run={sessionId,command,emit:(kind,data)=>{if(kind==='model_state')models.push(data.current)}}
+  adapter.cancelBeforePrompt.add('run')
   await assert.rejects(adapter.run(run,{text:'fixture',files:[]}),{code:-32602,message:/未开始运行/})
   assert.equal(models.at(-1),'first')
+  assert.equal(adapter.cancelBeforePrompt.has('run'),false)
+  assert.equal(adapter.accepted.has('run'),false)
 })

@@ -15,7 +15,8 @@
     "start": "node server/index.ts",
     "connector": "node connector/index.ts",
     "backup": "node scripts/backup.ts",
-    "test": "node --test"
+    "test": "node --test",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@mozilla/readability": "0.6.0",
@@ -23,12 +24,14 @@
     "fflate": "0.8.3",
     "ipaddr.js": "2.5.0",
     "linkedom": "0.18.15",
+    "markdown-it": "15.0.3",
     "robots-parser": "3.1.1",
     "ws": "^8.18.3",
     "yaml": "2.9.1"
   },
   "devDependencies": {
     "@electron/packager": "20.3.0",
+    "@playwright/test": "1.65.1",
     "@types/node": "^22.20.5",
     "@types/ws": "^8.18.2",
     "electron": "45.4.1",

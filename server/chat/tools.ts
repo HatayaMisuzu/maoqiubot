@@ -555,18 +555,22 @@ const tools=[
       if(!pkg||pkg.digest!==a.baseDigest||((pkg.projectId??null)!==(c.thread.projectId??null)))fail('基准版本不在当前范围或已改变',409)
       return c.plugins!.manage({action:'revise',id:a.id,baseDigest:a.baseDigest,files:a.files,remove:a.remove,manifest:a.manifest},c.signal)
     }}),
-  define('plugin_review','查看插件待审查版本相对当前版本的差异、能力变化和版本摘要',{id:'string',version:'string'},['id'],{
+  define('plugin_review','查看插件版本相对当前版本的差异、能力变化和版本摘要',{id:'string',version:'string'},['id','version'],{
     creator:true,async:true,execute:async(c,a)=>{
+      if(!['pending','current','previous'].includes(a.version))fail('请选择明确的插件版本')
       const plugin=c.plugins?.list().plugins.find(p=>p.id===a.id)
-      if(!plugin||((plugin.pending as any)?.projectId??null)!==(c.thread.projectId??null))fail('当前范围内没有该插件草稿',404)
+      const target=plugin&&({pending:plugin.pending,current:plugin.current,previous:plugin.previous} as any)[a.version]
+      if(!target||(target.projectId??null)!==(c.thread.projectId??null))fail('当前范围内没有该插件版本',404)
       return c.plugins!.manage({action:'review',id:a.id,version:a.version},c.signal)
     }}),
-  define('plugin_activate','启用已审查的插件版本。代码和网络能力仍需对应授权',{id:'string',digest:'string',trustCode:'boolean',allowNetwork:'boolean'},['id','digest'],{
+  define('plugin_activate','启用已审查的插件版本。代码和网络能力需由用户在确认时分别授权',{id:'string',digest:'string'},['id','digest'],{
     creator:true,confirm:true,async:true,execute:async(c,a)=>{
       const plugin=c.plugins?.list().plugins.find(p=>p.id===a.id)
-      if(!plugin||((plugin.pending as any)?.projectId??(plugin.current as any)?.projectId??null)!==(c.thread.projectId??null))
+      const target=plugin?.pending??plugin?.current
+      if(!target||(target.projectId??null)!==(c.thread.projectId??null))
         fail('当前范围内没有可启用的插件版本',404)
-      return c.plugins!.manage({action:'activate',id:a.id,digest:a.digest,trustCode:a.trustCode===true,allowNetwork:a.allowNetwork===true},c.signal)
+      return c.plugins!.manage({action:'activate',id:a.id,digest:a.digest,trustCode:a.trustCode===true,allowNetwork:a.allowNetwork===true,
+        expectedRevision:a.expectedPluginRevision},c.signal)
     }}),
   define('plugin_runtime_test','对已启用的插件运行其声明的连接测试并返回真实结果',{id:'string',input:'object'},['id','input'],{
     creator:true,confirm:true,async:true,execute:(c,a)=>{
@@ -574,13 +578,14 @@ const tools=[
       if(!plugin?.current||!plugin.loaded||(plugin.current.projectId??null)!==c.thread.projectId)fail('此范围内没有运行中的插件',409)
       return c.plugins!.manage({action:'test',id:a.id,digest:plugin.current.digest,input:a.input},c.signal)
     }}),
-  define('plugin_switch','停用插件或回滚到已审查的前一版本',{id:'string',action:'string',digest:'string',trustCode:'boolean',allowNetwork:'boolean'},['id','action','digest'],{
+  define('plugin_switch','停用插件或回滚到已审查的前一版本',{id:'string',action:'string',digest:'string'},['id','action','digest'],{
     creator:true,confirm:true,async:true,execute:(c,a)=>{
       if(!['disable','rollback'].includes(a.action))fail('请选择停用或回滚')
       const plugin=c.plugins?.list().plugins.find(p=>p.id===a.id)
       const version=a.action==='rollback'?plugin?.previous:plugin?.current
       if(!version||version.digest!==a.digest||(version.projectId??null)!==c.thread.projectId)fail('此范围内没有可操作的插件版本',409)
-      return c.plugins!.manage({action:a.action,id:a.id,digest:a.digest,trustCode:a.trustCode===true,allowNetwork:a.allowNetwork===true},c.signal)
+      return c.plugins!.manage({action:a.action,id:a.id,digest:a.digest,trustCode:a.trustCode===true,allowNetwork:a.allowNetwork===true,
+        expectedRevision:a.expectedPluginRevision},c.signal)
     }}),
   define('web_archive','把本轮实际读取的网页正文和来源归档至当前项目或个人资料',{id:'string'},['id'],{
     group:'homeContent',allowed:c=>c.plugins?.tools.has('web__read')===true,confirm:true,execute:(c,a)=>{
@@ -625,14 +630,14 @@ function enabled(c:Core,t:Tool,policy:Policy){
     (!c.model||c.thread.projectId||c.model.sharePersonal||Boolean(t.file)||t.public)&&t.allowed?.(c)!==false
 }
 const builtin=new Map(tools.map(tool=>[tool.name,toolEntry({...tool,allowed:(c:Core)=>enabled(c,tool,chatPolicy(c.dir))})]))
-const coordinationTools=new Set(['task_progress','task_communications','task_check_delivery','task_coordination_status','utility_calculate','utility_time'])
+const coordinationTools=new Set(['task_progress','task_communications','task_check_delivery','task_coordination_status','utility_calculate','utility_clock'])
 const available=(c:Core,entry:RegisteredTool<Core>)=>
   (c.actor==='user'||!!c.coordination&&coordinationTools.has(entry.name))&&entry.allowed?.(c)!==false
 export function toolsFor(c:Core){
   return [...builtin.values(),...(c.plugins?.tools.values()??[])].filter(t=>available(c,t))
     .map(({name,description,parameters})=>({name,description,parameters}))
 }
-export function toolCall(c:Core,name:string,raw:string){
+export function toolCall(c:Core,name:string,raw:string,pluginAuthorization?:{digest:string;trustCode:boolean;allowNetwork:boolean;pluginRevision?:number}){
   const entry=builtin.get(name)??c.plugins?.tools.get(name)
   if(!entry||!available(c,entry))fail('当前未授权该工具或资料范围',403)
   const args=parseTool(entry,raw)
@@ -645,7 +650,14 @@ export function toolCall(c:Core,name:string,raw:string){
   const needsConfirmation=typeof entry.confirm==='function'?entry.confirm(args):entry.confirm===true
   const confirm=needsConfirmation&&!routineWrite(c,name,args)
   if(confirm&&c.actor!=='user')fail('这项操作须由真实用户发起并确认',403)
-  return {confirm,async:entry.async===true,execute:()=>entry.execute(c,args)}
+  const risk=(entry as RegisteredTool<Core>&{risk?:string}).risk
+  const retrySafe=risk==='read'||!needsConfirmation&&!routineWrite(c,name,args)
+  const authorizedPluginAction=name==='plugin_activate'||name==='plugin_switch'&&args.action==='rollback'
+  if(pluginAuthorization&&(!authorizedPluginAction||pluginAuthorization.digest!==args.digest))
+    fail('插件授权与待执行版本不匹配',409)
+  return {confirm,async:entry.async===true,retrySafe,execute:()=>entry.execute(c,pluginAuthorization
+    ?{...args,trustCode:pluginAuthorization.trustCode,allowNetwork:pluginAuthorization.allowNetwork,
+      expectedPluginRevision:pluginAuthorization.pluginRevision}:args)}
 }
 function routineWrite(c:Core,name:string,args:Record<string,unknown>){
   if(c.actor!=='user')return false

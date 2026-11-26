@@ -22,10 +22,19 @@ import type { DesktopBridge } from './chat/tools.ts'
 
 const webRoot=fileURLToPath(new URL('../web-demo/',import.meta.url))
 const favicon=fileURLToPath(new URL('../desktop/icon.ico',import.meta.url))
+const markdownModule=fileURLToPath(import.meta.resolve('markdown-it/browser'))
 const mime:Record<string,string>={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.png':'image/png','.webp':'image/webp','.svg':'image/svg+xml','.ico':'image/x-icon','.woff2':'font/woff2'}
 async function body(req:IncomingMessage){
   const chunks:Buffer[]=[];let size=0
-  for await(const chunk of req){size+=chunk.length;if(size>24*1024*1024)fail('请求超过 24 MiB',413);chunks.push(chunk)}
+  const iterator=req.iterator({destroyOnReturn:false})
+  while(true){
+    const next=await iterator.next()
+    if(next.done)break
+    const chunk=next.value as Buffer
+    size+=chunk.length
+    if(size>24*1024*1024){req.pause();(req as IncomingMessage&{bodyTooLarge?:boolean}).bodyTooLarge=true;fail('请求超过 24 MiB',413)}
+    chunks.push(chunk)
+  }
   if(!size)return {}
   if(!req.headers['content-type']?.startsWith('application/json'))fail('请发送 application/json',415)
   try{const b=JSON.parse(Buffer.concat(chunks).toString('utf8'));if(!b||typeof b!=='object'||Array.isArray(b))throw Error();return b}catch{fail('JSON 请求体无效')}
@@ -54,7 +63,12 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
     try{
       const url=new URL(req.url??'/','http://localhost'),method=req.method??'GET'
       const host=req.headers.host??''
-      if(req.headers.origin && new URL(req.headers.origin).host!==host)fail('来源不匹配',403)
+      if(req.headers.origin){
+        if(req.headers.origin==='null')fail('来源不匹配',403)
+        let origin:URL
+        try{origin=new URL(req.headers.origin)}catch{fail('来源无效',400)}
+        if(!['http:','https:'].includes(origin.protocol)||origin.origin!==req.headers.origin||origin.host.toLowerCase()!==host.toLowerCase())fail('来源不匹配',403)
+      }
       if(url.pathname==='/login'&&method==='GET'){
         if(!isLocal(req))fail('工作台登录链接限本机使用',403)
         if(ticketExpires<=Date.now()||url.searchParams.get('ticket')!==ticket)fail('登录链接已使用或已过期',403)
@@ -65,11 +79,13 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       if(!url.pathname.startsWith('/api/v1/')){
         if(method!=='GET')fail('接口不存在',404)
         const rel=decodeURIComponent(url.pathname.slice(1))||'index.html'
-        const file=rel==='favicon.ico'?favicon:resolve(webRoot,rel)
-        if((file!==favicon&&!file.startsWith(resolve(webRoot)+sep))||!mime[extname(file)])fail('页面不存在',404)
+        const localAsset=rel==='vendor/markdown-it.mjs'?markdownModule:rel==='favicon.ico'?favicon:null
+        const file=localAsset??resolve(webRoot,rel)
+        const contentType=file===markdownModule?'text/javascript; charset=utf-8':mime[extname(file)]
+        if((!localAsset&&!file.startsWith(resolve(webRoot)+sep))||!contentType)fail('页面不存在',404)
         let buf:Buffer
         try{buf=readFileSync(file)}catch{fail('页面不存在',404)}
-        res.writeHead(200,{'Content-Type':mime[extname(file)],'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"});res.end(buf);return
+        res.writeHead(200,{'Content-Type':contentType,'Content-Security-Policy':"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"});res.end(buf);return
       }
       const path=url.pathname.slice('/api/v1'.length),token=req.headers.authorization?.replace(/^Bearer /,'')??''
       const cookie=req.headers.cookie?.match(/(?:^|;\s*)maoqiu=([\w-]+)/)?.[1]
@@ -142,16 +158,23 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
       if(['POST','PATCH','DELETE'].includes(method) && b.requestId!=null && (typeof b.requestId!=='string'||!b.requestId.length||b.requestId.length>256))fail('requestId 无效')
       const result=transaction(db,()=>{
         if(method!=='GET' && token && !principal.owner && !auth.principal(db,token))fail('项目资料授权已失效',401)
-        const signature=b.requestId?hash(JSON.stringify([method,path,stable(b)])):null
+        const querySignature=Array.from(url.searchParams.entries()).map(([key,value],index)=>({key,value,index}))
+          .sort((a,b)=>a.key.localeCompare(b.key)||a.index-b.index).map(({key,value})=>[key,value])
+        const signature=b.requestId?hash(url.searchParams.toString()?JSON.stringify([method,path,stable(b),querySignature]):JSON.stringify([method,path,stable(b)])):null
         if(signature){
           const previous=one(db,'SELECT * FROM requests WHERE principal=? AND requestId=?',principal.id,b.requestId)
           if(previous){
             if(previous.signature!==signature) fail('相同 requestId 的内容不同',409)
-            return JSON.parse(previous.result)
+            const cached=JSON.parse(previous.result)
+            if(cached?._sensitiveResult==='grant-token')fail('此请求的授权令牌仅在首次签发时显示，请使用新的 requestId 重新签发',409)
+            return cached
           }
         }
         const value=route(db,{method,path,query:url.searchParams,body:b,principal,dataDir,localRequest:isLocal(req),plugins})
-        if(signature) db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run(principal.id,b.requestId,signature,JSON.stringify(value))
+        if(signature){
+          const cached=path==='/grants'&&method==='POST'?{_sensitiveResult:'grant-token'}:value
+          db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run(principal.id,b.requestId,signature,JSON.stringify(cached))
+        }
         return value
       })
       if(method==='GET' && /^\/attachments\/[^/]+$/.test(path)){
@@ -171,7 +194,11 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         else nodes.flush()
         apiBots.tick();broadcast();if(opts.chat!==false)void chat.tick()
       }
-    }catch(e:any){if(!e.status)console.error(e);if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()}
+    }catch(e:any){
+      if(!e.status)console.error(e)
+      if((req as IncomingMessage&{bodyTooLarge?:boolean}).bodyTooLarge)res.once('finish',()=>req.destroy())
+      if(!res.headersSent)json(res,e.status??500,{error:e.status?e.message:'服务端处理失败',current:e.current});else res.end()
+    }
   })
   const nodes=attachNodes(server,db,auth.node,dataDir,opts.desktop?.worktreeSource)
   function mustProject(projectId:unknown){

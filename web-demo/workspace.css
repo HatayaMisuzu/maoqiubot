@@ -788,7 +788,7 @@ main {
 }
 
 /* Safe Markdown typography */
-.md { font-size: var(--text-base); line-height: 1.68; color: var(--fg); display: grid; gap: 8px; }
+.md { font-size: var(--text-base); line-height: 1.68; color: var(--fg); display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
 .md h1, .md h2, .md h3, .md h4 { margin-top: 6px; font-weight: 650; color: var(--fg-strong); }
 .md h1 { font-size: 17px; }
 .md h2 { font-size: 15.5px; }
@@ -797,6 +797,12 @@ main {
 .md p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .md ul, .md ol { margin: 0; padding-left: 20px; display: grid; gap: 3px; }
 .md li { overflow-wrap: anywhere; }
+.md li.md-task-item { list-style: none; }
+.md-task { margin-inline: 0 6px; vertical-align: middle; }
+.md table { border-collapse: collapse; overflow-wrap: anywhere; }
+.md th, .md td { border: 1px solid var(--border); padding: 4px 8px; text-align: start; }
+.md th { background: var(--surface-subtle); }
+.compose-feedback { color: var(--muted); padding-inline: 4px; overflow-wrap: anywhere; }
 .md blockquote {
   margin: 0;
   padding: 4px 12px;
