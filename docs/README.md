@@ -25,6 +25,7 @@
 - [Orca 复用与小毛球升级验收](orca-reuse-report.md)
 - [会话升级验收报告](session-upgrade-report.md)
 - [工作台稳定性修复与验收](stability-repair-report.md)
+- [Codex 供应商切换与桌面发行验收](provider-stability-repair-report.md)
 
 ## 运行架构（四进程协同）
 
