@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
+import {randomUUID} from 'node:crypto'
 import {once} from 'node:events'
-import {mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs'
+import {mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {isAbsolute,join} from 'node:path'
 import {setTimeout as delay} from 'node:timers/promises'
 import test from 'node:test'
 import {startServer} from '../server/index.ts'
 import settings from '../desktop/connector-settings.cjs'
+import {discoverHermes,probeHermes} from '../desktop/hermes-discovery.cjs'
 
 const agent=String.raw`
 const {createInterface}=require('node:readline')
@@ -78,7 +80,7 @@ test('workbench connects Hermes, routes approvals and cancellation, and reloads 
   const temp=mkdtempSync(join(tmpdir(),'maoqiu-hermes-test-'))
   const config=join(temp,'node.json'),calls=join(temp,'calls'),home=join(temp,'profile')
   const app=startServer({port:0,dataDir:join(temp,'server'),chat:false})
-  let child,exit
+  let child,exit,connectorGeneration
   async function stopConnector(){
     if(child?.connected)child.disconnect()
     if(!exit)return
@@ -94,8 +96,10 @@ test('workbench connects Hermes, routes approvals and cancellation, and reloads 
       instances:[{id:'hermes',name:'Hermes',adapterKey:'hermes',workspaceRef:temp,command:process.execPath,args:['acp'],
         env:{HERMES_HOME:home,TEST_ACP_CALLS:calls}}]}))
     function startConnector(){
+      connectorGeneration=randomUUID()
       child=spawn(process.execPath,['connector/index.ts',config],{
-        env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local},stdio:['ignore','ignore','inherit','ipc'],windowsHide:true})
+        env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local,MAOQIU_CONNECTOR_GENERATION:connectorGeneration},
+        stdio:['ignore','ignore','inherit','ipc'],windowsHide:true})
       exit=once(child,'exit')
     }
     async function request(path,body,expected=200){
@@ -116,6 +120,12 @@ test('workbench connects Hermes, routes approvals and cancellation, and reloads 
     startConnector()
     const instance=await online()
     assert.equal(instance.capabilities.version,'fixture')
+    const firstGeneration=connectorGeneration
+    assert.deepEqual(app.localConnectorStatus(randomUUID()),{instances:[]})
+    const registration=app.localConnectorStatus(firstGeneration).instances[0]
+    assert.equal(registration.id,'hermes')
+    assert.equal(registration.online,true)
+    assert.match(registration.runtimeScopeId,/^[a-f0-9]{64}$/)
     const sessions='/instances/hermes/sessions'
     const catalog=await request(sessions)
     assert.deepEqual(catalog.items.map(item=>item.id),['hermes-session'])
@@ -159,8 +169,11 @@ test('workbench connects Hermes, routes approvals and cancellation, and reloads 
 
     await stopConnector()
     await wait('connector offline',async()=>(await request('/instances')).some(i=>i.id==='hermes'&&!i.online))
+    assert.deepEqual(app.localConnectorStatus(firstGeneration),{instances:[]})
     startConnector()
     await online()
+    assert.deepEqual(app.localConnectorStatus(firstGeneration),{instances:[]})
+    assert.deepEqual(app.localConnectorStatus(connectorGeneration).instances,[registration])
     const follow=await ask('continue')
     const continued=await snapshot(follow.runId,'completed')
     assert.equal(continued.thread.sessionId,completed.thread.sessionId)
@@ -203,4 +216,41 @@ test('desktop stores the Hermes ACP entrypoint and rejects another launcher name
     assert.deepEqual(JSON.parse(readFileSync(file,'utf8')).instances[0].args,['acp'])
     assert.throws(()=>settings.saveInstance(config,db,{...instance,command:'node'}),/官方可执行程序/)
   }finally{rmSync(temp,{recursive:true,force:true})}
+})
+
+test('Hermes discovery honors the configured launcher and profile and tests only ACP initialize',async t=>{
+  const temp=mkdtempSync(join(tmpdir(),'maoqiu-hermes-probe-'))
+  t.after(()=>rmSync(temp,{recursive:true,force:true,maxRetries:5,retryDelay:100}))
+  const launcherName=process.platform==='win32'?'hermes.cmd':'hermes'
+  const install=join(temp,'launcher with spaces')
+  const broken=join(temp,'broken install')
+  mkdirSync(install);mkdirSync(broken)
+  const goodPath=join(install,launcherName),brokenPath=join(broken,launcherName)
+  const script=join(install,'fixture.cjs'), calls=join(temp,'calls.jsonl')
+  writeFileSync(script,`const {createInterface}=require('node:readline');
+    createInterface({input:process.stdin}).on('line',line=>{
+      const {method,id}=JSON.parse(line);
+      require('node:fs').appendFileSync(process.env.TEST_ACP_CALLS,JSON.stringify({method,home:process.env.HERMES_HOME})+'\\n');
+      process.stdout.write(JSON.stringify({id,result:{protocolVersion:1,agentInfo:{name:'hermes-agent'}}})+'\\n');
+    });`)
+  writeFileSync(goodPath,process.platform==='win32'?`@echo off\r\n"${process.execPath}" "${script}" %*\r\n`:
+    `#!/bin/sh\nexec "${process.execPath}" "${script}" "$@"\n`,{mode:0o700})
+  writeFileSync(brokenPath,process.platform==='win32'?'@exit /b 1\r\n':'#!/bin/sh\nexit 1\n',{mode:0o700})
+  const file=join(temp,'standalone.json'), configurationHome=join(temp,'Hermes custom profile')
+  const entry={id:'configured',name:'Custom Hermes',adapterKey:'hermes',workspaceRef:temp,
+    profileId:'custom',command:goodPath,args:['acp'],env:{HERMES_HOME:configurationHome,TEST_ACP_CALLS:calls}}
+  writeFileSync(file,JSON.stringify({stateDir:join(temp,'node'),instances:[entry,{...entry,id:'broken',command:brokenPath},
+    {...entry,id:'missing',command:join(temp,'missing',launcherName)}]}))
+  const config={file,workspace:temp,editable:false}, initial=readFileSync(file,'utf8')
+  const discovery=discoverHermes(config)
+  assert.equal(discovery.editable,false)
+  const [good,bad,missing]=discovery.candidates
+  assert.deepEqual(good,{instanceId:'configured',name:'Custom Hermes',command:goodPath,configurationHome,profileId:'custom',found:true})
+  assert.equal(missing.found,false)
+  assert.equal((await probeHermes(config,missing)).status,'missing')
+  assert.equal((await probeHermes(config,{...good,command:script})).status,'missing')
+  assert.equal((await probeHermes(config,good)).status,'ready')
+  assert.equal((await probeHermes(config,bad)).status,'failed')
+  assert.deepEqual(readFileSync(calls,'utf8').trim().split('\n').map(line=>JSON.parse(line)),[{method:'initialize',home:configurationHome}])
+  assert.equal(readFileSync(file,'utf8'),initial)
 })

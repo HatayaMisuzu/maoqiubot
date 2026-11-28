@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { changed, fail, id, must, now, one, required, unpack } from './db/index.ts'
 import { assertBotAllowed } from './tasks/bots.ts'
-import { createThread, getThread, homeRead, message, messages, queueNativeBindingRelease } from './tasks/index.ts'
+import { assertNativeBindingScope, createThread, getThread, homeRead, message, messages, queueNativeBindingRelease } from './tasks/index.ts'
 import { modelSettings, selectedModel, type ModelConfig } from './chat/model-settings.ts'
 
 type Sharing = Pick<ModelConfig,'shareProject'|'sharePersonal'|'shareAttachments'> | undefined
@@ -183,6 +183,8 @@ export function nativeLifecycle(db:DatabaseSync,dir:string,thread:any,action:'fo
     return null
   }
   if(!inst.online)fail('原生实例离线，无法同步此操作',409)
+  assertNativeBindingScope(db,inst,thread)
+  if(thread.nativeInvalid)fail('原生绑定已失效，可查看工作台已保存的记录',409)
   assertBotAllowed(db,inst.id,actor==='user'?'direct':'delegate',thread.projectId)
   const active=one(db,"SELECT id FROM runs WHERE threadId=? AND status NOT IN ('completed','failed','blocked','cancelled')",thread.id)
   if(active){
@@ -220,7 +222,9 @@ export function threadLifecycle(db:DatabaseSync,key:string,b:any,dir=''){
       break
     }
     case 'replaceNative': {
-      if(thread.kind!=='native'||!thread.nativeInvalid||!readable(thread.state)||!threadImpact(db,key).canPurge)
+      const unverified=thread.kind==='native'&&thread.sessionId&&!thread.nativeRuntimeScopeId&&
+        one(db,"SELECT 1 FROM instances WHERE id=? AND adapterKey='codex'",thread.instanceId)
+      if(thread.kind!=='native'||(!thread.nativeInvalid&&!unverified)||!readable(thread.state)||!threadImpact(db,key).canPurge)
         fail('请先核对并标记旧绑定失效',409)
       assertBotAllowed(db,thread.instanceId,'direct',thread.projectId)
       const target=createThread(db,dir,{instanceId:thread.instanceId,projectId:thread.projectId,title:b.title||thread.title+' · 接续'})

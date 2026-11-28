@@ -1,6 +1,6 @@
 # 小毛球 Bot 工作台
 
-这是 Windows 个人桌面工作台。桌面壳（Electron）、本机服务端（HTTP/SSE/WebSocket）、原生连接器与内置外接 Agent 管理组件协同运行；后端、毛球之家与附件共用一份 SQLite 数据目录（主库 v10，连接器本地库 v2）。工作 Bot 在配置的本机环境与工作区目录中执行，前端 `web-demo/` 通过本机 HTTP 和 SSE 接口与工作台交互（亦支持纯浏览器模式运行，桌面进程管理入口将降级为只读监控视图）。
+这是 Windows 个人桌面工作台。桌面壳（Electron）、本机服务端（HTTP/SSE/WebSocket）、原生连接器与内置外接 Agent 管理组件协同运行；后端、毛球之家与附件共用一份 SQLite 数据目录（主库 v11，连接器本地库 v2）。工作 Bot 在配置的本机环境与工作区目录中执行，前端 `web-demo/` 通过本机 HTTP 和 SSE 接口与工作台交互（亦支持纯浏览器模式运行，桌面进程管理入口将降级为只读监控视图）。
 
 详细文档结构与架构拓扑见 [docs/README.md](docs/README.md)。
 
@@ -29,7 +29,7 @@ npm.cmd run package:desktop
 | `npm.cmd start` | 仅启动服务端（不启动默认本地连接器） |
 | `npm.cmd run connector` | 独立运行连接器进程（按传入配置或 `MAOQIU_NODE_URL` 连接服务端） |
 | `npm.cmd run build:agent-manager` | 在 `build/.agent-manager-work` 拉取/应用 CC Switch 补丁并编译产出 `build/agent-manager/`（含开源许可声明） |
-| `npm.cmd run package:desktop` | 校验并打包最新完整桌面包到 `dist/Xiaomaoqiu-win32-x64`，并自动把 `dist/` 原有旧包归档至 `backups/desktop-packages/`（可用 `MAOQIU_PACKAGE_OUT`、`MAOQIU_PACKAGE_ARCHIVE` 覆盖路径） |
+| `npm.cmd run package:desktop` | 先在 `build/` 暂存并校验完整桌面包，再归档 `dist/` 的旧包并发布到 `dist/Xiaomaoqiu-win32-x64` |
 | `npm.cmd run backup -- save/restore ...` | 创建或恢复数据库、附件及脱敏连接器配置快照 |
 | `npm.cmd run check` | 运行 TypeScript 类型检查（`tsc --noEmit`） |
 | `npm.cmd test` | 运行 Node 单元测试套件 |
@@ -43,8 +43,11 @@ npm.cmd run package:desktop
 - `MAOQIU_DSH_EXECUTABLE`：指定 DSH 官方可执行入口路径（如 `dsh.cmd`）
 - `MAOQIU_CHAT_CODEX`：指定主聊 Codex CLI 可执行文件名称或路径（默认 `codex`）
 - `MAOQIU_SAFE_PLUGINS=1`：安全模式，启动时不加载外部可执行扩展
-- `MAOQIU_PACKAGE_OUT`：指定 `package:desktop` 输出目录
+- `MAOQIU_PACKAGE_OUT`：指定 `dist/` 之外的独立输出目录。打包时只归档该目录内同名的旧发行包
+- `MAOQIU_PACKAGE_ARCHIVE`：指定旧包归档目录（默认 `backups/desktop-packages/`）
 - `MAOQIU_MODEL_KEY_*` / `MAOQIU_PLUGIN_KEY_*`：分别供主聊外部模型及扩展工具引用的密钥环境变量（自动从 Codex/连接器子进程隔离）
+
+替换旧包前，先从托盘退出旧版工作台并关闭 Agent 管理窗口。发布失败时打包脚本会尝试恢复旧包。若脚本报告无法恢复，先将目标目录现有内容移到其他位置，再将日志中提示的旧包归档恢复到原路径。数据库回退请使用升级前备份，详见[会话与升级](docs/sessions.md)。
 
 ### 外接 Agent 管理与执行实例
 
@@ -52,8 +55,9 @@ npm.cmd run package:desktop
 
 - 配置窗口打开时，工作台会暂停空闲本机连接器；若有运行仍在进行，会提示等待或先停止。若同一种 Agent 配置了多份独立配置目录，可在「目标配置」切换对应实例。
 - 从仓库根目录配置的实例可在「执行实例与工作区 → 新建 Git 工作树」建立 `maoqiu/<实例 ID>` 独立工作分支及新实例，用于多 Bot 并行修改互不干扰。
-- Codex 工作 Bot 只需保留单一实例：在「Agent 设置」顶层面板即可直接查看本机 `config.toml` / 外接管理配置的当前供应商，并在 `official`（官方 ChatGPT 登录）与 `native`（跟随本机供应商）间一键切换重连；若已有绑定原生会话，会先提示确认归档旧绑定再保留全部本地历史。
-- 在「Agent 设置 → 打开管理窗口」切换过本机 Codex 供应商后，对无绑定会话的 `native` 模式 Codex 实例会在关闭管理窗口后自动解除旧绑定范围并按新供应商重连。
+- 在「Agent 设置」可将同一 Codex 实例切换为 `official`（官方 ChatGPT 登录）或 `native`（跟随本机原生配置）。重复应用同一有效配置会直接返回。存在旧原生绑定时须确认影响范围，工作台保留本地消息和来源，并提示通过替代话题继续。保存后，界面会等待本次新连接的握手登记。
+- 在外接管理窗口修改 Codex 账号或供应商后，工作台会重新核对身份。只有空闲且无受影响绑定的实例才会自动接受变化。有绑定时在「Agent 设置」确认后重连。若外部修改后界面还未发现变化，可先点「测试连接」。
+- Hermes 可在「执行实例与工作区」重新扫描。找到启动器后，可先验证 ACP 握手，再手动添加实例。使用独立 JSON 时在原文件管理实例。
 
 快捷交互：工作台支持 `Ctrl+K` 打开快速切换与搜索面板（命令面板），`Ctrl+I` 切换右侧上下文面板；在窄屏设备下上下文面板与侧栏抽屉均支持遮罩点击与 `Esc` 收起。
 
@@ -96,6 +100,6 @@ $env:MAOQIU_DATA = 'restored-data'
 npm.cmd start
 ```
 
-备份默认包含 `workbench.sqlite`、`persona.md`、`chat-models.json`、`chat-policy.json`、附件与插件包，并通过 `--without-access` 控制是否剔除 `access.local.json`。传入 `--connector-config` 时仅保留安全的启动参数、工作树与 `CODEX_HOME`/`DSH_HOME`/`HERMES_HOME`/`HERMES_DATA_DIR_SUFFIX` 环境变量，自动剥离密钥环境变量。切勿使用旧版程序打开 v10 数据库。
+备份默认包含 `workbench.sqlite`、`persona.md`、`chat-models.json`、`chat-policy.json`、附件与插件包，并通过 `--without-access` 控制是否剔除 `access.local.json`。传入 `--connector-config` 时仅保留安全的启动参数、工作树与 `CODEX_HOME`/`DSH_HOME`/`HERMES_HOME`/`HERMES_DATA_DIR_SUFFIX` 环境变量，自动剥离密钥环境变量。切勿使用旧版程序打开 v11 数据库。
 
 第三方开源组件及许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

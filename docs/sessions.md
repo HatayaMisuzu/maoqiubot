@@ -12,7 +12,7 @@
 
 ## 会话与数据
 
-工作台主库 SQLite 已演进至版本 10（`workbench.sqlite`，`PRAGMA user_version = 10`；连接器本地库为版本 2）。自版本 7 起在迁移事务内从个人范围选取最近实际聊过的普通小毛球话题作为主聊，没有候选时新建；后续版本陆续增加了 `threads.nativeReleased` 解绑标记（v8）、请求幂等表中授权令牌缓存脱敏（v9）以及工作 Bot 用量回执表 `bot_usage_receipts`（v10）。已有项目话题保持项目边界。唯一索引保证重复启动只得到一个主聊。所有者可以对选定个人侧聊调用 `setMain` 并提供原主聊 ID 与明确确认，原来的话题保留为侧聊。
+工作台主库 SQLite 当前为版本 11（`workbench.sqlite`），连接器本地库为版本 2。v11 保存原生话题的来源范围 `threads.nativeRuntimeScopeId`。Codex 旧绑定只在原连接器保存了匹配的实例、工作区、会话和身份记录时补录来源范围。缺少证据的旧绑定标为待核对，保留工作台消息，可建立替代话题。已有项目话题保持项目边界。唯一索引保证重复启动只得到一个主聊。所有者可以对选定个人侧聊调用 `setMain` 并提供原主聊 ID 与明确确认，原来的话题保留为侧聊。
 
 重置上下文会更新该话题的消息边界。时间线与导出仍能看到旧原文，模型检索和摘要从新边界开始。个人/项目历史、外部模型分享开关及附件权限限制跨聊检索。消息删除后清除相应消息内容、待确认记忆与旧摘要，重新生成上下文。已经确认的长期记忆可在毛球之家单独修订。
 
@@ -32,9 +32,11 @@
 | DSH / ACP v1 | ACP session ID | 只在握手声明 list 时查询对应 cwd 的分页目录；没有只读完整消息回放时显示工作台缓存 | new、声明的 resume/load、prompt、cancel；fork/delete 只按握手声明开放 |
 | Hermes / ACP v1 | ACP session ID | 按 Hermes profile 和当前工作区查询目录，显示工作台收到的消息 | new、prompt、cancel 和权限答复；导入及重连通过目录核查后 load，fork 按握手声明开放 |
 | 独立 API 工作 Bot | 工作台本地话题与消息 | 本地分页；当前请求和获准的近期历史送到选定模型 | 复用模型配置，强制非流式单次请求收集完整 token 用量并支持取消；底层模型停用或缺失时动态标记离线；没有原生工作目录、会话 ID 或内部工具 |
-| 旧连接器 | 沿用原有绑定 | 未声明的新能力视为不可用 | 保留既有派发与回执协议 |
+| 旧连接器 | 非 Codex 实例沿用原有绑定 | 未声明的新能力视为不可用 | Codex 须升级至支持原生范围核验的连接器 |
 
-Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。在桌面端「Agent 设置」顶层「Codex 供应商」面板即可直接调节同一个 Codex 实例的供应商模式（`official` 官方 ChatGPT 登录 / `native` 跟随本机供应商）并查看只读 `config.toml` 摘要与外接管理已配置的供应商名称（新建/复制实例也可在「执行实例与工作区」中预设该模式）。若已有绑定原生会话，切换会先要求确认，确认后将旧绑定话题标记 `nativeInvalid` 并归档（保留本地记录，可用「建立替代话题」继续）；无绑定原生会话时，`native` 模式 Codex 在关闭「外接 Agent 管理」窗口后也会自动按新供应商重连。原生目录支持不等于外部客户端已经释放写入占用。ACP 的 list 与 delete 由协议握手字段声明，fork 属于需要单独协商的扩展。[ACP 目录](https://agentclientprotocol.com/protocol/v1/session-list) · [ACP 删除语义](https://agentclientprotocol.com/protocol/v1/session-delete) · [ACP fork 草案](https://agentclientprotocol.com/rfds/session-fork)
+Codex 通过官方 stdio 接口探测能力和核对原生身份。在「Agent 设置 → Codex 供应商」可切换 `official`（官方 ChatGPT 登录）与 `native`（跟随本机供应商），并查看只读配置摘要。相同模式和有效身份重复应用时保留当前连接。切换涉及原生绑定时需确认，范围包含本地缓存已经清理且尚未解除的绑定。活跃旧话题归档，其他话题保留原状态，旧会话 ID 和本地记录继续留在来源范围内。切回旧账号后，已失效话题仍可查看工作台消息和创建替代话题。已经清理缓存的话题仅在原身份和本地映射均核对后可解除绑定。
+
+关闭「外接 Agent 管理」后，桌面端会核对 `native` 模式的身份变化。无受影响的绑定和待核对操作时可以应用新身份并重连。有绑定时可在「Agent 设置」确认影响范围并应用；确认前 Codex 保持受保护状态。原生目录支持不等于外部客户端已经释放写入占用。ACP 的 list 与 delete 由协议握手字段声明，fork 属于需要单独协商的扩展。[ACP 目录](https://agentclientprotocol.com/protocol/v1/session-list) · [ACP 删除语义](https://agentclientprotocol.com/protocol/v1/session-delete) · [ACP fork 草案](https://agentclientprotocol.com/rfds/session-fork)
 
 工作台联系人下可搜索会话和查看原生目录。原生目录按实例、工作区、账号/profile 读取，已绑定或待导入的会话只在原项目及实例显示。原生历史保留本次页面会话中已读取的分页内容和读取时间，掉线时显示为缓存。Codex 可按需从 App Server 查询额度窗口，DSH/Hermes 提示在原生客户端查看官方订阅额度并在工作台「Agent 设置」（浏览器为「Bot 监控」）统一查看运行状态与任务用量。[Codex App Server](https://learn.chatgpt.com/docs/app-server)
 
@@ -83,8 +85,8 @@ Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。在�
 退出指向实际数据目录的旧实例，再用仓库备份命令保存数据库、附件及连接器状态。示例命令采用尚不存在的目标目录。
 
 ```powershell
-npm.cmd run backup -- save data backups/before-session-v10 --offline --connector data/node-local --connector-config data/desktop-connector.json
-npm.cmd run backup -- restore backups/before-session-v10 backups/restored-data
+npm.cmd run backup -- save data backups/before-session-v11 --offline --connector data/node-local --connector-config data/desktop-connector.json
+npm.cmd run backup -- restore backups/before-session-v11 backups/restored-data
 ```
 
-恢复时选用与备份兼容的程序版本，将其数据目录指向恢复出的新目录，再核对原生连接器配置。`--connector-config` 会脱敏保存并恢复安全的启动参数 `args`、`CODEX_HOME`/`DSH_HOME`/`HERMES_HOME`/`HERMES_DATA_DIR_SUFFIX` 目录环境、`codexProviderMode` 与 `worktree` 字段，同时自动剥离秘密环境变量；仍需独立保存模型密钥或重新配置环境变量，既有备份机制不会复制本机模型密钥文件。切勿用旧版程序直接打开 v10 原库。
+恢复时选用与备份兼容的程序版本，将其数据目录指向恢复出的新目录，再核对原生连接器配置。`--connector-config` 会脱敏保存并恢复安全的启动参数 `args`、`CODEX_HOME`/`DSH_HOME`/`HERMES_HOME`/`HERMES_DATA_DIR_SUFFIX` 目录环境、`codexProviderMode` 与 `worktree` 字段，同时自动剥离秘密环境变量。模型密钥继续由原有环境变量或密钥文件管理。切勿用旧版程序直接打开 v11 原库。

@@ -11,7 +11,7 @@ function officialCodex(instance:Instance){
 export function agentEnvironment(instance:Instance){
   const source={...process.env,...instance.env}
   const env=officialCodex(instance)?codexEnvironment(source):source
-  for(const key of Object.keys(env))if(/^(?:NODE_OPTIONS$|NODE_PATH$|ELECTRON_RUN_AS_NODE$|MAOQIU_EXPECTED_AGENT_SCOPES$|(?:NODE|OWNER)_TOKEN$|MAOQIU_(?:MODEL|PLUGIN)_KEY_)/i.test(key))delete env[key]
+  for(const key of Object.keys(env))if(/^(?:NODE_OPTIONS$|NODE_PATH$|ELECTRON_RUN_AS_NODE$|MAOQIU_(?:EXPECTED_AGENT_SCOPES|CONNECTOR_GENERATION)$|(?:NODE|OWNER)_TOKEN$|MAOQIU_(?:MODEL|PLUGIN)_KEY_)/i.test(key))delete env[key]
   return env
 }
 

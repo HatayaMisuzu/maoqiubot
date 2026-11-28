@@ -97,7 +97,11 @@ export function openDatabase(dir: string) {
         body TEXT NOT NULL,factKey TEXT,recordType TEXT NOT NULL,important INTEGER NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL);
     `),db=>{initSessions(db);initBotSchema(db);initChatBudget(db)},db=>db.exec(`
       ALTER TABLE threads ADD COLUMN nativeReleased INTEGER NOT NULL DEFAULT 0;
-    `),scrubCachedGrantTokens,initBotUsage])
+    `),scrubCachedGrantTokens,initBotUsage,db=>db.exec(`
+      ALTER TABLE threads ADD COLUMN nativeRuntimeScopeId TEXT;
+      CREATE INDEX threads_native_binding ON threads(sessionId,nativeRuntimeScopeId) WHERE kind='native' AND sessionId IS NOT NULL;
+      CREATE TABLE desktop_codex_switch(id TEXT PRIMARY KEY);
+    `)])
     db.exec('UPDATE instances SET online=0')
     db.function('maoqiu_fact_key',{deterministic:true},value=>typeof value==='string'?normalizeFactKey(value):null)
     return db

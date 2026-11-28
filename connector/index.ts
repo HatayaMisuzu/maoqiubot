@@ -2,7 +2,7 @@ import {existsSync,mkdirSync,readFileSync,writeFileSync,realpathSync} from 'node
 import {basename,isAbsolute,resolve,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
-import {agentCommand,agentHome,agentHomeVariable,agentRuntimeKey,agentRuntimeScope} from '../contracts/agent-runtime.ts'
+import {accountRuntimeKey,agentCommand,agentHome,agentHomeVariable,agentRuntimeKey,agentRuntimeScope} from '../contracts/agent-runtime.ts'
 import WebSocket from 'ws'
 import {registry} from './adapters/index.ts'
 import {runKeyedSerializedOperation} from './keyed-serialized-operations.ts'
@@ -16,6 +16,7 @@ const token=process.env.NODE_TOKEN
 if(!token) throw new Error('需要设置 NODE_TOKEN')
 const url=new URL(process.env.MAOQIU_NODE_URL||config.url)
 const loopback=['localhost','127.0.0.1','[::1]'].includes(url.hostname)
+const desktopGeneration=process.env.MAOQIU_CONNECTOR_GENERATION
 if(!(url.protocol==='wss:' || url.protocol==='ws:' && loopback)) throw new Error('跨机连接需要 wss://')
 const baseUrl=new URL('/api/v1/',url)
 baseUrl.protocol=url.protocol==='wss:'?'https:':'http:'
@@ -119,6 +120,8 @@ async function handle(c:Command) {
     if(!inst?.adapter || !inst.caps.availableActions.includes(c.kind)) throw new Error('实例离线或不支持该操作')
     if(c.workspaceRef!==inst.config.workspaceRef || c.profileId!==inst.config.profileId) throw new Error('命令的工作区或 profile 与节点不一致')
     const adapter=inst.adapter
+    const scopedCodex=inst.config.adapterKey==='codex'
+    if(scopedCodex&&!c.runtimeScopeId||c.runtimeScopeId&&c.runtimeScopeId!==inst.runtimeScopeId)throw Error('原生命令的账号或供应商范围无法核对')
     if(c.kind==='run'||c.kind==='prepare') {
       if(preparing.has(c.runId)||running.has(c.runId))throw Error('运行已经排队或已启动')
       const pending={command:c,adapter,cancelled:false,started:false}
@@ -130,32 +133,32 @@ async function handle(c:Command) {
         if(stopping||inst.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
         if(occupied.has(c.threadId)) throw new Error('话题正在处理上一轮输入')
         occupied.add(c.threadId);locked=true
-        const runtimeKey=await checkedRuntime(inst,adapter)
+        const runtimeKey=await checkedRuntime(inst,adapter,c.runtimeScopeId)
         if(pending.cancelled)return
-        const bound=store.binding(c,inst.config.workspaceRef,runtimeKey)
+        const bound=store.binding(c,inst.config.workspaceRef,runtimeKey,scopedCodex)
         if(c.payload.sessionId && c.payload.sessionId!==bound) throw new Error('请求不属于本节点绑定的会话')
         const incoming=c.kind==='prepare'?c.payload.importSessionId:undefined
         const op=c.kind==='prepare'?c.payload.nativeOperation:undefined
         if(op?.action==='release'){
-          const busy=[...running.values()].some(value=>value.run.sessionId===op.sourceSessionId)||
+          const busy=[...running.values()].some(value=>value.run.command.threadId===op.sourceThreadId)||
             [...preparing.values()].some(value=>value.command.threadId===op.sourceThreadId&&value.command.id!==c.id)
           if(!inst.caps.sessionList||op.sourceThreadId!==c.threadId||bound!==op.sourceSessionId||busy)
             throw Error('原生绑定的会话、范围或运行状态已变化')
-          const event=store.release(c,inst.config.workspaceRef,runtimeKey,op.sourceSessionId)
+          const event=store.release(c,inst.config.workspaceRef,runtimeKey,op.sourceSessionId,scopedCodex)
           send({type:'event',event})
           receipt(c.id,'done')
           return
         }
         if(op){
           if(!adapter.sessionAction||!inst.caps.nativeActions?.includes(op.action)||
-            store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey)!==op.sourceSessionId||
+            store.binding({...c,threadId:op.sourceThreadId},inst.config.workspaceRef,runtimeKey,scopedCodex)!==op.sourceSessionId||
             (op.action==='fork'?bound||op.sourceThreadId===c.threadId:bound!==op.sourceSessionId))throw Error('原生操作能力或来源绑定不匹配')
           started=true
           pending.started=true
           store.submit(c.id)
-          emit(c,'accepted',{sessionId:op.sourceSessionId})
+          emit(c,'accepted',op.action==='fork'?{}:{sessionId:op.sourceSessionId})
           const sessionId=await adapter.sessionAction(op.action,op.sourceSessionId)
-          if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
+          if(op.action==='fork')store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey,scopedCodex)
           emit(c,'completed',{sessionId,nativeAction:op.action})
           receipt(c.id,'done')
           return
@@ -166,7 +169,7 @@ async function handle(c:Command) {
         if(c.kind==='prepare')emit(c,'accepted',{})
         const sessionId=incoming&&!bound?await adapter.importSession!(incoming):await adapter.open(bound)
         if(stopping||inst.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
-        store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey)
+        store.bind(c,inst.config.workspaceRef,sessionId,runtimeKey,scopedCodex)
         if(pending.cancelled)return
         const run:Run={command:c,sessionId,emit:(kind,data)=>emit(c,kind,data)}
         if(c.kind==='prepare'){
@@ -176,7 +179,7 @@ async function handle(c:Command) {
           const material=await input(c)
           if(pending.cancelled)return
           if(stopping||inst.adapter!==adapter) throw Error('原生进程已断开，输入尚未发送')
-          if(inst.config.codexProviderMode==='native')await checkedRuntime(inst,adapter)
+          if(scopedCodex)await checkedRuntime(inst,adapter,c.runtimeScopeId)
           if(pending.cancelled)return
           cleanup=grant(c,material)
           running.set(c.runId,{run,adapter})
@@ -202,6 +205,7 @@ async function handle(c:Command) {
         (c.payload.sessionId!==run.sessionId && !(c.kind==='cancel'&&!c.payload.sessionId)) || c.projectId!==run.command.projectId ||
         (c.payload.nativeRunId && c.payload.nativeRunId!==run.nativeRunId)) throw new Error('该运行不再接收控制命令')
       const material=c.kind==='steer'?await input(c):undefined
+      if(scopedCodex)await checkedRuntime(inst,adapter,c.runtimeScopeId)
       if(inst.adapter!==adapter || running.get(c.runId)!==target) throw Error('原运行已结束或已断开')
       store.submit(c.id)
       started=true
@@ -234,7 +238,7 @@ async function handle(c:Command) {
 async function runtimeIdentity(inst:{config:Instance,adapter?:Adapter}) {
   const account=await inst.adapter?.identity?.()
   const runtimeKey=inst.config.runtimeKey??''
-  return account?JSON.stringify([runtimeKey,account]):runtimeKey
+  return accountRuntimeKey(runtimeKey,account)
 }
 async function checkedRuntime(entry:Entry,adapter:Adapter,expected=entry.runtimeScopeId){
   const runtime=await runtimeIdentity({config:entry.config,adapter})
@@ -248,15 +252,17 @@ async function recover(inst:Entry) {
     const c:Command=JSON.parse(row.body)
     if(row.submitted===0){
       const detail=c.kind==='prepare'?'连接中断，请重新读取会话模型':'原生进程中断，指令尚未发送'
-      if(c.kind==='run'||c.kind==='prepare')emit(c,'failed',{text:detail})
+      if(c.kind==='run'||c.kind==='prepare')emit(c,'failed',{text:detail,notDispatched:true})
       store.status(c.id,'failed',detail)
       continue
     }
     let verified=false
     try {
       const adapter=inst.adapter
-      if(c.kind==='run' && adapter?.inspect){
-        const sessionId=store.binding(c,inst.config.workspaceRef,await runtimeIdentity(inst))
+      const scopedCodex=inst.config.adapterKey==='codex'
+      if(c.kind==='run' && adapter?.inspect && (!scopedCodex||c.runtimeScopeId)){
+        const runtime=await checkedRuntime(inst,adapter,c.runtimeScopeId)
+        const sessionId=store.binding(c,inst.config.workspaceRef,runtime,scopedCodex)
         const saved=store.db.prepare('SELECT native FROM runs WHERE id=?').get(c.runId)
         if(sessionId && typeof saved?.native==='string')
           verified=await adapter.inspect({command:c,sessionId,nativeRunId:saved.native,emit:(kind,data)=>emit(c,kind,data)})
@@ -335,7 +341,9 @@ for(const instance of config.instances as Instance[]) {
 }
 function connect(){
   if(stopping) return
-  ws=new WebSocket(url,{headers:{Authorization:'Bearer '+token,'X-Node-Id':config.nodeId},maxPayload:4*1024*1024,handshakeTimeout:15000})
+  ws=new WebSocket(url,{headers:{Authorization:'Bearer '+token,'X-Node-Id':config.nodeId,
+    ...(loopback&&config.nodeId==='local'&&desktopGeneration?{'X-Maoqiu-Connector-Generation':desktopGeneration}:{})},
+    maxPayload:4*1024*1024,handshakeTimeout:15000})
   ws.on('open',async()=>{
     const socket=ws
     const registrations=[...instances.values()].map(entry=>{
@@ -343,10 +351,10 @@ function connect(){
       const runtimeScopeId=adapter&&entry.runtimeScopeId
       return {id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,
         ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,nativeBindingRelease:caps.sessionList===true,
-        usage:typeof entry.adapter?.readUsage==='function'&&caps.usage!==false,error,online:!error}
+        usage:typeof entry.adapter?.readUsage==='function'&&caps.usage!==false,error,online:!!runtimeScopeId&&!error}
     })
     if(ws!==socket||socket?.readyState!==WebSocket.OPEN)return
-    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,cancelBeforeStart:true,instances:registrations})
+    send({type:'hello',nodeId:config.nodeId,receiptLookup:true,cancelBeforeStart:true,scopedCommands:true,nativeBindingProofs:loopback,instances:registrations})
     for(const row of store.db.prepare('SELECT event FROM outbox ORDER BY rowid').iterate()) send({type:'event',event:JSON.parse(String(row.event))})
     for(const row of store.db.prepare('SELECT c.id,c.status,c.detail FROM commands c LEFT JOIN receipt_acks a ON c.id=a.id WHERE c.status IS NOT a.status ORDER BY c.rowid').iterate()) send({type:'receipt',commandId:row.id,status:row.status,detail:row.detail})
   })
@@ -354,6 +362,15 @@ function connect(){
     try{
       const frame=JSON.parse(bytes.toString())
       if(frame.type==='command') await handle(frame.command)
+      else if(frame.type==='verify_native_bindings'&&loopback&&Array.isArray(frame.bindings)&&frame.bindings.length<=200){
+        const bindings=frame.bindings.flatMap((proof:any)=>{
+          if(!proof||typeof proof.instance!=='string'||typeof proof.thread!=='string'||typeof proof.workspace!=='string'||typeof proof.session!=='string'||
+            instances.get(proof.instance)?.config.adapterKey!=='codex')return []
+          const scope=store.bindingProof(proof.thread,proof.instance,proof.workspace,proof.session)
+          return scope?[{thread:proof.thread,instance:proof.instance,workspace:proof.workspace,session:proof.session,scope}]:[]
+        })
+        if(bindings.length)send({type:'native_binding_proofs',bindings})
+      }
       else if(frame.type==='read_history'&&typeof frame.id==='string'){
         const entry=instances.get(frame.instanceId),socket=ws
         try{
@@ -361,7 +378,7 @@ function connect(){
           if(!entry?.caps.nativeHistory||!adapter?.readHistory||entry.config.workspaceRef!==frame.workspaceRef||
             entry.config.profileId!==frame.profileId||!frame.sessionId)throw Error('原生历史绑定不匹配')
           const runtime=await checkedRuntime(entry,adapter,frame.runtimeScopeId||undefined)
-          if(store.binding(frame,entry.config.workspaceRef,runtime)!==frame.sessionId)throw Error('原生历史绑定不匹配')
+          if(store.binding(frame,entry.config.workspaceRef,runtime,entry.config.adapterKey==='codex')!==frame.sessionId)throw Error('原生历史绑定不匹配')
           const page=await adapter.readHistory(frame.sessionId,frame.before)
           if(ws===socket)send({type:'history',id:frame.id,...page})
         }catch{if(ws===socket)send({type:'history',id:frame.id,error:true})}
@@ -422,5 +439,20 @@ function stop(){
 process.once('SIGINT',stop)
 process.once('SIGTERM',stop)
 if(process.send)process.once('disconnect',stop)
+const desktopPort=(process as NodeJS.Process & {parentPort?:{
+  on(event:'message',listener:(message:{data:unknown})=>void):void
+  postMessage(message:unknown):void
+}}).parentPort
+desktopPort?.on('message',({data})=>{
+  if(data!=='stop'&&data!=='quit')return
+  if(data==='stop'&&(running.size||preparing.size||handling.size)){
+    desktopPort.postMessage('stop-blocked')
+    return
+  }
+  stop()
+  // Electron keeps the utility IPC channel open after the connector closes its own handles.
+  store.db.close()
+  process.exit(0)
+})
 await Promise.all([...instances.values()].map(entry=>startAdapter(entry)))
 connect()

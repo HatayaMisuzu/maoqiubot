@@ -1,6 +1,7 @@
-import { api, btn, confirmDialog, displayDialog, el, items, notice } from './lib.js';
+import { btn, confirmDialog, displayDialog, el, icon, notice } from './lib.js';
 import { desktopSettings } from './desktop-settings.js';
 import { mountAgentMonitor } from './agent-monitor.js';
+import { waitForConnector } from './connector-connection.js';
 
 export async function agentManagement(onUpdated, onBotSettings) {
   const desktop = window.maoqiuDesktop;
@@ -42,7 +43,9 @@ export async function agentManagement(onUpdated, onBotSettings) {
   }, 'primary', 'sliders');
 
   const codexSection = el('div', 'settings-list');
+  const codexMessages = new Map();
   let codexControls = [];
+  let codexBusy = false;
   let lastStatus = initial;
   let dialog;
   let panel;
@@ -58,6 +61,7 @@ export async function agentManagement(onUpdated, onBotSettings) {
     codexSection.hidden = false;
     const cards = codexInstances.map(instance => {
       const isNative = instance.codexProviderMode === 'native';
+      const currentMode = isNative ? 'native' : 'official';
       const localSummary = instance.codexLocal || {};
       const managerProviders = Array.isArray(instance.codexManagerProviders) ? instance.codexManagerProviders : [];
       const details = [];
@@ -78,6 +82,15 @@ export async function agentManagement(onUpdated, onBotSettings) {
           item.name + (item.isCurrent ? '（当前）' : '')).join('、')));
       }
       let controls = null;
+      const progress = el('small', 'muted', codexMessages.get(instance.id) || (instance.codexIdentityChanged
+        ? '检测到本机账号或供应商变化，应用前需核对原生绑定。' : ''));
+      progress.setAttribute('role', 'status');
+      progress.hidden = !progress.textContent;
+      const report = message => {
+        codexMessages.set(instance.id, message);
+        progress.textContent = message;
+        progress.hidden = !message;
+      };
       if (currentSettings.editable && desktop.setCodexProvider) {
         const modeSelect = el('select', '',
           (() => {
@@ -90,67 +103,70 @@ export async function agentManagement(onUpdated, onBotSettings) {
             option.value = 'official';
             return option;
           })());
-        modeSelect.value = isNative ? 'native' : 'official';
-        const ctrl = { select: modeSelect, apply: null, busy: false };
-        const applyBtn = btn('应用供应商设置', async () => {
-          const targetMode = modeSelect.value;
+        modeSelect.value = currentMode;
+        const canApply = () => modeSelect.value !== currentMode || instance.codexIdentityChanged;
+        const isOpen = () => panel.isConnected && dialog.open;
+        const applyBtn = el('button', 'secondary', icon('refresh'), '应用供应商设置');
+        applyBtn.type = 'button';
+        applyBtn.onclick = async () => {
+          if (codexBusy || lastStatus.active || !canApply()) return;
           const labelNode = applyBtn.lastChild;
-          ctrl.busy = true;
-          modeSelect.disabled = true;
-          applyBtn.disabled = true;
+          const payload = { instanceId: instance.id, codexProviderMode: modeSelect.value };
+          const previousGeneration = currentSettings.connectorGeneration;
+          codexBusy = true;
+          render(lastStatus);
           if (labelNode) labelNode.textContent = '应用中…';
+          let saved = false;
+          const retry = '可使用「执行实例与工作区 → 测试连接」重试。';
           try {
-            const start = Date.now() - 50;
-            let result = await desktop.setCodexProvider({ instanceId: instance.id, codexProviderMode: targetMode });
+            let result = await desktop.setCodexProvider(payload);
+            if (!isOpen()) return;
             if (result?.requiresConfirmation) {
               const confirmed = await confirmDialog({
                 title: '确认切换 Codex 供应商？',
-                body: `该实例当前有 ${result.boundThreads} 个已绑定原生会话的话题。切换供应商后，这些话题将保留全部本地记录并转为「归档 / 绑定失效」，后续可使用「建立替代话题」继续工作。`,
+                body: `该实例当前有 ${result.boundThreads} 个已绑定原生会话的话题。切换会保留本地记录和原绑定，归档活跃话题并标记原绑定失效。已清除但未解绑的记录也会保留，可用「建立替代话题」继续工作。`,
                 confirmLabel: '确认切换并重连',
                 destructive: true
               });
-              if (!confirmed) return;
-              result = await desktop.setCodexProvider({
-                instanceId: instance.id,
-                codexProviderMode: targetMode,
-                confirmRebind: true
-              });
+              if (!confirmed || !isOpen()) return;
+              result = await desktop.setCodexProvider({ ...payload, confirmationToken: result.confirmationToken });
             }
-            if (!result?.applied) return;
-            if (result.view?.connectorRunning) {
-              for (let i = 0; i < 20; i++) {
-                if (!panel.isConnected || !dialog?.open) break;
-                try {
-                  const live = items(await api('/instances'));
-                  const updated = live.find(item => item.id === instance.id && Date.parse(item.lastSeen) >= start);
-                  if (updated) break;
-                } catch {
-                  break;
-                }
-                await new Promise(resolve => setTimeout(resolve, 300));
-              }
+            if (!isOpen()) return;
+            if (result?.noChange) {
+              report('当前供应商设置无变更。');
+              if (result.view) currentSettings = result.view;
+              renderCodexSection();
+              return;
             }
-            if (!panel.isConnected || !dialog?.open) return;
-            currentSettings = result.view || await desktop.settings();
+            if (!result?.applied) {
+              report('供应商设置未应用，请重新核对配置。');
+              return;
+            }
+            saved = true;
+            report('供应商配置已保存，正在等待本次连接登记…');
+            currentSettings = result.view ?? await desktop.settings();
             renderCodexSection();
             render(lastStatus);
-            await refreshMonitor?.();
-            await onUpdated?.();
-            notice('Codex 供应商配置已应用并重连。');
+            const outcome = await waitForConnector(currentSettings, [instance.id], isOpen, previousGeneration);
+            if (!outcome || !isOpen()) return;
+            currentSettings = outcome.view;
+            report(outcome.ready ? 'Codex 本次连接已确认可用。模型调用仍取决于模型配置和额度。' :
+              '供应商配置已保存。' + outcome.detail + retry);
+            renderCodexSection();
+            void Promise.allSettled([Promise.resolve().then(refreshMonitor), Promise.resolve().then(onUpdated)]);
           } catch (error) {
-            notice(error?.message || '应用 Codex 供应商配置失败', 'error');
+            if (!isOpen()) return;
+            report(saved ? '供应商配置已保存，无法确认本次连接。' + retry :
+              error?.message || '应用 Codex 供应商配置失败。');
+            if (saved) renderCodexSection();
           } finally {
-            ctrl.busy = false;
+            codexBusy = false;
             if (labelNode && applyBtn.isConnected) labelNode.textContent = '应用供应商设置';
-            if (modeSelect.isConnected && applyBtn.isConnected) {
-              const locked = Boolean(lastStatus?.active);
-              modeSelect.disabled = locked;
-              applyBtn.disabled = locked;
-            }
+            if (isOpen()) render(lastStatus);
           }
-        }, 'secondary', 'refresh');
-        ctrl.apply = applyBtn;
-        codexControls.push(ctrl);
+        };
+        modeSelect.addEventListener('change', () => render(lastStatus));
+        codexControls.push({ select: modeSelect, apply: applyBtn, canApply });
         controls = [
           el('label', 'field', el('span', 'field-label', 'Codex 供应商模式'), modeSelect),
           el('div', 'actions', applyBtn)
@@ -161,8 +177,9 @@ export async function agentManagement(onUpdated, onBotSettings) {
       return el('div', 'record',
         el('div', 'record-head',
           el('strong', '', instance.name || instance.id),
-          el('span', 'badge' + (isNative ? ' online' : ''), isNative ? '跟随本机供应商' : '官方 ChatGPT 登录')),
+          el('span', 'badge', isNative ? '跟随本机供应商' : '官方 ChatGPT 登录')),
         ...details,
+        progress,
         ...(controls || []));
     });
     codexSection.replaceChildren(
@@ -179,6 +196,7 @@ export async function agentManagement(onUpdated, onBotSettings) {
       selection.value = value.instanceId;
     }
     open.hidden = !value.available;
+    open.disabled = codexBusy;
     open.lastChild.textContent = value.active ? '切到管理窗口' : '打开管理窗口';
     status.textContent = value.error || (value.active
       ? '管理窗口已打开。本机连接器会在管理窗口关闭后恢复。'
@@ -186,9 +204,9 @@ export async function agentManagement(onUpdated, onBotSettings) {
         ? '设置会写入本机 Agent 使用的目录。打开管理窗口时会暂停空闲的本机连接器。'
         : '当前桌面包缺少内置管理组件（源码运行请先执行 npm run build:agent-manager）。');
     for (const ctrl of codexControls) {
-      const disabled = Boolean(value.active || ctrl.busy);
+      const disabled = Boolean(value.active || codexBusy);
       ctrl.select.disabled = disabled;
-      if (ctrl.apply) ctrl.apply.disabled = disabled;
+      ctrl.apply.disabled = disabled || !ctrl.canApply();
     }
   }
   let wasActive = initial.active;
@@ -197,9 +215,17 @@ export async function agentManagement(onUpdated, onBotSettings) {
     const value = await desktop.agentManagerStatus();
     const changed = wasActive !== value.active;
     wasActive = value.active;
-    if (changed && !value.active) {
-      currentSettings = await desktop.settings();
-      renderCodexSection();
+    const nativeInstances = currentSettings.instances.filter(instance => instance.codexProviderMode === 'native');
+    if (!value.active && !codexBusy && (changed || nativeInstances.length)) {
+      const next = await desktop.settings();
+      const identityChanged = nativeInstances.some(instance =>
+        instance.codexIdentityChanged !== next.instances.find(item => item.id === instance.id)?.codexIdentityChanged);
+      const generationChanged = currentSettings.connectorGeneration !== next.connectorGeneration;
+      currentSettings = next;
+      if (changed || identityChanged || generationChanged) {
+        codexMessages.clear();
+        renderCodexSection();
+      }
     }
     render(value);
     if (changed) {

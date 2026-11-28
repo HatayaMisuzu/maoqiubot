@@ -35,7 +35,7 @@
 +-----------------+-----------------+                           +-------------------------------+
                   | 可选管理窗口 (stdio / 独立数据目录)          |  server/index.ts (Node 22)    |
                   v                                             |  HTTP/SSE · web-demo 静态 UI   |
-+-----------------------------------+                           |  SQLite workbench.sqlite v10  |
++-----------------------------------+                           |  SQLite workbench.sqlite v11  |
 |  agent-manager.exe (CC Switch)    |                           +---------------+---------------+
 +-----------------------------------+                                           ^
                                                                                 | WebSocket (/api/v1/node)
@@ -47,7 +47,7 @@
 ```
 
 - **桌面宿主 (`desktop/`)**：Electron 主进程托管内嵌服务端与本机连接器；打包分发时附带 `agent-manager.exe` 供「Agent 设置 → 外接 Agent 管理」调用。`dist/` 目录仅保留最新完整包 `dist/Xiaomaoqiu-win32-x64/`，旧发行包归档至 `backups/desktop-packages/`，预编译与编译缓存位于 `build/`。直接通过浏览器访问 `npm.cmd run local` / `npm.cmd start` 时，无 Electron IPC，UI 自动降级为「Bot 监控」对话视图。
-- **数据与状态**：主库为 `<data>/workbench.sqlite`（当前 `PRAGMA user_version = 10`），连接器状态与本地命令映射保存在 `<data>/node-local`（当前 `PRAGMA user_version = 2`），桌面连接器配置保存在 `<data>/desktop-connector.json`（含经 `MAOQIU_CONNECTOR_CONFIG` 指定的自定义文件）。
+- **数据与状态**：主库为 `<data>/workbench.sqlite`（当前 `PRAGMA user_version = 11`），连接器状态与本地命令映射保存在 `<data>/node-local`（当前 `PRAGMA user_version = 2`），桌面连接器配置保存在 `<data>/desktop-connector.json`（也可以通过 `MAOQIU_CONNECTOR_CONFIG` 指定自定义文件）。
 
 ## 常用环境变量速查
 

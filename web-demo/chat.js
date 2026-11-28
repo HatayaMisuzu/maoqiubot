@@ -1,6 +1,6 @@
 import {
   $, api, at, banner, basenamePath, btn, confirmDialog, copyText, displayDialog,
-  download, el, form, getWorkBots, icon, iconBtn, items, notice, phase,
+  download, el, form, getWorkBots, icon, iconBtn, items, nativeBindingUnverified, notice, phase,
   resolveActiveContext, state, upload, url
 } from './lib.js';
 import { renderMarkdown } from './markdown.js';
@@ -797,7 +797,8 @@ export const chat = actions => {
       }, 'settings-row', 'archive'));
     }
 
-    if (thread.sessionId && !thread.nativeInvalid && agent?.capabilities?.nativeActions?.includes('fork')) {
+    const unverified = nativeBindingUnverified(thread, agent);
+    if (thread.sessionId && !thread.nativeInvalid && !unverified && agent?.capabilities?.nativeActions?.includes('fork')) {
       actionsList.push(btn('从此会话创建原生分支', () => form('创建原生分支', [
         { key: 'title', label: '新会话名称', value: (thread.title || '会话') + ' · 分支', required: true }
       ], '创建分支', async ({ title }) => {
@@ -814,7 +815,7 @@ export const chat = actions => {
     if (thread.instanceId !== 'main' && thread.kind === 'native' && thread.sessionId && !thread.nativeInvalid && thread.state === 'active') {
       actionsList.push(btn('标记原生绑定失效', () => markNativeInvalid(thread), 'settings-row', 'warning'));
     }
-    if (thread.instanceId !== 'main' && thread.nativeInvalid) {
+    if (thread.instanceId !== 'main' && (thread.nativeInvalid || unverified)) {
       actionsList.push(btn('创建替代话题继续', () => {
         dialog.close();
         return replaceNative(thread);
@@ -1138,11 +1139,13 @@ export const chat = actions => {
       return;
     }
 
-    if (t?.nativeInvalid) {
+    const unverified = nativeBindingUnverified(t, instance(t?.instanceId));
+    if (t?.nativeInvalid || unverified) {
       bar.hidden = false;
       bar.className = 'banner-warn';
       bar.replaceChildren(
-        el('div', 'banner-text', icon('warning'), el('span', '', '原生会话绑定失效：' + t.nativeInvalid)),
+        el('div', 'banner-text', icon('warning'), el('span', '', t.nativeInvalid ? '原生会话绑定失效：' + t.nativeInvalid
+          : '旧 Codex 会话的原生账号来源待核对。已收到的工作台消息仍可查看。')),
         el('div', 'actions',
           btn('创建替代话题继续', () => replaceNative(t), 'primary btn-sm', 'branch')
         )
@@ -1257,7 +1260,8 @@ export const chat = actions => {
       direct: '用户直聊', delegated: '任务委派', imported: '原生导入', local: '工作台会话'
     };
     const syncStatus = t?.nativeInvalid ? '原生绑定失效'
-      : t?.nativeArchived ? '原生端已归档'
+      : nativeBindingUnverified(t, agent) ? '原生账号待核对'
+        : t?.nativeArchived ? '原生端已归档'
         : t?.sessionId ? (agent?.online ? (agent.capabilities?.nativeHistory ? '原生历史可读取' : '工作台缓存') : '离线缓存') : null;
 
     const crumb = $('crumb');
@@ -1644,11 +1648,21 @@ export const chat = actions => {
     const ctx = resolveActiveContext();
     const contact = instance(target.instanceId);
     const scopes = target.id ? [] : buildScopeOptions(contact);
-    const key = JSON.stringify([target.key, target.revision, t?.state, t?.nativeInvalid, contact?.settings?.enabled,
+    const unverified = nativeBindingUnverified(t, contact);
+    const key = JSON.stringify([target.key, target.revision, t?.state, t?.nativeInvalid, unverified, contact?.settings?.enabled,
       contact?.settings?.allowDirect, scopes]);
     if ($('compose').dataset.key === key && $('input')) return;
 
     $('compose').dataset.key = key;
+
+    if (t?.nativeInvalid || unverified) {
+      $('compose').replaceChildren(el('div', 'compose-disabled',
+        el('span', '', t.nativeInvalid ? '原生会话绑定已失效，请创建替代话题以继续工作。'
+          : '原生账号来源待核对，可以在替代话题中继续工作。'),
+        btn('创建替代话题', () => replaceNative(t), 'primary btn-sm', 'branch')
+      ));
+      return;
+    }
 
     if (t?.state === 'archived') {
       $('compose').replaceChildren(el('div', 'compose-disabled',
@@ -1659,14 +1673,6 @@ export const chat = actions => {
           actions.renderChrome();
           await actions.refresh();
         }, 'secondary btn-sm', 'refresh')
-      ));
-      return;
-    }
-
-    if (t?.nativeInvalid) {
-      $('compose').replaceChildren(el('div', 'compose-disabled',
-        el('span', '', '原生会话绑定已失效，请创建替代话题以继续工作。'),
-        btn('创建替代话题', () => replaceNative(t), 'primary btn-sm', 'branch')
       ));
       return;
     }

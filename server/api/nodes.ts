@@ -2,19 +2,34 @@ import { WebSocketServer, WebSocket } from 'ws'
 import type { Server } from 'node:http'
 import type { DatabaseSync } from 'node:sqlite'
 import { transaction, changed, now, required, one, must, fail } from '../db/index.ts'
-import { applyEvent, addProjectContext, checkQueuedInput, markUncertain, nativeBindingInScope, nativeSessionBinding, nativeSessionReleaseScope, nativeSessionCatalogTarget } from '../tasks/index.ts'
+import { applyEvent, addProjectContext, assertNativeBindingScope, checkQueuedInput, markUncertain, nativeBindingInScope, nativeSessionBinding, nativeSessionReleaseScope, nativeSessionCatalogTarget } from '../tasks/index.ts'
 import type { NativeSession, NativeHistory, NativeUsage, NodeCommand } from '../../contracts/node.ts'
 import { secret,hash } from './auth.ts'
 import { isLocal } from './local.ts'
 
+type LocalRegistration={id:string;online:boolean;runtimeScopeId:string|null;error?:string}
+function localHandshakeError(error:unknown){
+  if(typeof error==='string'&&error.startsWith('原生账号、供应商或 profile 已变化'))
+    return '原生账号、供应商或 profile 已变化。请核对配置与历史绑定。'
+  if(typeof error==='string'&&error.includes('等待原生响应超时'))return '原生握手超时。'
+  if(error==='找不到配置的 Agent 可执行程序')return error
+  return '原生 Agent 未完成握手。请检查启动器、配置目录和登录状态。'
+}
+
 export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:string)=>string|undefined,dataDir:string,
   worktreeSource?:(instance:{id:string;workspaceRef:string;adapterKey:string})=>string|undefined){
   const wss=new WebSocketServer({noServer:true,maxPayload:4*1024*1024})
-  const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,cancelBeforeStart:boolean,alive:boolean,instances:Set<string>}>()
+  const online=new Map<string,{ws:WebSocket,sent:Set<string>,lookups:Map<string,number>,missing:Set<string>,receiptLookup:boolean,cancelBeforeStart:boolean,scopedCommands:boolean,alive:boolean,instances:Set<string>}>()
   const catalogs=new Map<string,{ws:WebSocket; type:string; respond:(frame:any)=>void}>()
+  let localDispatchPaused=false
+  let expectedLocalGeneration:string|null|undefined
+  let localRegistration:{generation:string,ws:WebSocket,instances:LocalRegistration[],error?:string}|undefined
   server.on('upgrade',(req,socket,head)=>{
     const nodeId=authenticate((req.headers.authorization??'').replace(/^Bearer /,''))
     if(!nodeId || nodeId==='@model-api' || req.url?.split('?')[0]!=='/api/v1/node'){socket.destroy();return}
+    const header=req.headers['x-maoqiu-connector-generation']
+    const generation=nodeId==='local'&&isLocal(req)&&typeof header==='string'&&/^[0-9a-f-]{36}$/i.test(header)?header:undefined
+    if(nodeId==='local'&&expectedLocalGeneration!==undefined&&generation!==expectedLocalGeneration){socket.destroy();return}
     wss.handleUpgrade(req,socket,head,ws=>{
       let registered=false
       const helloTimeout=setTimeout(()=>{if(!registered) ws.terminate()},10000)
@@ -29,6 +44,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       ws.on('message',raw=>{
         try {
           const m=JSON.parse(raw.toString())
+          if(nodeId==='local'&&expectedLocalGeneration!==undefined&&generation!==expectedLocalGeneration){ws.terminate();return}
           if(!registered){
             if(m.type!=='hello'||(m.nodeId && m.nodeId!==nodeId)||!Array.isArray(m.instances)) fail('节点握手失败')
             transaction(db,()=>{
@@ -42,17 +58,18 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
                   old.runtimeScopeId&&runtimeScopeId&&old.runtimeScopeId!==runtimeScopeId))) fail('实例绑定冲突，请用新实例 ID')
                 if(!Array.isArray(i.availableActions)) fail('缺少实例能力')
                 const blocked=i.adapterKey==='codex'&&!isLocal(req)
+                const unverified=i.adapterKey==='codex'&&(!runtimeScopeId||m.scopedCommands!==true)
                 const caps={version:i.version,resume:i.resume,history:i.history,sessionList:i.sessionList===true,nativeHistory:i.nativeHistory===true,
                   sessionImport:i.sessionList===true&&i.sessionImport!==false,nativeBindingRelease:i.nativeBindingRelease===true,
                   usage:i.adapterKey==='codex'&&i.usage===true,
                   nativeActions:['fork','archive','unarchive','delete'].filter(action=>Array.isArray(i.nativeActions)&&i.nativeActions.includes(action)),
-                  error:blocked?'个人 Codex 登录限本机':i.error,models:Array.isArray(i.models)?i.models.slice(0,200):[]}
+                  error:blocked?'个人 Codex 登录限本机':i.error||(unverified?'Codex 原生账号和供应商尚未核对':undefined),models:Array.isArray(i.models)?i.models.slice(0,200):[]}
                 db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,availableActions=excluded.availableActions,
                   lastSeen=excluded.lastSeen,online=excluded.online,capabilities=excluded.capabilities,
                   runtimeScopeId=COALESCE(excluded.runtimeScopeId,instances.runtimeScopeId)`)
                   .run(key,nodeId,required(i.name,'name'),required(i.adapterKey,'adapterKey'),required(i.workspaceRef,'workspaceRef'),
-                    JSON.stringify(i.availableActions),now(),blocked||i.online===false?0:1,JSON.stringify(caps),profileId,runtimeScopeId)
+                    JSON.stringify(i.availableActions),now(),blocked||unverified||i.online===false?0:1,JSON.stringify(caps),profileId,runtimeScopeId)
                 const source=!old&&nodeId==='local'&&isLocal(req)?worktreeSource?.(i):undefined
                 if(source)db.prepare(`INSERT INTO bot_settings(instanceId,description,enabled,allowDirect,allowDelegate,allowedProjects,updatedAt)
                   SELECT ?,description,enabled,allowDirect,allowDelegate,allowedProjects,? FROM bot_settings WHERE instanceId=?`)
@@ -63,13 +80,42 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
             registered=true
             const previous=online.get(nodeId)
             const ids=db.prepare('SELECT id FROM instances WHERE nodeId=? AND online=1').all(nodeId).map(r=>String(r.id))
-            online.set(nodeId,{ws,sent:new Set(),lookups:new Map(),missing:new Set(),receiptLookup:m.receiptLookup===true,cancelBeforeStart:m.cancelBeforeStart===true,alive:true,instances:new Set(ids)})
+            if(generation){
+              const onlineIds=new Set(ids)
+              const instances:LocalRegistration[]=m.instances.map((i:any)=>{
+                const online=onlineIds.has(i.id)&&i.online===true&&typeof i.runtimeScopeId==='string'&&
+                  i.availableActions.includes('run')&&!i.error
+                return {id:i.id,online,runtimeScopeId:i.runtimeScopeId??null,...(!online?{error:localHandshakeError(i.error)}:{})}
+              })
+              localRegistration={generation,ws,instances}
+            }
+            online.set(nodeId,{ws,sent:new Set(),lookups:new Map(),missing:new Set(),receiptLookup:m.receiptLookup===true,cancelBeforeStart:m.cancelBeforeStart===true,scopedCommands:m.scopedCommands===true,alive:true,instances:new Set(ids)})
             previous?.ws.terminate()
+            if(m.nativeBindingProofs===true&&isLocal(req)){
+              const unknown=db.prepare(`SELECT t.id AS thread,t.instanceId AS instance,t.sessionId AS session,i.workspaceRef AS workspace
+                FROM threads t JOIN instances i ON i.id=t.instanceId WHERE i.nodeId=? AND i.adapterKey='codex'
+                AND t.kind='native' AND t.sessionId IS NOT NULL AND t.nativeReleased=0 AND t.nativeRuntimeScopeId IS NULL`).all(nodeId)
+              for(let offset=0;offset<unknown.length;offset+=200)
+                ws.send(JSON.stringify({type:'verify_native_bindings',bindings:unknown.slice(offset,offset+200)}))
+            }
             flush()
             return
           }
           if(online.get(nodeId)?.ws!==ws)return
-          if(m.type==='event'){
+          if(m.type==='native_binding_proofs'){
+            if(!isLocal(req)||!Array.isArray(m.bindings)||m.bindings.length>200)fail('原生绑定核对无效')
+            transaction(db,()=>{
+              const verify=db.prepare(`UPDATE threads SET nativeRuntimeScopeId=? WHERE id=? AND instanceId=? AND sessionId=?
+                AND kind='native' AND nativeReleased=0 AND nativeRuntimeScopeId IS NULL AND EXISTS(SELECT 1 FROM instances i
+                  WHERE i.id=threads.instanceId AND i.nodeId=? AND i.adapterKey='codex' AND i.workspaceRef=?)`)
+              for(const proof of m.bindings){
+                if(!proof||typeof proof.scope!=='string'||!/^[a-f0-9]{64}$/.test(proof.scope))fail('原生绑定核对无效')
+                const threadId=required(proof.thread,'threadId'),instanceId=required(proof.instance,'instanceId')
+                const result=verify.run(proof.scope,threadId,instanceId,required(proof.session,'sessionId'),nodeId,required(proof.workspace,'workspaceRef'))
+                if(result.changes)changed(db,'thread',{threadId,instanceId})
+              }
+            })
+          }else if(m.type==='event'){
             transaction(db,()=>applyEvent(db,nodeId,m.event))
             ws.send(JSON.stringify({type:'ack',key:m.event.key}))
           }else if(m.type==='sessions'||m.type==='history'||m.type==='usage'){
@@ -112,7 +158,11 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
             ws.send(JSON.stringify({type:'receipt_ack',commandId:m.commandId,status:m.status}))
           }else fail('未知节点消息')
           flush()
-        }catch(err){console.error('节点协议',nodeId,(err as Error).message);ws.close(1008,'invalid message')}
+        }catch(err){
+          if(!registered&&generation)localRegistration={generation,ws,instances:[],error:'工作台拒绝了本次实例登记。请核对实例 ID、工作区、profile 和绑定范围。'}
+          console.error('节点协议',nodeId,(err as Error).message)
+          ws.close(1008,'invalid message')
+        }
       })
     })
   })
@@ -136,20 +186,24 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     }
     changed(db,'receipt',{threadId:c.threadId,runId:c.runId,commandId:c.id,status:uncertain?'uncertain':'failed'})
   }
-  function freeze(c:any):NodeCommand{
+  function freeze(c:any,scopedCommands:boolean):NodeCommand{
     const {dispatch:previous,attachmentIds,modelId,requestId,choice,text,inputText,communication,importSessionId,...rest}=JSON.parse(c.payload)
     const input=['run','steer','prepare'].includes(c.kind)
     const projectRun=c.kind==='run'&&c.projectId
     const binding=projectRun?one(db,'SELECT agentPermission FROM project_workspaces WHERE projectId=? AND instanceId=? AND allowAgentAccess=1',c.projectId,c.instanceId)?.agentPermission??null:null
-    if(input)checkQueuedInput(db,dataDir,c,{...rest,attachmentIds,communication})
+    if(input)checkQueuedInput(db,dataDir,c,{...rest,attachmentIds,communication,importSessionId})
     if(c.status!=='queued'&&!previous)fail('旧版本发送记录缺少冻结材料，需人工核对',409)
+    if(c.adapterKey==='codex'&&(!c.runtimeScopeId||previous&&!previous.runtimeScopeId)||
+      previous?.runtimeScopeId&&(!scopedCommands||previous.runtimeScopeId!==c.runtimeScopeId))
+      fail('命令的原生账号或供应商范围无法核对，停止发送',409)
     if(previous&&['run','prepare'].includes(c.kind)&&
       (c.runStatus!=='queued'||c.nativeRunId||c.sessionId!==previous.sessionId))
       fail('工作台已有原生会话或运行回执，停止重发并核对节点记录',409)
     if(previous && previous.binding!==binding)fail('实例资料授权已变化，停止重发',409)
     const fullText=binding?addProjectContext(db,c,text??'',!previous):text
     if(previous && previous.text!==fullText)fail('已发送的项目上下文发生变化，停止重发',409)
-    const dispatch=previous??{sessionId:c.sessionId,nativeRunId:c.nativeRunId,text:fullText,binding}
+    const dispatch=previous??{sessionId:c.sessionId,nativeRunId:c.nativeRunId,text:fullText,binding,
+      ...(scopedCommands&&c.runtimeScopeId?{runtimeScopeId:c.runtimeScopeId}:{})}
     let grant=binding&&one(db,'SELECT token,projectId,permission FROM run_grants WHERE runId=? AND expiresAt>? AND permission=?',c.runId,now(),binding)
     if(binding&&!grant){
       if(previous)fail('原运行令牌已过期或撤销，停止重发',409)
@@ -168,14 +222,15 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     if(!previous)db.prepare("UPDATE commands SET payload=json_set(payload,'$.dispatch',json(?)),status='sent' WHERE id=?")
       .run(JSON.stringify(dispatch),c.id)
     return {id:c.id,threadId:c.threadId,runId:c.runId,taskId:c.taskId,instanceId:c.instanceId,projectId:c.projectId,
-      profileId:c.profileId,workspaceRef:c.workspaceRef,kind:c.kind,payload:{text:dispatch.text,sessionId:dispatch.sessionId,nativeRunId:dispatch.nativeRunId,
+      profileId:c.profileId,workspaceRef:c.workspaceRef,runtimeScopeId:dispatch.runtimeScopeId,kind:c.kind,payload:{text:dispatch.text,sessionId:dispatch.sessionId,nativeRunId:dispatch.nativeRunId,
         attachmentIds,modelId,requestId,choice,inputText,materials:rest.materials,nativeOperation:rest.nativeOperation,communication,importSessionId,
         ...(grant?{homeAccess:grant}:{}),...(communicationAccess?{communicationAccess}:{})}}
   }
   function flush(){
     for(const [nodeId,link] of online){
+      if(nodeId==='local'&&localDispatchPaused)continue
       if(link.ws.readyState!==WebSocket.OPEN) continue
-      const rows=db.prepare(`SELECT c.*,t.sessionId,t.projectId,r.nativeRunId,r.status AS runStatus,i.adapterKey,i.profileId,i.workspaceRef FROM commands c JOIN instances i ON i.id=c.instanceId JOIN threads t ON t.id=c.threadId JOIN runs r ON r.id=c.runId
+      const rows=db.prepare(`SELECT c.*,t.sessionId,t.projectId,r.nativeRunId,r.status AS runStatus,i.adapterKey,i.profileId,i.workspaceRef,i.runtimeScopeId FROM commands c JOIN instances i ON i.id=c.instanceId JOIN threads t ON t.id=c.threadId JOIN runs r ON r.id=c.runId
         WHERE i.nodeId=? AND (c.status IN ('queued','sent','received') OR c.status='uncertain' AND c.kind IN ('run','prepare'))
           AND (r.status NOT IN ('completed','cancelled','blocked','failed','uncertain') OR r.status='uncertain' AND c.kind IN ('run','prepare','cancel'))
         ORDER BY c.rowid`).all(nodeId) as any[]
@@ -219,7 +274,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
           if(!ready&&!preparing&&!(c.kind==='cancel'&&link.cancelBeforeStart&&JSON.parse(c.payload).priorStatus==='queued'))continue
         }
         try {
-          const command=transaction(db,()=>freeze(c))
+          const command=transaction(db,()=>freeze(c,link.scopedCommands))
           link.sent.add(c.id)
           link.ws.send(JSON.stringify({type:'command',command}),err=>{if(err)link.ws.terminate()})
         }catch(e){
@@ -230,6 +285,7 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
     }
   }
   function queryNative(inst:any,type:string,request:Record<string,unknown>){
+    if(inst.nodeId==='local'&&localDispatchPaused)fail('本机 Agent 连接器正在维护，请稍后重试',409)
     const link=online.get(inst.nodeId)
     if(!link?.instances.has(inst.id)||link.ws.readyState!==WebSocket.OPEN)fail('原生节点离线',409)
     const {ws}=link
@@ -269,10 +325,15 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
   async function readHistory(thread:any,before?:string):Promise<NativeHistory>{
     const inst=must(db,'SELECT * FROM instances WHERE id=?',thread.instanceId)
     if(!thread.sessionId||!JSON.parse(inst.capabilities).nativeHistory)fail('此实例未提供绑定会话的只读历史',409)
+    assertNativeBindingScope(db,inst,thread)
+    if(thread.nativeInvalid)fail('原生绑定已失效，可查看工作台已保存的记录',409)
     if(before&&before.length>2000)fail('原生历史游标无效')
     const frame=await queryNative(inst,'history',{type:'read_history',threadId:thread.id,sessionId:thread.sessionId,before})
-    const latest=must(db,'SELECT state,sessionId FROM threads WHERE id=?',thread.id)
-    if(!['active','archived'].includes(latest.state)||latest.sessionId!==thread.sessionId)fail('会话可见范围已变化',409)
+    const latest=must(db,'SELECT * FROM threads WHERE id=?',thread.id)
+    const current=must(db,'SELECT * FROM instances WHERE id=?',thread.instanceId)
+    assertNativeBindingScope(db,current,latest)
+    if(latest.state!==thread.state||latest.sessionId!==thread.sessionId||latest.nativeInvalid||current.runtimeScopeId!==inst.runtimeScopeId)
+      fail('会话可见范围已变化',409)
     const items=frame.items.filter((i:any)=>typeof i.id==='string'&&typeof i.turnId==='string'&&typeof i.text==='string'&&['user','assistant'].includes(i.role))
       .map(({id,turnId,role,text}:any)=>({id,turnId,role,text}))
     if(typeof frame.archived==='boolean'&&Boolean(thread.nativeArchived)!==frame.archived){
@@ -295,7 +356,34 @@ export function attachNodes(server:Server,db:DatabaseSync,authenticate:(token:st
       return {source:'codex_app_server',fetchedAt:now(),windows}
     }catch{return unknown}
   }
-  return {flush,listSessions,readHistory,readUsage,inspect(runId:string){
+  return {flush,listSessions,readHistory,readUsage,
+  expectLocalGeneration(generation:string|null){
+    expectedLocalGeneration=generation
+    const previous=online.get('local')
+    if(!previous)return
+    online.delete('local')
+    transaction(db,()=>{
+      db.prepare("UPDATE instances SET online=0 WHERE nodeId='local'").run()
+      changed(db,'presence',{nodeId:'local',online:false})
+    })
+    previous.ws.terminate()
+  },
+  pauseLocalDispatch(paused:boolean){
+    const previous=localDispatchPaused
+    localDispatchPaused=paused
+    if(previous&&!paused)flush()
+    return previous
+  },
+  localQueriesPending(){
+    const socket=online.get('local')?.ws
+    return !!socket&&[...catalogs.values()].some(request=>request.ws===socket)
+  },
+  localConnectorStatus(generation?:string){
+    const current=localRegistration
+    if(!current||current.generation!==generation)return {instances:[]}
+    if(current.error)return {instances:[],error:current.error}
+    return {instances:online.get('local')?.ws===current.ws&&current.ws.readyState===WebSocket.OPEN?current.instances:[]}
+  },inspect(runId:string){
     for(const command of db.prepare(`SELECT c.id,i.nodeId FROM commands c JOIN instances i ON i.id=c.instanceId
       WHERE c.runId=? AND c.status IN ('sent','received','uncertain')`).all(runId)){
       const link=online.get(String(command.nodeId)),id=String(command.id)

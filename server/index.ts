@@ -1,7 +1,7 @@
 import { createServer } from 'node:http'
 import type { IncomingMessage,ServerResponse } from 'node:http'
-import { readFileSync } from 'node:fs'
-import { resolve,extname,sep } from 'node:path'
+import { lstatSync, readFileSync } from 'node:fs'
+import { join,resolve,extname,sep } from 'node:path'
 import { pathToFileURL,fileURLToPath } from 'node:url'
 import { openDatabase, transaction, one, fail, owner } from './db/index.ts'
 import { access,hash,secret } from './api/auth.ts'
@@ -209,6 +209,10 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
     }
   })
   const nodes=attachNodes(server,db,auth.node,dataDir,opts.desktop?.worktreeSource)
+  if(!opts.desktop&&lstatSync(join(dataDir,'desktop-connector.json.codex-switch.json'),{throwIfNoEntry:false})){
+    nodes.expectLocalGeneration(null)
+    console.warn('本机连接器已暂停：Codex 供应商切换尚待恢复。请用同一数据目录启动桌面工作台。')
+  }
   function mustProject(projectId:unknown){
     if(typeof projectId!=='string'||!one(db,'SELECT 1 FROM projects WHERE id=?',projectId))fail('项目不存在',404)
   }
@@ -226,6 +230,8 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
   const port=opts.port??Number(process.env.PORT??4317),host=opts.host??process.env.HOST??'127.0.0.1'
   server.listen(port,host)
   return {server,db,auth,ticket,dataDir,
+    pauseLocalDispatch:nodes.pauseLocalDispatch,localQueriesPending:nodes.localQueriesPending,expectLocalGeneration:nodes.expectLocalGeneration,
+    localConnectorStatus: nodes.localConnectorStatus,
     agentMonitor: (options?:{days?:number},dshDatabases?:DshMonitorDatabase[])=>agentMonitor(db,dataDir,options,dshDatabases),
     agentQuota: (instanceId:string)=>{
       if(typeof instanceId!=='string'||!one(db,"SELECT 1 FROM instances WHERE id=? AND nodeId='local' AND adapterKey='codex'",instanceId))

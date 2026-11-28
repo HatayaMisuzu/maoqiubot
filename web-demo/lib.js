@@ -431,6 +431,10 @@ export function getWorkBots(s = state) {
   return s.instances.filter(i => i.id !== 'main');
 }
 
+export function nativeBindingUnverified(thread, agent) {
+  return agent?.adapterKey === 'codex' && thread?.kind === 'native' && Boolean(thread.sessionId) && !thread.nativeRuntimeScopeId;
+}
+
 export function findThreadAny(threadId, s = state) {
   if (!threadId) return null;
   if (s.mainThread?.id === threadId) return s.mainThread;

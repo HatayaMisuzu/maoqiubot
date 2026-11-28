@@ -8,6 +8,7 @@
    - **禁止**在 `dist/` 下保留历史版本目录、按日期命名的子目录（如 `stability-*`、`orca-upgrade`）或编译中间缓存。
 2. **旧包留档目录：`backups/desktop-packages/`**
    - 每次通过 `npm run package:desktop` 向默认 `dist/` 生成新包时，脚本会先在 `build/` 临时暂存并校验新包完整性，随后**自动将 `dist/` 内原有的旧包/历史目录迁移留档至 `backups/desktop-packages/`**（按名称或 `<原名>-YYYYMMDD-HHmmss` 命名），保留回退能力，不直接删除。
+   - 自定义输出目录应位于 `dist/` 之外，脚本只归档该输出目录里的同名旧包。输出、归档与暂存目录必须相互独立，并使用真实路径。替换前从托盘退出对应工作台并关闭 Agent 管理窗口。
 3. **中间构建与预编译目录：`build/`**
    - 外接 Agent 管理组件构建产物位于 `build/agent-manager/`（`agent-manager.exe` 与其许可证/依赖声明）。
    - CC Switch 上游源码、pnpm 与 Rust `target` 编译缓存位于 `build/.agent-manager-work/`。

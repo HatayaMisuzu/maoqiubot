@@ -21,9 +21,10 @@ import { dshSessionUsage } from '../server/tasks/dsh-monitor.ts'
 const require = createRequire(import.meta.url)
 const {
   normalizeStablePath, connectorSettings, settingsView, validateWorktreeRequest,
-  readCodexLocalSummary, switchCodexProviderMode, clearUnboundNativeCodexScopes
+  readCodexLocalSummary, switchCodexProviderMode
 } = require('../desktop/connector-settings.cjs')
 const { createAgentManager } = require('../desktop/agent-manager.cjs')
+const { discoverHermes } = require('../desktop/hermes-discovery.cjs')
 
 test('环境隔离同时剥离 MAOQIU_PLUGIN_KEY_* 与 MAOQIU_MODEL_KEY_*', () => {
   const dirtyEnv = {
@@ -414,7 +415,7 @@ test('resolveAgentManagerDir 与 archiveExistingDist 确保 dist 仅留新包并
   assert.equal(readFileSync(join(archiveDir, 'stability-20261126', 'marker.txt'), 'utf8'), 'old-stability')
 })
 
-test('connectorSettings 首次初始化时自动检测本机 Hermes，未安装时不生成无效实例', t => {
+test('首次启动与后续扫描 Hermes 使用同一配置，直到用户确认添加', t => {
   const root = mkdtempSync(join(tmpdir(), 'maoqiu-hermes-init-'))
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
 
@@ -433,32 +434,31 @@ test('connectorSettings 首次初始化时自动检测本机 Hermes，未安装�
   t.after(restoreEnv)
 
   delete process.env.MAOQIU_CONNECTOR_CONFIG
+  if ('Path' in process.env) process.env.Path = ''
+  if ('PATH' in process.env) process.env.PATH = ''
 
-  const fakeHermesHome = join(root, 'fake-hermes-home')
+  const fakeHermesHome = join(root, 'Hermes profile with spaces')
+  process.env.HERMES_HOME = fakeHermesHome
+  const dataDir = join(root, 'workbench')
+  mkdirSync(dataDir, { recursive: true })
+  const settings = connectorSettings({ root: process.cwd(), workspace: root, dataDir })
+  const initial = readFileSync(settings.file, 'utf8')
+  assert.deepEqual(discoverHermes(settings).candidates, [])
+
   const binDir = join(fakeHermesHome, 'bin')
   mkdirSync(binDir, { recursive: true })
   const fakeHermesBin = join(binDir, process.platform === 'win32' ? 'hermes.exe' : 'hermes')
   writeFileSync(fakeHermesBin, '')
-  process.env.HERMES_HOME = fakeHermesHome
-
-  const dataWithHermes = join(root, 'data-with')
-  mkdirSync(dataWithHermes, { recursive: true })
-  const s1 = connectorSettings({ root: process.cwd(), workspace: root, dataDir: dataWithHermes })
-  const cfg1 = JSON.parse(readFileSync(s1.file, 'utf8'))
-  const hermes1 = cfg1.instances.find(i => i.adapterKey === 'hermes')
-  assert.ok(hermes1)
-  assert.equal(hermes1.id, 'hermes-local')
-  assert.equal(hermes1.command, fakeHermesBin)
-  assert.deepEqual(hermes1.args, ['acp'])
-
-  process.env.HERMES_HOME = join(root, 'missing-hermes-home')
-  if ('Path' in process.env) process.env.Path = ''
-  if ('PATH' in process.env) process.env.PATH = ''
-  const dataWithoutHermes = join(root, 'data-without')
-  mkdirSync(dataWithoutHermes, { recursive: true })
-  const s2 = connectorSettings({ root: process.cwd(), workspace: root, dataDir: dataWithoutHermes })
-  const cfg2 = JSON.parse(readFileSync(s2.file, 'utf8'))
-  assert.equal(cfg2.instances.some(i => i.adapterKey === 'hermes'), false)
+  const otherDir = join(root, 'second install')
+  mkdirSync(otherDir)
+  const otherLauncher = join(otherDir, process.platform === 'win32' ? 'hermes.cmd' : 'hermes')
+  writeFileSync(otherLauncher, '')
+  process.env.PATH = `"${otherDir}"`
+  const discovered = discoverHermes(settings)
+  assert.deepEqual(discovered.candidates.map(candidate => candidate.command), [fakeHermesBin, otherLauncher])
+  assert.deepEqual(discoverHermes(settings), discovered)
+  assert.equal(readFileSync(settings.file, 'utf8'), initial)
+  assert.equal(settingsView(settings).instances.some(instance => instance.adapterKey === 'hermes'), false)
 })
 
 test('readCodexLocalSummary 只读解析顶层供应商字段并在首个 section 前停止', t => {
@@ -478,7 +478,7 @@ test('readCodexLocalSummary 只读解析顶层供应商字段并在首个 sectio
   assert.deepEqual(readCodexLocalSummary(root), { modelProvider: 'custom', model: 'gpt-6.1-sol' })
 })
 
-test('单一 Codex 实例可安全切换供应商模式并在无绑定话题时自动解除旧范围', async t => {
+test('Codex 供应商切换核对配置与影响范围，同模式保留归档及清除话题', async t => {
   const root = mkdtempSync(join(tmpdir(), 'maoqiu-codex-switch-'))
   const dataDir = join(root, 'data')
   mkdirSync(dataDir, { recursive: true })
@@ -499,6 +499,9 @@ test('单一 Codex 实例可安全切换供应商模式并在无绑定话题时�
   app = startServer({ port: 0, dataDir, chat: false })
   await once(app.server, 'listening')
   const settings = connectorSettings({ root: process.cwd(), workspace: root, dataDir })
+  const connectorConfig = JSON.parse(readFileSync(settings.file, 'utf8'))
+  connectorConfig.instances.find(item => item.id === 'codex-local').env = { CODEX_HOME: join(root, 'codex-home') }
+  writeFileSync(settings.file, JSON.stringify(connectorConfig))
 
   const codexScope1 = '1'.repeat(64)
   const dshScope = '2'.repeat(64)
@@ -508,6 +511,12 @@ test('单一 Codex 实例可安全切换供应商模式并在无绑定话题时�
   app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
     VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
     .run('dsh-local', 'local', 'DSH', 'dsh', root, '["run"]', new Date().toISOString(), 1, '{}', 'default', dshScope)
+
+  const officialConfig = readFileSync(settings.file)
+  const alreadyOfficial = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'official' })
+  assert.equal(alreadyOfficial.noChange, true)
+  assert.deepEqual(readFileSync(settings.file), officialConfig)
+  assert.equal(app.db.prepare("SELECT runtimeScopeId FROM instances WHERE id='codex-local'").get().runtimeScopeId, codexScope1)
 
   // 无绑定原生会话时，同一实例可直接切换并清旧 scope。
   const firstSwitch = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' })
@@ -524,43 +533,71 @@ test('单一 Codex 实例可安全切换供应商模式并在无绑定话题时�
   const codexScope2 = '3'.repeat(64)
   app.db.prepare("UPDATE instances SET runtimeScopeId=?, online=1 WHERE id='codex-local'").run(codexScope2)
   const createdAt = new Date().toISOString()
-  app.db.prepare(`INSERT INTO threads(id,kind,title,instanceId,state,sessionId,createdAt,nativeReleased)
-    VALUES(?,?,?,?,?,?,?,0)`)
-    .run('thread-codex-bound', 'native', '旧 Codex 话题', 'codex-local', 'active', 'native-codex-sess-1', createdAt)
+  const insertThread = app.db.prepare(`INSERT INTO threads(id,kind,title,instanceId,state,sessionId,createdAt,nativeReleased,nativeRuntimeScopeId)
+    VALUES(?,?,?,?,?,?,?,0,?)`)
+  insertThread.run('thread-codex-bound', 'native', '旧 Codex 话题', 'codex-local', 'active', 'native-codex-sess-1', createdAt, codexScope2)
+  insertThread.run('thread-codex-purged', 'native', '已清除话题', 'codex-local', 'purged', 'native-codex-sess-2', createdAt, codexScope2)
+  insertThread.run('thread-codex-archived', 'native', '已归档话题', 'codex-local', 'archived', 'native-codex-sess-3', createdAt, codexScope2)
+
+  const sameConfig = readFileSync(settings.file)
+  const sameMode = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' }, codexScope2)
+  assert.deepEqual(sameMode, { applied: false, noChange: true, requiresConfirmation: false, boundThreads: 0 })
+  assert.deepEqual(readFileSync(settings.file), sameConfig)
+  assert.equal(app.db.prepare("SELECT online FROM instances WHERE id='codex-local'").get().online, 1)
+  assert.equal(app.db.prepare("SELECT state FROM threads WHERE id='thread-codex-bound'").get().state, 'active')
+  assert.equal(app.db.prepare("SELECT state FROM threads WHERE id='thread-codex-archived'").get().state, 'archived')
+
+  const newNativeScope = 'a'.repeat(64)
+  const changedNative = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' }, newNativeScope)
+  assert.equal(changedNative.requiresConfirmation, true)
+  assert.equal(changedNative.boundThreads, 3)
 
   const needConfirm = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'official' })
-  assert.deepEqual(needConfirm, { applied: false, requiresConfirmation: true, boundThreads: 1 })
+  assert.equal(needConfirm.requiresConfirmation, true)
+  assert.equal(needConfirm.boundThreads, 3)
   assert.equal(settingsView(settings).instances.find(i => i.id === 'codex-local').codexProviderMode, 'native')
   assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, codexScope2)
   assert.equal(app.db.prepare('SELECT nativeInvalid FROM threads WHERE id=?').get('thread-codex-bound').nativeInvalid, null)
 
+  const codexHome = join(root, 'codex-home')
+  mkdirSync(codexHome)
+  writeFileSync(join(codexHome, 'config.toml'), 'model_provider = "fixture"\n')
+  const afterConfigEdit = switchCodexProviderMode(settings, app.db, {
+    instanceId: 'codex-local', codexProviderMode: 'official', confirmationToken: needConfirm.confirmationToken
+  })
+  assert.equal(afterConfigEdit.requiresConfirmation, true)
+  assert.notEqual(afterConfigEdit.confirmationToken, needConfirm.confirmationToken)
+  insertThread.run('thread-review-must-refresh', 'native', '确认期间新话题', 'codex-local', 'archived', 'native-codex-sess-4', createdAt, codexScope2)
+  const refreshed = switchCodexProviderMode(settings, app.db, {
+    instanceId: 'codex-local', codexProviderMode: 'official', confirmationToken: afterConfigEdit.confirmationToken
+  })
+  assert.equal(refreshed.requiresConfirmation, true)
+  assert.equal(refreshed.boundThreads, 4)
+  assert.notEqual(refreshed.confirmationToken, afterConfigEdit.confirmationToken)
   const confirmed = switchCodexProviderMode(settings, app.db, {
     instanceId: 'codex-local',
     codexProviderMode: 'official',
-    confirmRebind: true
+    confirmationToken: refreshed.confirmationToken
   })
   assert.equal(confirmed.applied, true)
-  assert.equal(confirmed.boundThreads, 1)
-  assert.equal(confirmed.invalidatedThreads, 1)
+  assert.equal(confirmed.boundThreads, 4)
+  assert.equal(confirmed.invalidatedThreads, 4)
   assert.equal(settingsView(settings).instances.find(i => i.id === 'codex-local').codexProviderMode, 'official')
   const archived = app.db.prepare('SELECT state, nativeInvalid FROM threads WHERE id=?').get('thread-codex-bound')
   assert.equal(archived.state, 'archived')
   assert.match(archived.nativeInvalid, /Codex 供应商配置已切换/)
+  const purged = app.db.prepare("SELECT state,nativeReleased,nativeRuntimeScopeId FROM threads WHERE id='thread-codex-purged'").get()
+  assert.deepEqual({ ...purged }, { state: 'purged', nativeReleased: 0, nativeRuntimeScopeId: codexScope2 })
   assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, null)
-
-  // clearUnboundNativeCodexScopes 仅清无有效绑定话题的 native 模式 Codex 实例。
-  switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' })
+  const switchedBack = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' })
+  assert.equal(switchedBack.applied, true)
+  assert.equal(switchedBack.boundThreads, 0)
   const codexScope3 = '4'.repeat(64)
   app.db.prepare("UPDATE instances SET runtimeScopeId=? WHERE id='codex-local'").run(codexScope3)
-  app.db.prepare(`INSERT INTO threads(id,kind,title,instanceId,state,sessionId,createdAt,nativeReleased)
-    VALUES(?,?,?,?,?,?,?,0)`)
-    .run('thread-codex-bound-2', 'native', '新 Codex 话题', 'codex-local', 'active', 'native-codex-sess-2', createdAt)
-  assert.deepEqual(clearUnboundNativeCodexScopes(settings, app.db), [])
-  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, codexScope3)
-
-  app.db.prepare("UPDATE threads SET nativeInvalid='已失效' WHERE id='thread-codex-bound-2'").run()
-  assert.deepEqual(clearUnboundNativeCodexScopes(settings, app.db), ['codex-local'])
-  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, null)
+  const nativeConfig = readFileSync(settings.file)
+  assert.equal(switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' }, newNativeScope).applied, true)
+  assert.deepEqual(readFileSync(settings.file), nativeConfig)
+  assert.equal(app.db.prepare("SELECT runtimeScopeId FROM instances WHERE id='codex-local'").get().runtimeScopeId, newNativeScope)
   assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('dsh-local').runtimeScopeId, dshScope)
 })
 

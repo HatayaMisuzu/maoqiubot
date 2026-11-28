@@ -1,4 +1,5 @@
-import { api, btn, displayDialog, el, form, items, notice } from './lib.js';
+import { btn, displayDialog, el, form, notice } from './lib.js';
+import { connectorInstanceState, waitForConnector } from './connector-connection.js';
 
 const desktop = () => window.maoqiuDesktop;
 export const hasDesktopSettings = () => Boolean(desktop());
@@ -8,20 +9,19 @@ export async function desktopSettings(onUpdated, back) {
     notice('本机执行实例设置仅在桌面端可用。', 'error');
     return;
   }
-  const settings = await desktop().settings();
-  const instances = items(await api('/instances'));
+  let settings = await desktop().settings();
   const labels = el('p', 'muted', settings.lastError || (settings.connectorRunning ? '连接器进程已启动' : '连接器进程未启动'));
   labels.setAttribute('role', 'status');
   const list = el('div', 'settings-list');
 
-  function showInstances(live) {
+  const isOpen = () => labels.isConnected && document.getElementById('dialog')?.open;
+  function showInstances(view) {
     list.replaceChildren(...settings.instances.map(instance => {
-      const registered = live.find(i => i.id === instance.id);
-      const status = registered?.online ? '在线 · 已握手' : registered?.capabilities?.error || '离线 · 等待登记';
+      const status = connectorInstanceState(view, instance.id);
       return el('div', 'record',
         el('div', 'record-head',
           el('strong', '', instance.name),
-          el('span', 'badge ' + (registered?.online ? 'online' : ''), status)
+          el('span', 'badge ' + (status.state === 'ready' ? 'online' : ''), status.detail)
         ),
         el('small', 'muted mono', [instance.id, instance.adapterKey, instance.profileId, instance.workspaceRef].join(' · ')),
         instance.configurationHome ? el('small', 'muted mono', '配置目录 ' + instance.configurationHome) : null,
@@ -40,51 +40,82 @@ export async function desktopSettings(onUpdated, back) {
 
   const operation = btn('测试连接', async () => {
     const labelNode = operation.lastChild;
-    operation.disabled = true;
+    const previousGeneration = settings.connectorGeneration;
     if (labelNode) labelNode.textContent = '测试中…';
+    labels.textContent = '正在启动连接器…';
     try {
-      const start = Date.now() - 50;
-      await desktop().restartConnector();
-      if (!labels.isConnected) return;
-      labels.textContent = '正在等待本机实例登记…';
+      const started = await desktop().restartConnector();
+      if (!isOpen()) return;
+      settings = started;
+      showInstances(settings);
+      labels.textContent = '正在等待本次连接登记…';
       const ids = settings.instances.map(i => i.id);
-      for (let i = 0; i < 40; i++) {
-        if (!labels.isConnected) return;
-        const current = items(await api('/instances'));
-        if (!labels.isConnected) return;
-        const fresh = current.filter(item => ids.includes(item.id) && Date.parse(item.lastSeen) >= start);
-        if (fresh.length === ids.length) {
-          labels.textContent = fresh.length ? '连接测试结束，查看下方各实例状态。' : '尚未配置执行实例。';
-          showInstances(fresh);
-          await onUpdated?.();
-          return;
-        }
-        if (!(await desktop().settings()).connectorRunning) break;
-        await new Promise(resolve => setTimeout(resolve, 300));
-      }
-      if (!labels.isConnected) return;
-      const latest = await desktop().settings();
-      labels.textContent = latest.lastError || '尚未收到全部本机实例的登记，请检查路径、登录状态或原生启动错误。';
-      showInstances(items(await api('/instances')));
-      await onUpdated?.();
+      const outcome = await waitForConnector(started, ids, isOpen, previousGeneration);
+      if (!outcome || !isOpen()) return;
+      settings = outcome.view;
+      showInstances(settings);
+      labels.textContent = outcome.ready ? (ids.length ?
+        '本次实例登记已确认。模型调用仍取决于模型配置和额度。' : '尚未配置执行实例。') : outcome.detail;
+      void Promise.resolve().then(onUpdated).catch(() => {});
+    } catch (error) {
+      if (isOpen()) labels.textContent = error?.message || '无法确认本次连接。';
     } finally {
-      operation.disabled = false;
       if (labelNode) labelNode.textContent = '测试连接';
     }
   }, 'secondary', 'refresh');
 
-  showInstances(instances);
+  showInstances(settings);
+  const hermes = desktop().discoverHermes ? hermesDiscovery(() => settings, onUpdated, back) : null;
 
   displayDialog('执行实例与工作区', [
     labels,
     el('small', 'muted mono', settings.file),
     !settings.editable ? el('p', 'muted', '当前从独立 JSON 文件加载配置。') : null,
-    list
+    list,
+    hermes
   ], [
     settings.editable ? btn('新增实例', () => instanceForm(settings, null, false, onUpdated, back), 'secondary', 'plus') : null,
     operation,
     btn('关闭', () => document.getElementById('dialog')?.close(), 'ghost')
   ], { wide: true, back });
+}
+
+function hermesDiscovery(settings, onUpdated, back) {
+  const results = el('div', 'settings-list');
+  const message = el('p', 'muted');
+  message.setAttribute('role', 'status');
+  const scan = btn('重新扫描 Hermes', async () => {
+    message.textContent = '正在查找 Hermes 启动器…';
+    const discovery = await desktop().discoverHermes();
+    if (!message.isConnected || !document.getElementById('dialog')?.open) return;
+    message.textContent = discovery.candidates.length ? (discovery.editable ? '' : '独立 JSON 配置由原文件管理。') : '未找到 Hermes 启动器。';
+    results.replaceChildren(...discovery.candidates.map(candidate => {
+      const state = el('small', 'muted', candidate.found ? '已找到启动器，等待 ACP 验证。' : '未找到配置的启动器。');
+      state.setAttribute('role', 'status');
+      const probe = candidate.found && desktop().probeHermes ? btn('测试 ACP 握手', async () => {
+        state.textContent = '正在等待 ACP 握手…';
+        try {
+          const result = await desktop().probeHermes(candidate);
+          state.textContent = result.detail;
+        } catch (error) {
+          state.textContent = error?.message || 'ACP 握手失败。';
+        }
+      }, 'ghost btn-xs') : null;
+      const add = discovery.editable && candidate.found && !candidate.instanceId ? btn('添加为新实例', () => {
+        const current = settings();
+        const id = Array.from({ length: current.instances.length + 1 }, (_, i) => i ? 'hermes-local-' + (i + 1) : 'hermes-local')
+          .find(value => !current.instances.some(instance => instance.id.toLowerCase() === value));
+        instanceForm(current, null, false, onUpdated, back, {
+          adapterKey: 'hermes', id, name: 'Hermes', command: candidate.command, profileId: candidate.profileId,
+          configuredHome: candidate.configurationHome
+        });
+      }, 'ghost btn-xs') : null;
+      return el('div', 'record', el('strong', '', candidate.name || 'Hermes'), el('small', 'muted mono', candidate.command),
+        el('small', 'muted mono', candidate.profileId + ' · ' + candidate.configurationHome), state,
+        probe || add ? el('div', 'actions', probe, add) : null);
+    }));
+  }, 'secondary', 'refresh');
+  return el('div', 'settings-list', el('h3', '', 'Hermes 启动器'), el('div', 'actions', scan), message, results);
 }
 
 function worktreeForm(instance, onUpdated, back) {
@@ -100,19 +131,20 @@ function worktreeForm(instance, onUpdated, back) {
   ui.body.prepend(el('p', 'muted', instance.workspaceRef + ' · 从当前提交创建新分支和独立执行实例。'));
 }
 
-function instanceForm(settings, instance, copy = false, onUpdated, back) {
+function instanceForm(settings, instance, copy = false, onUpdated, back, draft) {
+  const initial = instance ?? draft;
   const nextId = instance && copy
     ? Array.from({ length: settings.instances.length + 1 }, (_, i) => instance.id + '-' + (i + 2))
       .find(id => !settings.instances.some(i => i.id === id))
-    : instance?.id;
+    : initial?.id;
   const ui = form(copy ? '复制执行实例' : instance ? '编辑执行实例' : '新增执行实例', [
-    { key: 'adapterKey', label: 'Agent', options: [{ id: 'codex', name: 'Codex' }, { id: 'dsh', name: 'DSH' }, { id: 'hermes', name: 'Hermes' }], value: instance?.adapterKey },
+    { key: 'adapterKey', label: 'Agent', options: [{ id: 'codex', name: 'Codex' }, { id: 'dsh', name: 'DSH' }, { id: 'hermes', name: 'Hermes' }], value: initial?.adapterKey },
     { key: 'id', label: '实例 ID', value: nextId, required: true },
-    { key: 'name', label: '显示名称', value: instance?.name, required: true },
-    { key: 'command', label: '官方可执行程序名或完整路径', value: instance?.command, required: true },
-    { key: 'workspaceRef', label: '工作区目录', value: instance?.workspaceRef || settings.workspace, required: true },
-    { key: 'profileId', label: 'Profile 绑定标识', value: instance?.profileId || 'default', required: true },
-    { key: 'configurationHome', label: 'Agent 配置目录', value: instance?.configuredHome, placeholder: instance?.configurationHome || '留空使用本机默认目录' },
+    { key: 'name', label: '显示名称', value: initial?.name, required: true },
+    { key: 'command', label: '官方可执行程序名或完整路径', value: initial?.command, required: true },
+    { key: 'workspaceRef', label: '工作区目录', value: initial?.workspaceRef || settings.workspace, required: true },
+    { key: 'profileId', label: 'Profile 绑定标识', value: initial?.profileId || 'default', required: true },
+    { key: 'configurationHome', label: 'Agent 配置目录', value: initial?.configuredHome, placeholder: initial?.configurationHome || '留空使用本机默认目录' },
     { key: 'codexProviderMode', label: 'Codex 供应商模式', options: [
       { id: 'official', name: '官方 ChatGPT 登录' },
       { id: 'native', name: '跟随本机供应商' }

@@ -1016,6 +1016,7 @@ test('同项目的 Bot 澄清、转达、交接、接手、交付和用户验收
 test('工作台用节点实际能力列出原生会话，导入有持久回执且可继续同一个原生话题',async t=>{
   const f=await server(t),{api}=f
   const frames=[]
+  const runtimeScopeId='a'.repeat(64)
   const socket=new WebSocket(f.base().replace('http:','ws:')+'/node',{headers:{Authorization:'Bearer '+f.app.auth.cfg.nodes.local}})
   t.after(()=>socket.terminate())
   socket.on('message',raw=>{
@@ -1025,8 +1026,8 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
       items:[{id:'existing-native',title:'现有原生会话',updatedAt:150,active:false,path:'private-path'}],nextCursor:'native-page-2'}))
   })
   await once(socket,'open')
-  socket.send(JSON.stringify({type:'hello',receiptLookup:true,instances:[
-    {id:'codex-catalog',name:'Codex',workspaceRef:f.dir,adapterKey:'codex',profileId:'native-profile',
+  socket.send(JSON.stringify({type:'hello',receiptLookup:true,scopedCommands:true,instances:[
+    {id:'codex-catalog',name:'Codex',workspaceRef:f.dir,adapterKey:'codex',profileId:'native-profile',runtimeScopeId,
       availableActions:['run','prepare'],history:true,sessionList:true,nativeBindingRelease:true},
     {id:'dsh-no-catalog',name:'DSH',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare']},
     {id:'dsh-list-only',name:'DSH 只读',workspaceRef:f.dir,adapterKey:'dsh',availableActions:['run','prepare'],sessionList:true,sessionImport:false}
@@ -1058,7 +1059,7 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   assert.equal(command.payload.importSessionId,'existing-native')
   async function event(seq,kind,data){
     const key='native-import-'+seq
-    socket.send(JSON.stringify({type:'event',event:{seq,key,kind,data,instanceId:command.instanceId,runId:command.runId,commandId:command.id}}))
+    socket.send(JSON.stringify({type:'event',event:{seq,key,kind,data,instanceId:command.instanceId,runId:command.runId,commandId:command.id,runtimeScopeId}}))
     await eventually(()=>frames.some(f=>f.type==='ack'&&f.key===key))
   }
   await event(1,'model_state',{sessionId:'existing-native',current:'native-model'})
@@ -1078,7 +1079,7 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   assert.equal(next.payload.communication.sender.kind,'user')
   for(const [seq,kind,data] of [[1,'accepted',{sessionId:'existing-native',nativeRunId:'followup-turn'}],[2,'completed',{sessionId:'existing-native',text:'续接完成'}]]){
     const key='native-followup-'+seq
-    socket.send(JSON.stringify({type:'event',event:{seq,key,kind,data,instanceId:next.instanceId,runId:next.runId,commandId:next.id}}))
+    socket.send(JSON.stringify({type:'event',event:{seq,key,kind,data,instanceId:next.instanceId,runId:next.runId,commandId:next.id,runtimeScopeId}}))
     await eventually(()=>frames.some(frame=>frame.type==='ack'&&frame.key===key))
   }
   await api('/threads/'+first.thread.id+'/lifecycle',{action:'delete'})
@@ -1092,7 +1093,7 @@ test('工作台用节点实际能力列出原生会话，导入有持久回执�
   await api('/runs/'+release.runId+'/recovery',{action:'abandon',acknowledge:true,reason:'旧解绑测试'},{status:409})
   const releaseKey='native-release-1'
   socket.send(JSON.stringify({type:'event',event:{seq:1,key:releaseKey,kind:'completed',
-    data:{sessionId:'existing-native',nativeAction:'release',released:true},instanceId:release.instanceId,runId:release.runId,commandId:release.id}}))
+    data:{sessionId:'existing-native',nativeAction:'release',released:true},instanceId:release.instanceId,runId:release.runId,commandId:release.id,runtimeScopeId}}))
   await eventually(()=>frames.some(frame=>frame.type==='ack'&&frame.key===releaseKey))
   assert.deepEqual((await api('/threads/'+first.thread.id+'/impact')).nativeRelease,{runId:releaseRequest.runId,status:'completed'})
   assert.deepEqual((await api(endpoint+'?projectId='+p.id)).items,[{id:'existing-native',title:'现有原生会话',updatedAt:150,active:false}])
@@ -1433,6 +1434,115 @@ test('主聊下一轮读取人格、持久摘要及相关记忆，调用失败�
   assert.ok((await api(path)).messages.every(m=>!m.text.includes('private-fixture-secret')))
 })
 
+test('Codex 原生绑定保留来源范围，切换及迟到回执不会混用相同会话 ID',async t=>{
+  const f=await server(t),{api}=f
+  const instance='codex-scoped',scopeA='a'.repeat(64),scopeB='b'.repeat(64),sessionId='same-native-id'
+  const endpoint='/instances/'+instance+'/sessions'
+  let socket
+  t.after(()=>socket?.terminate())
+  async function connectScope(scope){
+    if(socket){
+      const closed=once(socket,'close')
+      socket.terminate()
+      await closed
+      await eventually(()=>!f.app.db.prepare('SELECT online FROM instances WHERE id=?').get(instance)?.online)
+      f.app.db.prepare('UPDATE instances SET runtimeScopeId=NULL WHERE id=?').run(instance)
+    }
+    const ws=new WebSocket(f.base().replace('http:','ws:')+'/node',{headers:{Authorization:'Bearer '+f.app.auth.cfg.nodes.local}})
+    socket=ws
+    const frames=[]
+    const send=frame=>ws.send(JSON.stringify(frame))
+    ws.on('message',raw=>{
+      const frame=JSON.parse(raw)
+      frames.push(frame)
+      if(frame.type==='list_sessions')send({type:'sessions',id:frame.id,items:[{id:sessionId,title:scope}]})
+      if(frame.type==='read_history')send({type:'history',id:frame.id,items:[{id:'native-text',turnId:'turn',role:'assistant',text:scope}]})
+    })
+    await once(ws,'open')
+    send({type:'hello',scopedCommands:true,nativeBindingProofs:true,receiptLookup:true,instances:[{
+      id:instance,name:'Codex',adapterKey:'codex',workspaceRef:f.dir,profileId:'fixture',runtimeScopeId:scope,
+      availableActions:['run','prepare'],nativeHistory:true,sessionList:true,nativeBindingRelease:true,nativeActions:['fork','archive','unarchive']
+    }]})
+    await eventually(()=>f.app.db.prepare('SELECT online FROM instances WHERE id=?').get(instance)?.online)
+    return {frames,send,command:runId=>eventually(()=>frames.find(frame=>frame.command?.runId===runId)?.command),
+      async event(command,seq,kind,data={},runtimeScopeId=scope){
+        const key=command.id+'-'+seq
+        send({type:'event',event:{key,seq,kind,data,instanceId:instance,commandId:command.id,runId:command.runId,runtimeScopeId}})
+        await eventually(()=>frames.some(frame=>frame.type==='ack'&&frame.key===key))
+      }}
+  }
+  const a=await connectScope(scopeA)
+  const p=await api('/projects',{name:'原项目'}),q=await api('/projects',{name:'新项目'})
+  for(const project of [p,q])await api('/projects/'+project.id+'/workspaces',{instanceId:instance,workspaceRef:f.dir})
+  const original=await api(endpoint,{projectId:p.id,sessionId})
+  const originalCommand=await a.command(original.runId)
+  await a.event(originalCommand,1,'completed',{sessionId})
+  const originalId=original.thread.id,path='/threads/'+originalId
+  assert.equal((await api(path+'/native')).items[0].text,scopeA)
+  assert.equal((await api(path)).thread.nativeRuntimeScopeId,scopeA)
+
+  const fork=await api(path+'/lifecycle',{action:'fork'})
+  const forkCommand=await a.command(fork.runId)
+  assert.equal(forkCommand.payload.nativeOperation.sourceSessionId,sessionId)
+  await a.event(forkCommand,1,'accepted')
+  await a.event(forkCommand,2,'completed',{sessionId:'forked',nativeAction:'fork'})
+  assert.equal((await api('/threads/'+fork.id)).thread.nativeRuntimeScopeId,scopeA)
+
+  await api(path+'/lifecycle',{action:'delete'})
+  await api(path+'/lifecycle',{action:'purge',confirm:true})
+  f.app.db.prepare(`INSERT INTO threads(id,kind,state,title,instanceId,projectId,sessionId,createdAt)
+    VALUES('legacy-unknown','native','purged','旧记录',?,?,?,?)`).run(instance,p.id,'legacy-id','2026-01-01')
+  f.app.db.prepare(`INSERT INTO threads(id,kind,state,title,instanceId,projectId,sessionId,createdAt)
+    VALUES('legacy-readable','native','active','旧记录',?,?,?,?)`).run(instance,p.id,'legacy-readable-id','2026-01-01')
+  const pending=await api(endpoint,{projectId:p.id,sessionId:'legacy-pending-id'})
+  const pendingCommand=await a.command(pending.runId)
+  f.app.db.prepare(`UPDATE commands SET status='uncertain',payload=json_remove(payload,'$.dispatch.runtimeScopeId','$.importRuntimeScopeId') WHERE id=?`)
+    .run(pendingCommand.id)
+  f.app.db.prepare("UPDATE runs SET status='uncertain' WHERE id=?").run(pending.runId)
+  const b=await connectScope(scopeB)
+  await eventually(()=>b.frames.find(frame=>frame.type==='verify_native_bindings'))
+  const proof={thread:'legacy-unknown',instance,session:'legacy-id',scope:scopeA}
+  b.send({type:'native_binding_proofs',bindings:[{...proof,workspace:f.dir+'-other'}]})
+  await api('/threads/legacy-unknown/lifecycle',{action:'releaseNative',sessionId:'legacy-id',confirm:true},{status:409})
+  assert.equal(f.app.db.prepare("SELECT nativeRuntimeScopeId FROM threads WHERE id='legacy-unknown'").get().nativeRuntimeScopeId,null)
+  b.send({type:'native_binding_proofs',bindings:[{...proof,workspace:f.dir}]})
+  await eventually(()=>f.app.db.prepare("SELECT nativeRuntimeScopeId FROM threads WHERE id='legacy-unknown'").get().nativeRuntimeScopeId===scopeA)
+  await api(endpoint,{projectId:p.id,sessionId:'legacy-pending-id'},{status:409})
+  await api(endpoint,{projectId:q.id,sessionId:'legacy-pending-id'},{status:409})
+  const replacement=await api('/threads/legacy-readable/lifecycle',{action:'replaceNative'})
+  assert.equal(replacement.sessionId,null)
+  assert.equal(replacement.projectId,p.id)
+  assert.equal((await api('/threads/legacy-readable')).thread.sessionId,'legacy-readable-id')
+  await api(path+'/lifecycle',{action:'releaseNative',sessionId,confirm:true},{status:409})
+  await api('/threads/'+fork.id+'/native',null,{status:409})
+  assert.deepEqual((await api(endpoint+'?projectId='+q.id)).items.map(item=>item.id),[sessionId])
+  const other=await api(endpoint,{projectId:q.id,sessionId})
+  const next=await b.command(other.runId)
+  assert.equal(next.runtimeScopeId,scopeB)
+  await b.event(next,1,'model_state',{sessionId},scopeA)
+  const otherPath='/threads/'+other.thread.id
+  assert.equal((await api(otherPath)).run.status,'uncertain')
+  assert.equal((await api(otherPath)).thread.sessionId,null)
+  await b.event(next,2,'model_state',{sessionId})
+  await b.event(next,3,'completed',{sessionId})
+  assert.equal((await api(otherPath+'/native')).items[0].text,scopeB)
+  assert.deepEqual((await api(endpoint+'?projectId='+p.id)).items,[])
+
+  const back=await connectScope(scopeA)
+  await api(otherPath+'/native',null,{status:409})
+  assert.deepEqual((await api(endpoint+'?projectId='+q.id)).items,[])
+  const release=await api(path+'/lifecycle',{action:'releaseNative',sessionId,confirm:true})
+  const releaseCommand=await back.command(release.runId)
+  assert.equal(releaseCommand.runtimeScopeId,scopeA)
+  await back.event(releaseCommand,1,'completed',{sessionId,nativeAction:'release',released:true})
+  assert.deepEqual((await api(endpoint+'?projectId='+p.id)).items.map(item=>item.id),[sessionId])
+  assert.deepEqual((await api(endpoint+'?projectId='+q.id)).items,[])
+  const bindings=f.app.db.prepare('SELECT id,state,nativeRuntimeScopeId,nativeReleased FROM threads WHERE sessionId=? ORDER BY rowid').all(sessionId)
+  assert.deepEqual(bindings.map(row=>[row.id,row.state,row.nativeRuntimeScopeId,row.nativeReleased]),[
+    [originalId,'purged',scopeA,1],[other.thread.id,'active',scopeB,0]
+  ])
+})
+
 test('旧版主库及连接器库迁移可重复打开，备份恢复前检查附件与绑定',t=>{
   const root=mkdtempSync(join(tmpdir(),'maoqiu-migration-'))
   t.after(()=>rmSync(root,{recursive:true,force:true}))
@@ -1463,8 +1573,10 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
   legacyConnector.close()
   for(let i=0;i<2;i++){
     const migrated=openDatabase(old)
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,10)
-    assert.equal(migrated.prepare('SELECT sessionId FROM threads WHERE id=?').get('old-thread').sessionId,'old-session')
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,11)
+    const oldBinding=migrated.prepare('SELECT sessionId,nativeRuntimeScopeId FROM threads WHERE id=?').get('old-thread')
+    assert.equal(oldBinding.sessionId,'old-session')
+    assert.equal(oldBinding.nativeRuntimeScopeId,null)
     assert.equal(migrated.prepare('SELECT count(*) n FROM run_grants').get().n,0)
     assert.ok(Date.parse(migrated.prepare('SELECT expiresAt FROM grants').get().expiresAt)>Date.now())
     const result=homeApi(migrated,{method:'GET',path:'/search',body:{},dataDir:old,principal:owner,query:new URLSearchParams({q:'迁移原件'})})

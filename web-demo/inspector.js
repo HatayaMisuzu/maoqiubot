@@ -1,6 +1,6 @@
 import {
   $, api, at, btn, copyText, el, icon, iconBtn,
-  phase, resolveActiveContext, state, url
+  nativeBindingUnverified, phase, resolveActiveContext, state, url
 } from './lib.js';
 import { hasDesktopSettings } from './desktop-settings.js';
 import { daily, mainModels, mainPermissions, memories } from './main-settings.js';
@@ -67,7 +67,9 @@ export function createInspector(actions) {
   function renderNativeHistorySection(thread, agent) {
     if (!thread?.sessionId && !agent?.capabilities?.nativeHistory) return null;
     const section = el('section', 'inspector-section');
-    const historyKey = thread?.sessionId && !thread.nativeInvalid ? thread.id + ':' + thread.sessionId : null;
+    const unverified = nativeBindingUnverified(thread, agent);
+    const historyKey = thread?.sessionId && !thread.nativeInvalid && !unverified
+      ? JSON.stringify([thread.id, thread.sessionId, thread.nativeRuntimeScopeId]) : null;
     const cached = historyKey ? nativeHistory.get(historyKey) : null;
     const loading = historyKey ? nativeHistoryLoading.has(historyKey) : false;
 
@@ -119,13 +121,13 @@ export function createInspector(actions) {
             el('code', '', thread.sessionId),
             iconBtn('复制原生会话 ID', () => copyText(thread.sessionId, '已复制原生会话 ID'), 'copy')
           )),
-          kvRow('绑定状态', el('span', 'badge ' + (thread.nativeInvalid ? 'error' : thread.nativeArchived ? 'question' : 'online'),
-            thread.nativeInvalid ? '绑定失效' : thread.nativeArchived ? '原生已归档' : '已绑定'))
+          kvRow('绑定状态', el('span', 'badge ' + (thread.nativeInvalid ? 'error' : unverified || thread.nativeArchived ? 'question' : 'online'),
+            thread.nativeInvalid ? '绑定失效' : unverified ? '原生账号待核对' : thread.nativeArchived ? '原生已归档' : '已绑定'))
         )
       );
-      if (thread.nativeInvalid) {
+      if (thread.nativeInvalid || unverified) {
         section.append(
-          el('p', 'muted', thread.nativeInvalid),
+          el('p', 'muted', thread.nativeInvalid || '工作台保留了已收到的消息。'),
           btn('创建替代话题继续', () => actions.replaceNative(thread), 'secondary btn-sm', 'branch')
         );
         return section;

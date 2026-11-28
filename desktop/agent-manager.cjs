@@ -33,7 +33,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
     return { directory: legacyDir, binary: legacyBin }
   }
   const stateDir = join(userData, 'agent-manager')
-  let child, opening, stopping, failure, activeInstanceId = null
+  let child, opening, resuming, stopping, failure, activeInstanceId = null
 
   function scope(value) {
     return createHash('sha256').update(JSON.stringify(value.map(path => process.platform === 'win32' ? path.toLowerCase() : path))).digest('hex')
@@ -80,7 +80,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
   }
 
   function status() {
-    const active = Boolean(child || opening)
+    const active = Boolean(child || opening || resuming)
     const { binary } = resolveManagerPaths()
     return {
       available: process.platform === 'win32' && Boolean(statSync(binary, { throwIfNoEntry: false })?.isFile()),
@@ -110,8 +110,9 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
       child = undefined
       activeInstanceId = null
       if (!stopping) {
-        try { resumeConnector() }
-        catch { failure = '本机 Agent 连接器未能恢复，请在 Agent 设置里测试连接。' }
+        resuming = Promise.resolve().then(resumeConnector).catch(error => {
+          failure = '本机 Agent 连接器未能恢复。' + error.message
+        }).finally(() => { resuming = undefined })
       }
     }
     managerProcess.once('exit', (code, signal) => {
@@ -128,6 +129,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
 
   async function open(instanceId) {
     if (stopping) throw Error('工作台正在退出')
+    if (resuming) throw Error('本机 Agent 连接器正在恢复，请稍后再打开外接 Agent 管理')
     if (opening) {
       await opening
       if (child && instanceId !== undefined && activeInstanceId !== instanceId) {
@@ -155,6 +157,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
   async function stop() {
     stopping = true
     await opening?.catch(() => {})
+    await resuming
     if (!child) return
     const process = child
     const exited = once(process, 'exit').catch(() => {})

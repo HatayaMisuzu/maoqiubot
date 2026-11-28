@@ -35,7 +35,8 @@ test('Origin errors are client responses, query-aware retries stay stable, and g
     assert.equal(JSON.parse(cached)._sensitiveResult,'grant-token')
     assert.equal(JSON.parse(cached).token,undefined)
     app.db.prepare('INSERT INTO requests VALUES(?,?,?,?)').run('owner','legacy-sensitive','legacy-signature',JSON.stringify({id:'legacy',projectId:project.id,token:'synthetic-token',expiresAt:'2099-01-01T00:00:00Z'}))
-    app.db.exec('PRAGMA user_version=8')
+    app.db.exec(`DROP TABLE desktop_codex_switch; DROP INDEX threads_native_binding;
+      ALTER TABLE threads DROP COLUMN nativeRuntimeScopeId; PRAGMA user_version=8`)
     await app.close()
     app=startServer({port:0,dataDir:temp,chat:false})
     await once(app.server,'listening')

@@ -38,3 +38,7 @@ export function agentRuntimeKey(profileId:string,home:string,command:string,args
 export function agentRuntimeScope(runtime:string){
   return createHash('sha256').update(runtime).digest('hex')
 }
+
+export function accountRuntimeKey(runtime:string,account?:string){
+  return account?JSON.stringify([runtime,account]):runtime
+}

@@ -169,13 +169,18 @@ export function reportCommunication(db:DatabaseSync,dir:string,runId:string,home
 }
 export function checkQueuedInput(db:DatabaseSync,dir:string,c:any,payload:any){
   const thread=getThread(db,c.threadId)
+  const inst=instance(db,c.instanceId)
+  assertNativeBindingScope(db,inst,thread)
+  if(inst.adapterKey==='codex'&&payload.importSessionId&&payload.importRuntimeScopeId!==inst.runtimeScopeId)
+    fail('导入所选的原生账号或供应商已变化，请重新核对目录',409)
   const op=payload.nativeOperation
   if(op){
     const source=getThread(db,required(op.sourceThreadId,'原生来源话题 ID'))
+    assertNativeBindingScope(db,inst,source)
     if(source.instanceId!==thread.instanceId||source.projectId!==thread.projectId||source.sessionId!==op.sourceSessionId||
       !['active','archived','deleted','purged'].includes(source.state)||(!['delete','unarchive','release'].includes(op.action)&&source.state==='deleted')||
       (source.state==='purged')!==(op.action==='release')||
-      (op.action==='release'&&source.nativeReleased)||
+      (source.nativeInvalid&&op.action!=='release')||
       (op.action==='fork'?source.id===thread.id:source.id!==thread.id))fail('原生操作来源或绑定已变化',409)
   }
   if(thread.nativeInvalid&&op?.action!=='release'||thread.state!=='active'&&!['delete','unarchive'].includes(op?.action)&&op?.action!=='release')
@@ -353,7 +358,10 @@ function linkTaskThread(db:DatabaseSync,taskId:string,threadId:string,relation:'
     .run(taskId,threadId,relation,now())
 }
 export function prepareModels(db:DatabaseSync,thread:any){
-  if(thread.taskId||thread.instanceId==='main'||!JSON.parse(instance(db,thread.instanceId).availableActions).includes('prepare'))fail('这个话题无法预读原生模型',409)
+  if(thread.taskId||thread.instanceId==='main')fail('这个话题无法预读原生模型',409)
+  const inst=instance(db,thread.instanceId)
+  if(!JSON.parse(inst.availableActions).includes('prepare'))fail('这个话题无法预读原生模型',409)
+  assertNativeBindingScope(db,inst,thread)
   assertBotAllowed(db,thread.instanceId,'direct',thread.projectId)
   if(thread.state!=='active'||thread.nativeInvalid)fail('已归档、删除或失效的话题不能继续执行',409)
   projectWorkspace(db,thread.projectId,thread.instanceId)
@@ -389,7 +397,7 @@ export function queueNativeBindingRelease(db:DatabaseSync,thread:any,sessionId:s
   const held=one(db,`SELECT 1 FROM commands WHERE threadId=? AND status IN ('held','waiting','uncertain','sent','queued','received')
     AND (status IN ('held','waiting','uncertain') OR runId IN(SELECT id FROM runs WHERE status NOT IN ('completed','failed','blocked','cancelled'))) LIMIT 1`,thread.id)
   if(active||jobs||held)fail('原生会话仍有未完成或待核对的操作',409)
-  nativeSessionReleaseTarget(db,thread.instanceId,thread.projectId)
+  assertNativeBindingScope(db,nativeSessionReleaseTarget(db,thread.instanceId,thread.projectId),thread)
   const run=startRun(db,thread)
   const commandId=enqueue(db,run,'prepare',{nativeOperation:{action:'release',sourceThreadId:thread.id,sourceSessionId:sessionId}})
   changed(db,'thread',{threadId:thread.id,instanceId:thread.instanceId,action:'releaseNative',status:'queued'})
@@ -399,37 +407,58 @@ function checkNativeCatalogTarget(db:DatabaseSync,inst:any,projectId:string|null
   projectWorkspace(db,projectId,inst.id)
   if(JSON.parse(inst.capabilities).sessionList!==true)fail('此实例未声明可核对的原生会话目录能力',409)
   if(!inst.online)fail('原生实例离线',409)
+  if(inst.adapterKey==='codex'&&!inst.runtimeScopeId)fail('Codex 原生账号和供应商尚未核对',409)
   return inst
 }
+
+export function assertNativeBindingScope(db:DatabaseSync,inst:any,thread:any){
+  if(thread.kind!=='native'||!thread.sessionId)return
+  if(thread.nativeReleased)fail('此原生会话的工作台绑定已解除',409)
+  if(inst.adapterKey==='codex'&&!thread.nativeRuntimeScopeId)
+    fail('旧 Codex 原生绑定缺少可核对的账号来源，可查看工作台已保存的记录',409)
+  if(thread.nativeRuntimeScopeId&&thread.nativeRuntimeScopeId!==inst.runtimeScopeId)
+    fail('此话题属于其他原生账号、供应商或 profile，可查看工作台已保存的记录',409)
+  if(inst.adapterKey==='codex'&&bindingRows(db,inst,thread.sessionId,0).some(row=>row.id!==thread.id))
+    fail('此原生会话存在尚未核对的其他绑定，可查看工作台已保存的记录',409)
+}
+
+// Legacy Codex rows have no provable scope until their original connector binding is available.
+// Reserve unknown IDs within their node/profile instead of exposing them to another project or scope.
+const matchingBindingScope=`(t.nativeRuntimeScopeId=? OR (t.nativeRuntimeScopeId IS NULL AND
+  (((i.adapterKey='codex' OR i.runtimeScopeId IS NULL) AND i.nodeId=? AND i.profileId=?) OR
+   (i.adapterKey<>'codex' AND i.runtimeScopeId=?))))`
+function bindingRows(db:DatabaseSync,inst:any,native:string,released:number){
+  return db.prepare(`SELECT t.* FROM threads t JOIN instances i ON i.id=t.instanceId
+    WHERE t.kind='native' AND t.sessionId=? AND t.nativeReleased=? AND i.workspaceRef=? AND i.adapterKey=? AND ${matchingBindingScope}`)
+    .all(native,released,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId,inst.runtimeScopeId) as any[]
+}
+
 export function nativeSessionBinding(db:DatabaseSync,inst:any,native:string){
-  const existing=one(db,`SELECT t.* FROM threads t JOIN instances i ON i.id=t.instanceId
-    WHERE t.sessionId=? AND COALESCE(t.nativeReleased,0)=0 AND i.workspaceRef=? AND i.adapterKey=? AND
-      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
-       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
-    native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId)
-  if(existing)return {thread:existing,status:'bound' as const}
-  const pending=one(db,`SELECT c.threadId,c.runId FROM commands c JOIN runs r ON r.id=c.runId JOIN instances i ON i.id=c.instanceId
+  const rows=bindingRows(db,inst,native,0)
+  if(rows.length)return {thread:rows[0],status:'bound' as const,
+    conflict:rows.length>1||inst.adapterKey==='codex'&&(!rows[0].nativeRuntimeScopeId||Boolean(rows[0].nativeInvalid))}
+  const pending=one(db,`SELECT c.threadId,c.runId,json_extract(c.payload,'$.importRuntimeScopeId') AS originalScope
+    FROM commands c JOIN runs r ON r.id=c.runId JOIN instances i ON i.id=c.instanceId
     WHERE i.workspaceRef=? AND i.adapterKey=? AND c.kind='prepare' AND json_extract(c.payload,'$.importSessionId')=?
       AND r.status IN ('queued','running','uncertain') AND
-      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
-       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`,
-    inst.workspaceRef,inst.adapterKey,native,inst.runtimeScopeId,inst.nodeId,inst.profileId)
-  if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending' as const}
+      (json_extract(c.payload,'$.importRuntimeScopeId')=? OR (json_type(c.payload,'$.importRuntimeScopeId') IS NULL AND
+       (((i.adapterKey='codex' OR i.runtimeScopeId IS NULL) AND i.nodeId=? AND i.profileId=?) OR
+        (i.adapterKey<>'codex' AND i.runtimeScopeId=?))))`,
+    inst.workspaceRef,inst.adapterKey,native,inst.runtimeScopeId,inst.nodeId,inst.profileId,inst.runtimeScopeId)
+  if(pending)return {thread:getThread(db,pending.threadId),runId:pending.runId,status:'pending' as const,
+    conflict:inst.adapterKey==='codex'&&!pending.originalScope}
 }
 export function nativeSessionReleaseScope(db:DatabaseSync,inst:any,native:string){
-  const rows=db.prepare(`SELECT t.instanceId,t.projectId FROM threads t JOIN instances i ON i.id=t.instanceId
-    WHERE t.sessionId=? AND t.nativeReleased=1 AND i.workspaceRef=? AND i.adapterKey=? AND
-      ((i.runtimeScopeId=? AND i.runtimeScopeId IS NOT NULL) OR
-       (i.runtimeScopeId IS NULL AND i.nodeId=? AND i.profileId=?))`).all(
-    native,inst.workspaceRef,inst.adapterKey,inst.runtimeScopeId,inst.nodeId,inst.profileId) as {instanceId:string;projectId:string|null}[]
+  const rows=bindingRows(db,inst,native,1)
   if(!rows.length)return null
   const scope=rows[0]
-  if(rows.some(row=>row.instanceId!==scope.instanceId||row.projectId!==scope.projectId))return {conflict:true as const}
+  if(rows.some(row=>row.instanceId!==scope.instanceId||row.projectId!==scope.projectId||
+    inst.adapterKey==='codex'&&!row.nativeRuntimeScopeId))return {conflict:true as const}
   return {instanceId:scope.instanceId,projectId:scope.projectId,conflict:false as const}
 }
 
-export function nativeBindingInScope(binding:{thread:any},instanceId:string,projectId:string|null){
-  return binding.thread.instanceId===instanceId&&binding.thread.projectId===projectId&&['active','archived'].includes(binding.thread.state)
+export function nativeBindingInScope(binding:{thread:any,conflict?:boolean},instanceId:string,projectId:string|null){
+  return !binding.conflict&&binding.thread.instanceId===instanceId&&binding.thread.projectId===projectId&&['active','archived'].includes(binding.thread.state)
 }
 
 export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any){
@@ -449,12 +478,13 @@ export function importNativeSession(db:DatabaseSync,dir:string,key:string,b:any)
   const previous=one(db,`SELECT t.* FROM threads t JOIN commands c ON t.id=c.threadId
     WHERE t.instanceId=? AND t.projectId IS ? AND t.sessionId IS NULL AND c.kind='prepare'
     AND json_extract(c.payload,'$.importSessionId')=? AND t.taskId IS NULL
+    AND json_extract(c.payload,'$.importRuntimeScopeId') IS ?
     AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.threadId=t.id AND m.role='user')
-    ORDER BY c.rowid DESC LIMIT 1`,key,projectId,native)
+    ORDER BY c.rowid DESC LIMIT 1`,key,projectId,native,inst.runtimeScopeId)
   const thread=previous&&terminal.has(latestRun(db,previous.id)?.status)?previous:
     createThread(db,dir,{title:required(b.title??('导入的 '+inst.name+' 话题'),'title').slice(0,120),instanceId:key,projectId,source:'imported'})
   const run=startRun(db,thread)
-  enqueue(db,run,'prepare',{importSessionId:native})
+  enqueue(db,run,'prepare',{importSessionId:native,...(inst.runtimeScopeId?{importRuntimeScopeId:inst.runtimeScopeId}:{})})
   return {thread,runId:run.id,status:'queued'}
 }
 function delegationTarget(db:DatabaseSync,b:any){
@@ -512,6 +542,8 @@ export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:strin
     thread=one(db,'SELECT t.* FROM task_drafts d JOIN threads t ON t.id=d.threadId WHERE t.id=? AND d.originThreadId=? AND t.instanceId=? AND t.projectId IS ? AND t.taskId IS NULL',key,origin.id,inst.id,projectId)
     if(thread){
       reusedDraft=true
+      if(thread.nativeInvalid)fail('目标工作话题的原生绑定已失效',409)
+      assertNativeBindingScope(db,inst,thread)
       const run=latestRun(db,key)
       if(run&&(!run.modelSetup||!terminal.has(run.status)))fail('正在读取此会话的模型，请稍候',409)
       if(Object.hasOwn(b,'modelId'))selectModel(db,thread,b.modelId)
@@ -521,6 +553,7 @@ export function delegate(db:DatabaseSync,dir:string,b:any,sourceMessageId?:strin
       thread=one(db,`SELECT * FROM threads WHERE id=? AND instanceId=? AND projectId IS ? AND kind IN ('native','api') AND state='active'
         AND NOT EXISTS(SELECT 1 FROM task_drafts d WHERE d.threadId=threads.id)`,key,inst.id,projectId)
       if(!thread||thread.kind==='native'&&(!thread.sessionId||thread.nativeInvalid))fail('目标工作话题不属于选定 Bot/项目或没有有效原生会话',409)
+      assertNativeBindingScope(db,inst,thread)
       const run=latestRun(db,key)
       if(run&&!terminal.has(run.status))fail('目标原生会话仍有运行，不能并行启动另一个任务',409)
       if(run?.status==='uncertain')fail('目标运行送达待核对，不能启动另一个任务',409)
@@ -554,6 +587,7 @@ function continueTask(db:DatabaseSync,dir:string,origin:any,inst:any,projectId:s
   if(thread.instanceId!==inst.id||thread.projectId!==projectId||thread.state!=='active'||
     thread.kind==='native'&&(thread.nativeInvalid||!thread.sessionId)||!['native','api'].includes(thread.kind))
     fail('指定任务没有可继续的有效原生工作话题',409)
+  assertNativeBindingScope(db,inst,thread)
   const active=latestRun(db,thread.id)
   if(active&&!terminal.has(active.status))fail('目标原生会话仍有运行，不能并行继续任务',409)
   const previous=one(db,'SELECT * FROM runs WHERE taskId=? AND threadId=? ORDER BY rowid DESC LIMIT 1',task.id,thread.id)
@@ -576,10 +610,11 @@ function continueTask(db:DatabaseSync,dir:string,origin:any,inst:any,projectId:s
 }
 export function sendInput(db:DatabaseSync,dir:string,thread:any,b:any,sourceMessageId?:string,coordination?:CoordinationApproval){
   if(one(db,'SELECT 1 FROM task_drafts WHERE threadId=?',thread.id))fail('请通过委派表单提交此草稿',409)
-  if(thread.state!=='active')fail('已归档或删除的话题不能继续执行',409)
+  if(thread.state!=='active'||thread.nativeInvalid)fail('已归档、删除或失效的话题不能继续执行',409)
   if(thread.instanceId!=='main')assertBotAllowed(db,thread.instanceId,sourceMessageId?'delegate':'direct',thread.projectId)
   projectWorkspace(db,thread.projectId,thread.instanceId)
   const target=thread.instanceId==='main'?undefined:instance(db,thread.instanceId)
+  if(target)assertNativeBindingScope(db,target,thread)
   if(Object.hasOwn(b,'expectedModelId')&&thread.kind==='native'&&thread.sessionId){
     const selected=one(db,'SELECT selected FROM thread_models WHERE threadId=?',thread.id)?.selected??null
     if(b.expectedModelId!==selected)fail('原生模型选择已变化，请重新核对后发送',409)
@@ -712,6 +747,21 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   if(!ins.changes) return
   const kind=e.kind,{usage,...data}=e.data??{},thread=getThread(db,run.threadId)
   if(!['accepted','message','activity','artifact','input_required','model_state','completed','failed','blocked','cancelled'].includes(kind)) fail('未知节点事件')
+  const command=JSON.parse(run.commandPayload),dispatchedScope=command.dispatch?.runtimeScopeId??null
+  const inst=instance(db,run.instanceId)
+  const scope=dispatchedScope??(inst.adapterKey==='codex'?null:inst.runtimeScopeId)
+  // A rejected legacy or mismatched receipt must not block the other instances on this node.
+  const unscopedLocalFailure=kind==='failed'&&data.notDispatched===true&&!e.runtimeScopeId&&!data.sessionId&&!data.nativeRunId
+  const scopeMismatch=dispatchedScope?dispatchedScope!==e.runtimeScopeId&&!unscopedLocalFailure:
+    inst.adapterKey==='codex'&&(!['failed','cancelled'].includes(kind)||Boolean(data.sessionId||data.nativeRunId))
+  const bindingMismatch=thread.sessionId&&(thread.nativeRuntimeScopeId||inst.adapterKey==='codex'&&scope)&&thread.nativeRuntimeScopeId!==scope
+  if(scopeMismatch||bindingMismatch&&!unscopedLocalFailure){
+    if(terminal.has(run.status))return
+    const detail='原生回执的账号或供应商范围无法核对，已保留为送达待核对'
+    db.prepare("UPDATE commands SET status='uncertain',detail=? WHERE id=?").run(detail,e.commandId)
+    markUncertain(db,{runId:run.id,threadId:thread.id,taskId:run.taskId,id:e.commandId},detail)
+    return
+  }
   if(terminal.has(run.status)){
     if(terminal.has(kind)&&one(db,"SELECT 1 FROM messages WHERE threadId=? AND kind='recovery' AND json_extract(data,'$.runId')=?",thread.id,run.id)){
       message(db,thread.id,'system','late_evidence','已归档旧运行的迟到原生回执：'+kind,
@@ -722,8 +772,14 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   const task=run.taskId && getTask(db,run.taskId)
   if(data.sessionId && thread.sessionId && thread.sessionId!==data.sessionId) fail('原线程绑定冲突',409)
   if(data.nativeRunId && run.nativeRunId && run.nativeRunId!==data.nativeRunId) fail('原运行绑定冲突',409)
-  if(data.sessionId && one(db,'SELECT 1 FROM threads WHERE instanceId=? AND sessionId=? AND id<>? AND COALESCE(nativeReleased,0)=0',run.instanceId,data.sessionId,thread.id))fail('原生会话已绑定到另一话题',409)
-  if(data.sessionId) db.prepare('UPDATE threads SET sessionId=? WHERE id=?').run(data.sessionId,thread.id)
+  if(data.sessionId){
+    if(thread.nativeReleased||bindingRows(db,{...inst,runtimeScopeId:scope??inst.runtimeScopeId},data.sessionId,0).some(row=>row.id!==thread.id))
+      fail('原生会话已绑定到另一话题或旧绑定无法核对',409)
+    if(command.importSessionId&&data.sessionId!==command.importSessionId)fail('原生导入回执与选定会话不匹配',409)
+    if(!thread.sessionId)db.prepare('UPDATE threads SET sessionId=?,nativeRuntimeScopeId=? WHERE id=?').run(data.sessionId,scope,thread.id)
+    else if(!thread.nativeRuntimeScopeId&&scope&&inst.adapterKey!=='codex')
+      db.prepare('UPDATE threads SET nativeRuntimeScopeId=? WHERE id=?').run(scope,thread.id)
+  }
   if(data.nativeRunId) db.prepare('UPDATE runs SET nativeRunId=? WHERE id=?').run(data.nativeRunId,run.id)
   if(kind==='model_state'){
     if(latestRun(db,thread.id)?.id!==run.id)return
@@ -740,7 +796,9 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
       return
     }
     if(!terminal.has(kind))fail('读取模型的命令没有开始推理')
-    const op=JSON.parse(run.commandPayload).nativeOperation
+    const op=command.nativeOperation
+    if(kind==='completed'&&command.importSessionId&&(data.sessionId??thread.sessionId)!==command.importSessionId)
+      fail('原生导入完成回执缺少选定会话',409)
     if(op&&kind==='completed'){
       if(op.action==='release'){
         if(data.nativeAction!=='release'||data.released!==true||data.sessionId!==op.sourceSessionId||thread.state!=='purged'||thread.sessionId!==op.sourceSessionId)
@@ -758,9 +816,9 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
     }
     db.prepare('UPDATE runs SET status=? WHERE id=?').run(kind,run.id)
     changed(db,'model',{threadId:thread.id,instanceId:thread.instanceId,runId:run.id,status:kind})
-    if(kind==='completed'&&JSON.parse(run.commandPayload).importSessionId)
+    if(kind==='completed'&&command.importSessionId)
       message(db,thread.id,'system','activity','已绑定选定的原生会话。后续消息在同一会话中继续。',{runId:run.id,sessionId:data.sessionId})
-    if(kind!=='completed'&&JSON.parse(run.commandPayload).nativeOperation?.action!=='release')message(db,thread.id,'system','error',String(data.text??'读取原生模型失败'),{runId:run.id})
+    if(kind!=='completed'&&op?.action!=='release')message(db,thread.id,'system','error',String(data.text??'读取原生模型失败'),{runId:run.id})
     return
   }
   let status=run.status

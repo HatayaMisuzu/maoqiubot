@@ -1,10 +1,12 @@
 const { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
 const { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path')
-const { randomUUID } = require('node:crypto')
+const { createHash, randomUUID } = require('node:crypto')
 const { execFile } = require('node:child_process')
 const { promisify } = require('node:util')
-const { agentCommand, agentHome, agentHomeVariable, agentRuntimeKey, agentRuntimeScope } = require('../contracts/agent-runtime.ts')
+const { accountRuntimeKey, agentCommand, agentHome, agentHomeVariable, agentRuntimeKey, agentRuntimeScope } = require('../contracts/agent-runtime.ts')
+const { commitCodexSwitch } = require('./codex-switch-recovery.cjs')
 const git = promisify(execFile)
+const confirmationSalt = randomUUID()
 const officialNames = {
   codex: /^codex(?:\.exe)?$/i,
   dsh: /^dsh(?:\.exe|\.cmd)?$/i,
@@ -30,11 +32,15 @@ function normalizeStablePath(targetPath) {
   }
 }
 function detectedCommand(adapterKey, command, configurationHome) {
-  if (!officialNames[adapterKey]?.test(basename(command))) return null
+  return detectedCommands(adapterKey, command, configurationHome)[0] ?? null
+}
+function detectedCommands(adapterKey, command, configurationHome, environment = process.env) {
+  if (typeof command !== 'string' || !officialNames[adapterKey]?.test(basename(command)) ||
+      (!isAbsolute(command) && command !== basename(command))) return []
   const names = adapterKey === 'hermes' && command.toLowerCase() !== 'hermes' ? [basename(command)] :
     ['dsh','hermes'].includes(adapterKey) && process.platform === 'win32' ? [adapterKey+'.exe', adapterKey+'.cmd'] :
     adapterKey === 'codex' && process.platform === 'win32' ? ['codex.exe'] : [adapterKey]
-  const pathDirs = (process.env.Path ?? process.env.PATH ?? '').split(delimiter)
+  const pathDirs = (environment.Path ?? environment.PATH ?? '').split(delimiter)
     .map(dir => dir.replace(/^"|"$/g, '')).filter(dir => isAbsolute(dir))
   const installs = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA,'Programs')]
     .filter(Boolean).map(dir => join(dir,'DeepSeekHarness','resources','runtime','cli','bin'))
@@ -44,13 +50,19 @@ function detectedCommand(adapterKey, command, configurationHome) {
     ...[...(adapterKey==='hermes'?[join(hermesHome,'bin')]:[]),...pathDirs,...(adapterKey==='dsh'?installs:[])]
       .flatMap(dir => names.map(name => join(dir,name)))
   ]
-  for (const path of candidates) {
-    if (!isAbsolute(path) || !officialNames[adapterKey].test(basename(path))) continue
+  const seen = new Set()
+  return candidates.filter(path => {
+    if (!isAbsolute(path) || !officialNames[adapterKey].test(basename(path))) return false
     try {
-      if (statSync(path, { throwIfNoEntry: false })?.isFile()) return path
+      if (!statSync(path, { throwIfNoEntry: false })?.isFile()) return false
+      const real = realpathSync.native(path)
+      const key = process.platform === 'win32' ? real.toLowerCase() : real
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
     } catch { /* PATH can contain inaccessible directories. Continue discovery. */ }
-  }
-  return null
+    return false
+  })
 }
 
 function connectorSettings({ root, workspace, dataDir }) {
@@ -64,27 +76,17 @@ function connectorSettings({ root, workspace, dataDir }) {
     config.stateDir = join(dataDir, 'node-local')
     for (const instance of config.instances) if (instance.adapterKey === 'dsh')
       instance.command = detectedCommand('dsh','dsh') ?? (process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
-    if (!config.instances.some(instance => instance.adapterKey === 'hermes')) {
-      const hermesCommand = detectedCommand('hermes', 'hermes')
-      if (hermesCommand) {
-        config.instances.push({
-          id: 'hermes-local',
-          name: 'Hermes',
-          adapterKey: 'hermes',
-          profileId: 'default',
-          workspaceRef: '.',
-          command: hermesCommand,
-          args: ['acp']
-        })
-      }
-    }
     write(file, config)
   }
   return { file, editable, workspace }
 }
 
 function configFrom(file) {
-  const config = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''))
+  return parseConfig(readFileSync(file, 'utf8'))
+}
+
+function parseConfig(text) {
+  const config = JSON.parse(text.replace(/^\uFEFF/, ''))
   if (!Array.isArray(config.instances) || typeof config.stateDir !== 'string' || !config.stateDir) {
     throw Error('连接器配置缺少 stateDir 或 instances')
   }
@@ -287,39 +289,119 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
   }
 }
 
-function boundCodexThreads(db, instanceId) {
-  const row = db.prepare(`SELECT COUNT(*) AS count FROM threads
+function codexBindings(db, instanceId, currentScope) {
+  return db.prepare(`SELECT id,state,sessionId,nativeRuntimeScopeId,nativeInvalid FROM threads
     WHERE instanceId=?
       AND sessionId IS NOT NULL
       AND COALESCE(nativeReleased,0)=0
-      AND nativeInvalid IS NULL
-      AND state IN ('active','archived','deleted')`).get(instanceId)
-  return Number(row?.count ?? 0)
+      AND (nativeRuntimeScopeId IS NULL OR nativeRuntimeScopeId=?)
+    ORDER BY id`).all(instanceId, currentScope)
 }
 
-function previewCodexProviderSwitch(settings, db, input) {
+function codexInstance(settings, config, instanceId, mode) {
+  const source = config.instances.find(item => item.id === instanceId && item.adapterKey === 'codex')
+  if (!source) throw Error('找不到指定的本机 Codex 实例')
+  const home = agentHome('codex', source.env, settings.workspace)
+  return { ...source, codexProviderMode: mode, profileId: source.profileId ?? 'default',
+    workspaceRef: realpathSync(resolve(settings.workspace, source.workspaceRef)),
+    env: { ...source.env, CODEX_HOME: home } }
+}
+
+async function probeCodexScope(settings, instanceId, mode) {
+  const instance = codexInstance(settings, configFrom(settings.file), instanceId, mode)
+  const { Codex } = await import('../connector/adapters/codex.ts')
+  const agent = new Codex(instance)
+  try {
+    await agent.initialize()
+    const account = await agent.identity()
+    const runtime = agentRuntimeKey(instance.profileId, instance.env.CODEX_HOME, instance.command, instance.args)
+    return agentRuntimeScope(accountRuntimeKey(runtime, account))
+  } catch {
+    throw Error('无法核对本机 Codex 原生供应商或账号，请检查启动入口和登录状态')
+  } finally {
+    agent.close()
+  }
+}
+
+function codexConfigEvidence(instance, mode) {
+  const hash = createHash('sha256')
+  function read(path) {
+    try {
+      const meta = statSync(path)
+      if (!meta.isFile() || meta.size > 2 * 1024 * 1024) throw Error('无法核对 Codex 本机配置')
+      return readFileSync(path)
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw Error('无法核对 Codex 本机配置')
+      return Buffer.alloc(0)
+    }
+  }
+  const home = instance.env.CODEX_HOME
+  if (mode === 'native') {
+    hash.update(JSON.stringify([home, read(join(home, 'config.toml')).toString('base64')]))
+    for (let cwd = instance.workspaceRef; ; cwd = dirname(cwd)) {
+      hash.update(JSON.stringify([cwd, read(join(cwd, '.codex', 'config.toml')).toString('base64')]))
+      if (dirname(cwd) === cwd) break
+    }
+  }
+  const auth = read(join(home, 'auth.json'))
+  try {
+    const data = JSON.parse(auth.toString('utf8'))
+    // Avoid binding confirmation to routine ChatGPT access/refresh token rotation.
+    hash.update(JSON.stringify([data.auth_mode, data.tokens?.account_id, data.OPENAI_API_KEY]))
+  } catch { hash.update(auth) }
+  return hash.digest('hex')
+}
+
+function prepareCodexSwitch(settings, db, input, verifiedScope) {
   if (!settings.editable) throw Error('当前使用独立 JSON 配置，请在原文件中修改')
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('实例配置无效')
   const instanceId = typeof input.instanceId === 'string' ? input.instanceId.trim() : ''
-  const config = configFrom(settings.file)
+  const previous = readFileSync(settings.file)
+  const config = parseConfig(previous.toString('utf8'))
   const existing = config.instances.find(item => item.id === instanceId && item.adapterKey === 'codex')
   if (!existing) throw Error('找不到指定的本机 Codex 实例')
   const codexProviderMode = input.codexProviderMode
   if (!['official', 'native'].includes(codexProviderMode)) throw Error('请选择有效的 Codex 供应商模式')
+  const registered = db.prepare('SELECT nodeId,adapterKey,runtimeScopeId FROM instances WHERE id=?').get(instanceId)
+  if (config.nodeId !== 'local' || (registered && (registered.nodeId !== 'local' || registered.adapterKey !== 'codex'))) {
+    throw Error('供应商切换仅支持本机 Codex 实例')
+  }
+  const previousMode = existing.codexProviderMode === 'native' ? 'native' : 'official'
+  const previousScope = registered?.runtimeScopeId ?? null
+  const modeChanged = previousMode !== codexProviderMode
+  const identityChanged = !modeChanged && previousScope && verifiedScope && verifiedScope !== previousScope
+  const noChange = !modeChanged && !identityChanged
+  const threads = noChange ? [] : codexBindings(db, instanceId, previousScope)
+  let confirmationToken
+  if (!noChange) {
+    const instance = codexInstance(settings, config, instanceId, codexProviderMode)
+    confirmationToken = createHash('sha256').update(confirmationSalt).update(previous)
+      .update(JSON.stringify([instanceId, codexProviderMode, previousScope, verifiedScope ?? null, threads,
+        codexConfigEvidence(instance, codexProviderMode),
+        modeChanged ? codexConfigEvidence(instance, previousMode) : null])).digest('hex')
+  }
   return {
-    instanceId,
-    codexProviderMode,
-    previousMode: existing.codexProviderMode ?? 'official',
-    boundThreads: boundCodexThreads(db, instanceId)
+    config, previous, threads, modeChanged,
+    preview: { instanceId, codexProviderMode, previousMode, noChange, boundThreads: threads.length, confirmationToken }
   }
 }
 
-function switchCodexProviderMode(settings, db, input) {
-  const { instanceId, codexProviderMode, boundThreads } = previewCodexProviderSwitch(settings, db, input)
-  if (boundThreads > 0 && input?.confirmRebind !== true) {
-    return { applied: false, requiresConfirmation: true, boundThreads }
+function previewCodexProviderSwitch(settings, db, input, verifiedScope) {
+  return prepareCodexSwitch(settings, db, input, verifiedScope).preview
+}
+
+function localConnectorStatePath(settings) {
+  return join(resolve(settings.workspace, configFrom(settings.file).stateDir), 'connector.sqlite')
+}
+
+function switchCodexProviderMode(settings, db, input, verifiedScope) {
+  const { config, previous, threads, modeChanged, preview } = prepareCodexSwitch(settings, db, input, verifiedScope)
+  const { instanceId, codexProviderMode, boundThreads, noChange, confirmationToken } = preview
+  if (noChange) return { applied: false, noChange: true, requiresConfirmation: false, boundThreads: 0 }
+  if ((input.confirmationToken && input.confirmationToken !== confirmationToken) ||
+    (boundThreads > 0 && input.confirmationToken !== confirmationToken)) {
+    return { applied: false, noChange: false, requiresConfirmation: true, boundThreads, confirmationToken }
   }
-  const config = configFrom(settings.file)
   config.instances = config.instances.map(item => {
     if (item.id !== instanceId) return item
     const next = { ...item }
@@ -327,47 +409,21 @@ function switchCodexProviderMode(settings, db, input) {
     else delete next.codexProviderMode
     return next
   })
-  db.exec('BEGIN IMMEDIATE')
-  try {
-    if (boundThreads > 0) {
-      db.prepare(`UPDATE threads
-        SET nativeInvalid=?,
-            state=CASE WHEN state='active' THEN 'archived' ELSE state END
-        WHERE instanceId=?
-          AND sessionId IS NOT NULL
-          AND COALESCE(nativeReleased,0)=0
-          AND nativeInvalid IS NULL
-          AND state IN ('active','archived','deleted')`)
-        .run('Codex 供应商配置已切换，请新建话题或创建替代话题继续', instanceId)
-    }
-    db.prepare("UPDATE instances SET runtimeScopeId=NULL,online=0 WHERE id=? AND nodeId='local' AND adapterKey='codex'")
-      .run(instanceId)
-    write(settings.file, config)
-    db.exec('COMMIT')
-  } catch (error) {
-    try { db.exec('ROLLBACK') } catch {}
-    throw error
-  }
+  const next = modeChanged ? Buffer.from(JSON.stringify(config, null, 2) + '\n') : previous
+  commitCodexSwitch(settings.file, db, previous, next, () => {
+    const invalidate = db.prepare(`UPDATE threads SET nativeInvalid=COALESCE(nativeInvalid,?),
+      state=CASE WHEN state='active' THEN 'archived' ELSE state END WHERE id=?`)
+    for (const thread of threads) invalidate.run('Codex 供应商配置已切换，请新建话题或创建替代话题继续', thread.id)
+    db.prepare("UPDATE instances SET runtimeScopeId=?,online=0 WHERE id=? AND nodeId='local' AND adapterKey='codex'")
+      .run(verifiedScope ?? null, instanceId)
+  })
   return {
     applied: true,
+    noChange: false,
     requiresConfirmation: false,
     boundThreads,
-    invalidatedThreads: boundThreads,
-    settings: settingsView(settings)
+    invalidatedThreads: threads.filter(item => !item.nativeInvalid).length
   }
-}
-
-function clearUnboundNativeCodexScopes(settings, db) {
-  const config = configFrom(settings.file)
-  const cleared = []
-  for (const instance of config.instances) {
-    if (instance.adapterKey !== 'codex' || instance.codexProviderMode !== 'native') continue
-    if (boundCodexThreads(db, instance.id) !== 0) continue
-    const result = db.prepare("UPDATE instances SET runtimeScopeId=NULL WHERE id=? AND nodeId='local' AND adapterKey='codex' AND runtimeScopeId IS NOT NULL")
-      .run(instance.id)
-    if (result.changes > 0) cleared.push(instance.id)
-  }
-  return cleared
 }
 
 function worktreeSource(settings, instance) {
@@ -377,6 +433,7 @@ function worktreeSource(settings, instance) {
 }
 
 module.exports = {
+  configFrom, detectedCommands,
   connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath,
-  readCodexLocalSummary, boundCodexThreads, previewCodexProviderSwitch, switchCodexProviderMode, clearUnboundNativeCodexScopes
+  readCodexLocalSummary, previewCodexProviderSwitch, switchCodexProviderMode, probeCodexScope, localConnectorStatePath
 }

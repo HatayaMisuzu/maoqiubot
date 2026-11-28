@@ -1,4 +1,4 @@
-import {join,relative,resolve} from 'node:path'
+import {join,relative} from 'node:path'
 import {createHash} from 'node:crypto'
 import {readFileSync} from 'node:fs'
 import {Native} from './base.ts'
@@ -48,7 +48,9 @@ export class Codex extends Native implements Adapter {
     if(this.instance.codexProviderMode!=='native'){
       const {account}=await this.rpc.request('account/read',{refreshToken:false},10000)
       if(account?.type!=='chatgpt')throw Error('请在本机使用官方 Codex 登录 ChatGPT')
-      return hash(String(account.email??'local-chatgpt'))
+      if(typeof account.email!=='string'||!account.email.trim())throw Error('无法核对本机 Codex 登录账号')
+      this.providerId='openai'
+      return hash(account.email)
     }
     // Inspect the configuration Codex resolves for this cwd, including native project overrides.
     const {config}=await this.rpc.request('config/read',{cwd:this.instance.workspaceRef},10000)
@@ -98,9 +100,13 @@ export class Codex extends Native implements Adapter {
   }
   endings=new Map<string,{finish:()=>void,fail:(err:Error)=>void}>()
   private starts=new Map<Run,Promise<unknown>>()
-  async probe() {
+  async initialize() {
     const hello=await this.rpc.request('initialize',{clientInfo:{name:'xiaomaoqiu',title:'小毛球工作台',version:'1.0.0'},capabilities:{}})
     await this.rpc.write({method:'initialized'})
+    return hello
+  }
+  async probe() {
+    const hello=await this.initialize()
     await this.identity()
     try{
       const result=await this.rpc.request('model/list',{limit:100,includeHidden:false,
@@ -130,7 +136,12 @@ export class Codex extends Native implements Adapter {
     const result=await this.rpc.request('thread/list',{...options,cwd:this.instance.workspaceRef,currentAccountOnly:true,useStateDbOnly:true},5000)
     if(!Array.isArray(result?.data))throw Error('Codex 未提供可核对的会话目录')
     return {...result,data:result.data.filter((thread:any)=>typeof thread.id==='string'&&typeof thread.cwd==='string'&&
-      relative(this.instance.workspaceRef,thread.cwd)===''&&!thread.ephemeral)}
+      relative(this.instance.workspaceRef,thread.cwd)===''&&!thread.ephemeral&&
+      (typeof thread.modelProvider!=='string'||thread.modelProvider===this.providerId))}
+  }
+  private matchesThread(thread:any,sessionId?:string){
+    return typeof thread?.id==='string'&&(!sessionId||thread.id===sessionId)&&typeof thread.cwd==='string'&&
+      relative(this.instance.workspaceRef,thread.cwd)===''&&(!this.providerId||thread.modelProvider===this.providerId)
   }
   async listSessions(cursor?:string){
     const result=await this.catalog({limit:35,sortKey:'updated_at',cursor})
@@ -142,8 +153,7 @@ export class Codex extends Native implements Adapter {
     const {data}=await this.catalog({includedThreadIds:[sessionId],limit:1})
     if(!data.some((thread:any)=>thread.id===sessionId))throw Error('找不到当前工作区、账号和 profile 下的外部会话')
     const {thread}=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
-    if(thread?.id!==sessionId||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!=='')
-      throw Error('外部会话的工作区不匹配')
+    if(!this.matchesThread(thread,sessionId))throw Error('外部会话的工作区或供应商不匹配')
     if(!['idle','notLoaded'].includes(thread.status?.type)||this.active.has(sessionId))throw Error('原生会话仍在运行或状态不可核对，请先在原客户端检查')
     try{return await this.open(sessionId)}
     catch(e){
@@ -158,15 +168,14 @@ export class Codex extends Native implements Adapter {
     const {thread,model}=await this.rpc.request(method,{cwd:this.instance.workspaceRef,
       ...(this.providerId?{modelProvider:this.providerId}:{}),
       ...(sessionId?{threadId:sessionId,excludeTurns:true}:{})})
-    if(!thread?.id || (sessionId && thread.id!==sessionId) || relative(resolve(thread.cwd),this.instance.workspaceRef)!=='' ||
-      (this.providerId && thread.modelProvider!==this.providerId))throw new Error('原生工作区、线程或供应商不符')
+    if(!this.matchesThread(thread,sessionId))throw new Error('原生工作区、线程或供应商不符')
     this.sessions.add(thread.id)
     if(typeof model==='string')this.sessionModels.set(thread.id,model)
     return thread.id as string
   }
   async readHistory(sessionId:string,before?:string):Promise<NativeHistory>{
     const {thread}=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
-    if(thread?.id!==sessionId||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!=='')throw Error('原生历史工作区不匹配')
+    if(!this.matchesThread(thread,sessionId))throw Error('原生历史工作区或供应商不匹配')
     const page=await this.rpc.request('thread/turns/list',{threadId:sessionId,limit:6,sortDirection:'desc',itemsView:'full',cursor:before},5000)
     if(!Array.isArray(page.data))throw Error('原生历史读取失败')
     const items:NativeHistory['items']=[]
@@ -193,13 +202,13 @@ export class Codex extends Native implements Adapter {
     if(action==='delete')throw Error('此 Codex 适配器未提供原生删除')
     if(this.active.has(sessionId))throw Error('原生会话仍在运行')
     const original=await this.rpc.request('thread/read',{threadId:sessionId,includeTurns:false},5000)
-    if(original.thread?.id!==sessionId||typeof original.thread.cwd!=='string'||
-      relative(this.instance.workspaceRef,original.thread.cwd)!==''||original.thread.status?.type==='active')throw Error('原生工作区或空闲状态无法核对')
+    if(!this.matchesThread(original.thread,sessionId)||original.thread.status?.type==='active')
+      throw Error('原生工作区、供应商或空闲状态无法核对')
     const result=await this.rpc.request('thread/'+action,{threadId:sessionId,...(action==='fork'?{cwd:this.instance.workspaceRef}:{})})
     if(action==='archive'){this.sessions.delete(sessionId);return sessionId}
     const thread=result.thread
-    if(typeof thread?.id!=='string'||typeof thread.cwd!=='string'||relative(this.instance.workspaceRef,thread.cwd)!==''||
-      (action==='fork'?thread.id===sessionId:thread.id!==sessionId))throw Error('原生会话操作回执不匹配')
+    if(!this.matchesThread(thread,action==='fork'?undefined:sessionId)||action==='fork'&&thread.id===sessionId)
+      throw Error('原生会话操作回执不匹配')
     if(action==='fork')this.sessions.add(thread.id)
     return thread.id as string
   }
@@ -311,7 +320,7 @@ export class Codex extends Native implements Adapter {
   async inspect(run:Run) {
     if(!run.nativeRunId) return false
     const {thread}=await this.rpc.request('thread/read',{threadId:run.sessionId,includeTurns:true})
-    if(thread?.id!==run.sessionId || resolve(thread.cwd)!==resolve(this.instance.workspaceRef)) return false
+    if(!this.matchesThread(thread,run.sessionId))return false
     const turn=thread.turns?.find((x:any)=>x.id===run.nativeRunId)
     if(!turn || !['completed','interrupted','failed'].includes(turn.status)) return false
     for(const item of turn.items??[]) if(item.type==='agentMessage') run.emit('message',{itemId:item.id,text:item.text})
