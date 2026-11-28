@@ -2,6 +2,7 @@ import {existsSync,mkdirSync,readFileSync,writeFileSync,realpathSync} from 'node
 import {basename,isAbsolute,resolve,join} from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {createHash} from 'node:crypto'
+import {agentCommand,agentHome,agentHomeVariable,agentRuntimeKey,agentRuntimeScope} from '../contracts/agent-runtime.ts'
 import WebSocket from 'ws'
 import {registry} from './adapters/index.ts'
 import {runKeyedSerializedOperation} from './keyed-serialized-operations.ts'
@@ -10,6 +11,7 @@ import {grantFiles} from './grant-files.ts'
 import type {Command,Instance,Adapter,Run,Input,Capabilities} from './types.ts'
 
 const config=JSON.parse(readFileSync(process.argv[2]||'connector/config.example.json','utf8').replace(/^\uFEFF/,''))
+const expectedScopes=new Map<string,string>(Object.entries(JSON.parse(process.env.MAOQIU_EXPECTED_AGENT_SCOPES||'{}')))
 const token=process.env.NODE_TOKEN
 if(!token) throw new Error('需要设置 NODE_TOKEN')
 const url=new URL(process.env.MAOQIU_NODE_URL||config.url)
@@ -174,6 +176,8 @@ async function handle(c:Command) {
           const material=await input(c)
           if(pending.cancelled)return
           if(stopping||inst.adapter!==adapter) throw Error('原生进程已断开，输入尚未发送')
+          if(inst.config.codexProviderMode==='native')await checkedRuntime(inst,adapter)
+          if(pending.cancelled)return
           cleanup=grant(c,material)
           running.set(c.runId,{run,adapter})
           preparing.delete(c.runId)
@@ -232,11 +236,10 @@ async function runtimeIdentity(inst:{config:Instance,adapter?:Adapter}) {
   const runtimeKey=inst.config.runtimeKey??''
   return account?JSON.stringify([runtimeKey,account]):runtimeKey
 }
-const runtimeScope=(runtime:string)=>createHash('sha256').update(runtime).digest('hex')
 async function checkedRuntime(entry:Entry,adapter:Adapter,expected=entry.runtimeScopeId){
   const runtime=await runtimeIdentity({config:entry.config,adapter})
   if(stopping||entry.adapter!==adapter)throw Error('原生进程已断开，指令尚未发送')
-  if(expected&&runtimeScope(runtime)!==expected)throw Error('原生账号或 profile 已变化，请检查实例配置')
+  if(expected&&agentRuntimeScope(runtime)!==expected)throw Error('原生账号、供应商或 profile 已变化。请恢复原配置或使用新实例 ID')
   return runtime
 }
 async function recover(inst:Entry) {
@@ -291,10 +294,10 @@ async function startAdapterOnce(entry:Entry,restarting:boolean,generation:number
     if(registration.localOnly&&!loopback)throw Error('该原生账号只支持同机运行')
     if(isAbsolute(instance.command)&&!existsSync(instance.command))throw Error('找不到配置的 Agent 可执行程序')
     instance.workspaceRef=realpathSync(instance.workspaceRef)
-    const key=registration.homeVariable
-    const home=resolve(instance.env?.[key]||process.env[key]||registration.defaultHome)
+    const key=agentHomeVariable(instance.adapterKey)!
+    const home=agentHome(instance.adapterKey,instance.env)!
     instance.env={...instance.env,[key]:home}
-    instance.runtimeKey=JSON.stringify([instance.profileId,home,instance.command,instance.args])
+    instance.runtimeKey=agentRuntimeKey(instance.profileId??'default',home,instance.command,instance.args)
     adapter=new registration.create(instance)
     entry.adapter=adapter
     adapter.onDisconnect(error=>{
@@ -306,7 +309,7 @@ async function startAdapterOnce(entry:Entry,restarting:boolean,generation:number
       if(ready||restarting)retry(entry)
     })
     const caps=await adapter.probe()
-    entry.runtimeScopeId=runtimeScope(await checkedRuntime(entry,adapter))
+    entry.runtimeScopeId=agentRuntimeScope(await checkedRuntime(entry,adapter,expectedScopes.get(instance.id)??entry.runtimeScopeId))
     await recover(entry)
     if(stopping||entry.generation!==generation)return
     if(entry.adapter!==adapter)throw Error(entry.error??'原生进程已断开')
@@ -327,10 +330,7 @@ for(const instance of config.instances as Instance[]) {
   if(instances.has(instance.id)) throw new Error('实例 ID 重复')
   instance.workspaceRef=resolve(instance.workspaceRef)
   instance.profileId=instance.profileId??'default'
-  if(instance.adapterKey==='dsh'&&!isAbsolute(instance.command)&&/^dsh(?:\.cmd|\.exe)?$/i.test(instance.command)){
-    const configured=process.env.MAOQIU_DSH_EXECUTABLE
-    if(configured&&isAbsolute(configured)&&/^dsh(?:\.cmd|\.exe)?$/i.test(basename(configured)))instance.command=configured
-  }
+  instance.command=agentCommand(instance.adapterKey,instance.command)
   instances.set(instance.id,{config:instance,caps:offline(),generation:0})
 }
 function connect(){
@@ -343,7 +343,7 @@ function connect(){
       const runtimeScopeId=adapter&&entry.runtimeScopeId
       return {id:i.id,name:i.name,workspaceRef:i.workspaceRef,profileId:i.profileId,adapterKey:i.adapterKey,
         ...(runtimeScopeId?{runtimeScopeId}:{}),...caps,nativeBindingRelease:caps.sessionList===true,
-        usage:typeof entry.adapter?.readUsage==='function',error,online:!error}
+        usage:typeof entry.adapter?.readUsage==='function'&&caps.usage!==false,error,online:!error}
     })
     if(ws!==socket||socket?.readyState!==WebSocket.OPEN)return
     send({type:'hello',nodeId:config.nodeId,receiptLookup:true,cancelBeforeStart:true,instances:registrations})
@@ -386,7 +386,6 @@ function connect(){
           if(!frame.runtimeScopeId)throw Error('缺少原生额度账号范围')
           await checkedRuntime(entry,adapter,frame.runtimeScopeId)
           const items=await adapter.readUsage()
-          await checkedRuntime(entry,adapter,frame.runtimeScopeId)
           if(ws===socket)send({type:'usage',id:frame.id,items})
         }catch{if(ws===socket)send({type:'usage',id:frame.id,error:true})}
       }

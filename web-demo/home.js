@@ -1,4 +1,5 @@
 import { $, api, at, btn, confirmDialog, displayDialog, download, el, form, icon, items, notice, state, upload, url } from './lib.js';
+import { renderMarkdown } from './markdown.js';
 import { spaceEditor } from './space-editor.js';
 
 const labels = {
@@ -10,9 +11,11 @@ const options = keys => keys.map(id => ({ id, name: labels[id] || id }));
 const empty = txt => el('p', 'empty', txt);
 
 function display(title, ...contents) {
+  const last = contents.at(-1);
+  const opts = last && typeof last === 'object' && !(last instanceof Node) && !Array.isArray(last) ? contents.pop() : {};
   displayDialog(title, contents.filter(Boolean), [
     btn('关闭', () => $('dialog').close(), 'ghost')
-  ]);
+  ], opts);
 }
 
 function showSource(source) {
@@ -32,10 +35,10 @@ function showSource(source) {
   for (const id of source.attachmentIds || []) {
     links.append(
       btn('下载附件', () => download(id), 'secondary btn-xs', 'file'),
-      btn('附件权限', async () => editSharing(await api('/attachments/' + url(id) + '?meta=1'), 'attachments', () => showSource(source)), 'ghost btn-xs')
+      btn('附件权限', async () => editSharing(await api('/attachments/' + url(id) + '?meta=1'), 'attachments', () => showSource(source), () => showSource(source)), 'ghost btn-xs')
     );
   }
-  links.append(btn('调整分享范围', () => editSharing(source, 'sources', showSource), 'ghost btn-xs'));
+  links.append(btn('调整分享范围', () => editSharing(source, 'sources', showSource, () => showSource(source)), 'ghost btn-xs'));
   display(source.title || '原件',
     el('small', '', [source.author, source.platform, at(source.createdAt)].filter(Boolean).join(' · ')),
     el('p', 'text', source.text || ''),
@@ -43,12 +46,12 @@ function showSource(source) {
   );
 }
 
-function editSharing(asset, area, onSave) {
+function editSharing(asset, area, onSave, back) {
   const ui = form(area === 'sources' ? '资料分享范围' : '附件分享范围 · ' + asset.name, [], '保存范围', async () => {
     const projectIds = Array.from(checks.querySelectorAll('input:checked'), input => input.value);
     const saved = await api('/' + area + '/' + url(asset.id), { projectIds, endpointIds: asset.endpointIds || [] }, 'PATCH');
     onSave(saved);
-  });
+  }, { back });
   const checks = el('fieldset', 'handoff-files', el('legend', '', '可读取原件的项目'));
   for (const p of state.projects) {
     const input = el('input');
@@ -61,17 +64,21 @@ function editSharing(asset, area, onSave) {
 }
 
 const sourceById = async id => showSource(await api('/sources/' + url(id)));
-const recordRow = (rec, onContinue, onStartWork) => el('div', 'record',
-  el('small', 'muted', [labels[rec.type] || rec.type, rec.author, at(rec.createdAt)].filter(Boolean).join(' · ')),
-  el('p', 'text', rec.body),
-  rec.extra?.version ? el('small', 'muted', '版本 ' + rec.extra.version) : null,
-  rec.evidence ? el('p', 'text', rec.evidence) : null,
-  rec.sourceId ? btn('查看出处', () => sourceById(rec.sourceId), 'ghost btn-xs') : null,
-  onContinue || onStartWork ? el('div', 'actions',
+const recordRow = (rec, onContinue, onStartWork, extraActions = []) => {
+  const rowActions = [
+    rec.sourceId ? btn('查看出处', () => sourceById(rec.sourceId), 'ghost btn-xs') : null,
     onContinue ? btn('接续此交接', onContinue, 'ghost btn-xs') : null,
-    onStartWork ? btn('带入工作话题', onStartWork, 'secondary btn-xs', 'chat') : null
-  ) : null
-);
+    onStartWork ? btn('带入工作话题', onStartWork, 'secondary btn-xs', 'chat') : null,
+    ...extraActions
+  ].filter(Boolean);
+  return el('div', 'record',
+    el('small', 'muted', [labels[rec.type] || rec.type, rec.author, at(rec.createdAt)].filter(Boolean).join(' · ')),
+    rec.body ? renderMarkdown(rec.body) : null,
+    rec.extra?.version ? el('small', 'muted', '版本 ' + rec.extra.version) : null,
+    rec.evidence ? el('p', 'text', rec.evidence) : null,
+    rowActions.length ? el('div', 'actions', ...rowActions) : null
+  );
+};
 
 export const home = actions => {
   const editor = spaceEditor(actions, display);
@@ -127,9 +134,16 @@ export const home = actions => {
       await actions.refresh();
     }, 'destructive-ghost');
     ui.save.before(unbind);
+    const apiHint = el('small', 'muted', 'API 工作 Bot 不挂载本机工作区目录，仅能通过明确选中的材料读取。');
+    apiHint.hidden = true;
+    ui.controls.access.closest('label')?.after(apiHint);
     const showAccess = () => {
+      const inst = state.instances.find(i => i.id === ui.controls.instanceId.value);
       const binding = current.find(row => row.instanceId === ui.controls.instanceId.value);
-      ui.controls.access.value = binding?.allowAgentAccess ? binding.agentPermission : 'explicit';
+      const isApi = inst?.adapterKey === 'model-api';
+      ui.controls.access.value = isApi ? 'explicit' : (binding?.allowAgentAccess ? binding.agentPermission : 'explicit');
+      ui.controls.access.disabled = isApi;
+      apiHint.hidden = !isApi;
       unbind.hidden = !binding;
     };
     ui.controls.instanceId.addEventListener('change', showAccess);
@@ -302,7 +316,7 @@ export const home = actions => {
     ], '保存', async values => {
       await api(endpoint, { ...values, expectedRevision: rec.revision }, 'PATCH');
       await actions.refresh();
-    });
+    }, { back: () => openRecord(id) });
 
     const sharing = () => form('派生知识共享', [{
       key: 'mode',
@@ -322,14 +336,14 @@ export const home = actions => {
       }, 'PATCH');
       await actions.refresh();
       await openRecord(id);
-    });
+    }, { back: () => openRecord(id) });
 
     const history = async () => {
       const { history: revisions } = await api(endpoint + '?history=1');
       display('修订历史', ...revisions.map(revision => el('article', 'record',
         el('strong', '', '版本 ' + revision.revision + ' · ' + at(revision.createdAt)),
-        el('p', 'text', revision.body)
-      )));
+        revision.body ? renderMarkdown(revision.body) : el('p', 'text', '')
+      )), { back: () => openRecord(id) });
     };
 
     const forget = async () => {
@@ -339,8 +353,9 @@ export const home = actions => {
         confirmLabel: '确认忘记',
         destructive: true
       });
-      if (!ok) { await openRecord(id); return; }
+      if (!ok) return;
       await api(endpoint, { expectedRevision: rec.revision }, 'DELETE');
+      $('dialog').close();
       await actions.refresh();
     };
 
@@ -360,12 +375,17 @@ export const home = actions => {
       value: f.type === 'attachment' ? undefined : entry?.values[f.id],
       options: f.type === 'select' && f.options ? [{ id: '', name: '请选择' }, ...f.options.map(id => ({ id, name: id }))] : undefined
     }));
-    form((entry ? '编辑' : '添加') + c.name, fields, '保存', async raw => {
+    const clearAttachments = new Set();
+    const ui = form((entry ? '编辑' : '添加') + c.name, fields, '保存', async raw => {
       const values = {};
       for (const field of c.fields) {
         const val = raw[field.id];
         if (!val) {
-          if (entry && field.type !== 'attachment' && entry.values[field.id] != null) values[field.id] = null;
+          if (entry && field.type === 'attachment' && clearAttachments.has(field.id)) {
+            values[field.id] = null;
+          } else if (entry && field.type !== 'attachment' && entry.values[field.id] != null) {
+            values[field.id] = null;
+          }
           continue;
         }
         values[field.id] = field.type === 'number'
@@ -379,6 +399,20 @@ export const home = actions => {
       else await api(path, { values });
       await actions.refresh();
     });
+    if (entry) {
+      for (const field of c.fields) {
+        if (field.type !== 'attachment' || !entry.values[field.id]) continue;
+        const box = el('input');
+        box.type = 'checkbox';
+        box.addEventListener('change', () => {
+          if (box.checked) clearAttachments.add(field.id);
+          else clearAttachments.delete(field.id);
+        });
+        ui.controls[field.id]?.closest('label')?.after(
+          el('label', 'check-field', box, el('span', '', '清空已有附件（' + field.name + '）'))
+        );
+      }
+    }
   }
 
   function entriesTable(c, entries, view, route) {
@@ -429,8 +463,8 @@ export const home = actions => {
 
     if (block.type === 'timeline') {
       sectionEl.append(...(timeline.length ? timeline.map(r => r.type === 'handoff'
-        ? recordRow(r, () => newRecord(space.projectId, null, r), () => startHandoff(space.projectId, r))
-        : el('div', '', recordRow(r), btn('查看记录', () => openRecord(r.id), 'ghost btn-xs'))
+        ? recordRow(r, () => newRecord(space.projectId, null, r), () => startHandoff(space.projectId, r), [btn('查看记录', () => openRecord(r.id), 'ghost btn-xs')])
+        : recordRow(r, null, null, [btn('查看记录', () => openRecord(r.id), 'ghost btn-xs')])
       ) : [empty('项目进度与交接会显示在这里。')]));
     }
 
@@ -524,7 +558,7 @@ export const home = actions => {
     if (crumb) { crumb.hidden = false; crumb.className = 'crumb'; crumb.textContent = '毛球之家'; }
     $('heading').textContent = project.name;
     const workspaceList = items(workspaces);
-    $('subhead').textContent = personal ? '个人资料空间' : workspaceList.map(i => i.name + ' · ' + i.workspaceRef).join(' / ');
+    $('subhead').textContent = personal ? '个人资料空间' : workspaceList.map(i => [i.name, i.workspaceRef].filter(Boolean).join(' · ')).join(' / ');
     $('tools').replaceChildren(
       btn('检索资料', () => search(personal ? null : pid, personal), 'secondary', 'search'),
       ...(!personal ? [btn('绑定工作区', () => bindWorkspace(pid), 'secondary')] : [])
@@ -538,11 +572,11 @@ export const home = actions => {
     grid.style.setProperty('--columns', page.columns || 1);
 
     const manage = () => display('空间设置', el('div', 'settings-list',
-      btn('编辑页面', () => editor.page(space, page), 'settings-row', 'edit'),
-      btn('新建页面', () => editor.page(space), 'settings-row', 'plus'),
-      btn('管理集合', () => editor.collections(space), 'settings-row', 'folder'),
-      btn('管理模块', () => editor.modules(space), 'settings-row', 'layers'),
-      space.revision > 1 ? btn('恢复布局', () => editor.restore(space), 'settings-row', 'task') : null
+      btn('编辑页面', () => editor.page(space, page, manage), 'settings-row', 'edit'),
+      btn('新建页面', () => editor.page(space, null, manage), 'settings-row', 'plus'),
+      btn('管理集合', () => editor.collections(space, manage), 'settings-row', 'folder'),
+      btn('管理模块', () => editor.modules(space, manage), 'settings-row', 'layers'),
+      space.revision > 1 ? btn('恢复布局', () => editor.restore(space, manage), 'settings-row', 'task') : null
     ));
 
     let projectChatBar = null;

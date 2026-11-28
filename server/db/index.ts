@@ -7,6 +7,7 @@ import { initSearch } from '../home/search.ts'
 import { initSessions } from './sessions.ts'
 import { initChatBudget } from './chat-budget.ts'
 import { initBotSchema } from '../tasks/bots.ts'
+import { initBotUsage } from './bot-usage.ts'
 import type { Principal } from '../home/common.ts'
 
 export const id = () => randomUUID()
@@ -96,7 +97,7 @@ export function openDatabase(dir: string) {
         body TEXT NOT NULL,factKey TEXT,recordType TEXT NOT NULL,important INTEGER NOT NULL,status TEXT NOT NULL,createdAt TEXT NOT NULL);
     `),db=>{initSessions(db);initBotSchema(db);initChatBudget(db)},db=>db.exec(`
       ALTER TABLE threads ADD COLUMN nativeReleased INTEGER NOT NULL DEFAULT 0;
-    `),scrubCachedGrantTokens])
+    `),scrubCachedGrantTokens,initBotUsage])
     db.exec('UPDATE instances SET online=0')
     db.function('maoqiu_fact_key',{deterministic:true},value=>typeof value==='string'?normalizeFactKey(value):null)
     return db

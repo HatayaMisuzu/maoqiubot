@@ -1,13 +1,35 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import WebSocket from 'ws'
 import desktopSettings from '../desktop/connector-settings.cjs'
 import { startServer } from '../server/index.ts'
+
+test('desktop Agent settings retain a DSH profile and patch when copying a work Bot', async t => {
+  const dir=realpathSync(mkdtempSync(join(tmpdir(),'maoqiu-agent-settings-')))
+  const home=join(dir,'dsh'),profile=join(home,'profiles','acp')
+  mkdirSync(profile,{recursive:true})
+  writeFileSync(join(profile,'cordis.patch.yml'),'[]\n')
+  const settings={file:join(dir,'connector.json'),workspace:dir,editable:true}
+  const source={id:'source',name:'DSH source',adapterKey:'dsh',command:'dsh',profileId:'personal',workspaceRef:dir,
+    args:['--profile=acp','--patch','user-overlay.yml'],env:{DSH_HOME:'./dsh'}}
+  writeFileSync(settings.file,JSON.stringify({stateDir:join(dir,'node'),instances:[source]}))
+  const app=startServer({port:0,dataDir:join(dir,'server'),chat:false})
+  t.after(async()=>{await app.close();rmSync(dir,{recursive:true,force:true,maxRetries:4,retryDelay:100})})
+  await once(app.server,'listening')
+  const [first]=desktopSettings.settingsView(settings).instances
+  assert.equal(first.configurationHome,home)
+  assert.equal(first.nativeProfile,'acp')
+  assert.equal(first.nativeProfileInitialized,true)
+  assert.equal(first.hasDshOverrides,true)
+  const {instances}=desktopSettings.saveInstance(settings,app.db,{...source,id:'copy',sourceId:source.id,configurationHome:first.configuredHome})
+  assert.deepEqual(instances.map(i=>i.configurationHome),[home,home])
+  assert.deepEqual(JSON.parse(readFileSync(settings.file,'utf8')).instances[1].args,source.args)
+})
 
 test('Git worktree starts at HEAD, preserves a dirty workspace, and inherits Bot scope on registration', async t => {
   const dir=mkdtempSync(join(tmpdir(),'maoqiu-worktree-'))

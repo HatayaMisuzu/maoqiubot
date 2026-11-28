@@ -31,6 +31,55 @@ function privateCopy(source:string,dest:string){
   copyFileSync(source,dest)
   chmodSync(dest,0o600)
 }
+const safeEnvKeys=['CODEX_HOME','DSH_HOME','HERMES_HOME','HERMES_DATA_DIR_SUFFIX'] as const
+function sanitizeConnectorArgs(adapterKey:unknown,args:unknown){
+  if(adapterKey==='codex')return ['app-server']
+  if(adapterKey==='hermes')return ['acp']
+  if(adapterKey==='dsh'){
+    if(Array.isArray(args)&&args.length&&args.every(a=>typeof a==='string'&&a.length>0&&a.length<=260&&!/[\r\n\0]/.test(a)))
+      return [...args]
+    return ['--profile','acp']
+  }
+  return []
+}
+function sanitizeConnectorEnv(raw:unknown){
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return undefined
+  const out:Record<string,string>={}
+  for(const key of safeEnvKeys){
+    const val=(raw as Record<string,unknown>)[key]
+    if(typeof val==='string'&&val.length>0&&val.length<=1000&&!/[\r\n\0]/.test(val))out[key]=val
+  }
+  return Object.keys(out).length?out:undefined
+}
+function sanitizeWorktree(raw:unknown){
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return undefined
+  const w=raw as Record<string,unknown>
+  if(typeof w.branch==='string'&&typeof w.baseCommit==='string'&&typeof w.sourceId==='string'){
+    return {branch:w.branch,baseCommit:w.baseCommit,sourceId:w.sourceId}
+  }
+  return undefined
+}
+export function sanitizeConnectorConfig(parsed:any){
+  if(!Array.isArray(parsed?.instances)||typeof parsed?.stateDir!=='string')throw Error('连接器实例配置无效')
+  const address=typeof parsed.url==='string'?new URL(parsed.url):null
+  if(address){address.username='';address.password='';address.search='';address.hash=''}
+  return {
+    stateDir:parsed.stateDir,
+    ...(address?{url:address.href}:{}),
+    ...(parsed.nodeId!==undefined?{nodeId:parsed.nodeId}:{}),
+    instances:parsed.instances.map((i:any)=>{
+      const env=sanitizeConnectorEnv(i.env)
+      const worktree=sanitizeWorktree(i.worktree)
+      return {
+        id:i.id,name:i.name,adapterKey:i.adapterKey,workspaceRef:i.workspaceRef,profileId:i.profileId,
+        command:i.command,args:sanitizeConnectorArgs(i.adapterKey,i.args),
+        ...(env?{env}:{}),
+        ...(i.adapterKey==='codex'&&(i.codexProviderMode==='native'||i.codexProviderMode==='official')?{codexProviderMode:i.codexProviderMode}:{}),
+        ...(worktree?{worktree}:{})
+      }
+    })
+  }
+}
 export function transfer(source:string,destination:string,restore=false,opts:Options={}){
   const src=realpathSync(source),requested=resolve(destination)
   if(existsSync(requested))throw Error('目标目录必须尚未存在')
@@ -153,14 +202,16 @@ export function transfer(source:string,destination:string,restore=false,opts:Opt
       const config=restore?join(connectorSource,'config.json'):opts.connectorConfig
       if(config&&(!restore||existsSync(config))){
         const parsed=JSON.parse(readFileSync(config,'utf8').replace(/^\uFEFF/,''))
-        if(!Array.isArray(parsed.instances)||typeof parsed.stateDir!=='string')throw Error('连接器实例配置无效')
-        const address=typeof parsed.url==='string'?new URL(parsed.url):null
-        if(address){address.username='';address.password='';address.search='';address.hash=''}
-        const safe={stateDir:parsed.stateDir,url:address?.href,nodeId:parsed.nodeId,instances:parsed.instances.map((i:any)=>({
-          id:i.id,name:i.name,adapterKey:i.adapterKey,workspaceRef:i.workspaceRef,profileId:i.profileId,
-          command:i.command,args:i.adapterKey==='dsh'?['--profile','acp']:i.adapterKey==='codex'?['app-server']:i.adapterKey==='hermes'?['acp']:[]}))}
+        const safe=sanitizeConnectorConfig(parsed)
         writeFileSync(restore?join(stage,'connector-config.backed-up.json'):join(connectorTarget,'config.json'),JSON.stringify(safe,null,2),{mode:0o600})
       }
+    }
+    const desktopConfig=join(src,'desktop-connector.json')
+    if(existsSync(desktopConfig)){
+      const parsed=JSON.parse(readFileSync(desktopConfig,'utf8').replace(/^\uFEFF/,''))
+      const safe=sanitizeConnectorConfig(parsed)
+      if(restore&&manifest.connector&&basename(safe.stateDir)==='node-local')safe.stateDir=join(dest,'node-local')
+      writeFileSync(join(stage,'desktop-connector.json'),JSON.stringify(safe,null,2)+'\n',{mode:0o600})
     }
     if(fromManifest?.connector&&!manifest.connector)throw Error('备份缺少连接器数据库')
     writeFileSync(join(stage,'backup.json'),JSON.stringify({...manifest,mode:restore?fromManifest?.mode??'legacy':manifest.mode},null,2),{mode:0o600})

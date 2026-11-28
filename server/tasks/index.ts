@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite'
 import { budgetOverride } from '../chat/budget.ts'
 import type { NodeEvent, Actor, Audience, Communication } from '../../contracts/node.ts'
 import { id, now, fail, required, changed, must, one, unpack, owner } from '../db/index.ts'
+import { recordBotUsage } from '../db/bot-usage.ts'
 import { addTaskRecord, homeApi, prepareProjectContext } from '../home/index.ts'
 import {assertBotAllowed,assertBotProjectAllowed} from './bots.ts'
 import {markSharesSent,pendingShareRefs,readShareMaterial} from '../sessions.ts'
@@ -706,10 +707,10 @@ function advance(db:DatabaseSync,run:any,thread:any) {
 export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   required(e.key,'event key')
   if(!Number.isSafeInteger(e.seq)||e.seq<0) fail('无效事件序号')
-  const run=must(db,'SELECT r.*,c.payload AS commandPayload,c.kind AS commandKind FROM runs r JOIN instances i ON i.id=r.instanceId JOIN commands c ON c.runId=r.id WHERE r.id=? AND i.id=? AND i.nodeId=? AND c.id=?',e.runId,e.instanceId,nodeId,e.commandId)
+  const run=must(db,'SELECT r.*,i.adapterKey,c.payload AS commandPayload,c.kind AS commandKind FROM runs r JOIN instances i ON i.id=r.instanceId JOIN commands c ON c.runId=r.id WHERE r.id=? AND i.id=? AND i.nodeId=? AND c.id=?',e.runId,e.instanceId,nodeId,e.commandId)
   const ins=db.prepare('INSERT OR IGNORE INTO node_events VALUES(?,?,?,?)').run(nodeId,run.id,e.seq,e.key)
   if(!ins.changes) return
-  const kind=e.kind,data=e.data??{},thread=getThread(db,run.threadId)
+  const kind=e.kind,{usage,...data}=e.data??{},thread=getThread(db,run.threadId)
   if(!['accepted','message','activity','artifact','input_required','model_state','completed','failed','blocked','cancelled'].includes(kind)) fail('未知节点事件')
   if(terminal.has(run.status)){
     if(terminal.has(kind)&&one(db,"SELECT 1 FROM messages WHERE threadId=? AND kind='recovery' AND json_extract(data,'$.runId')=?",thread.id,run.id)){
@@ -767,6 +768,10 @@ export function applyEvent(db:DatabaseSync,nodeId:string,e:NodeEvent){
   if(kind==='input_required' && status!=='cancelling') status='waiting_input'
   if(terminal.has(kind)) status=kind
   db.prepare('UPDATE runs SET status=?,pendingRequest=? WHERE id=?').run(status,kind==='input_required'?JSON.stringify(data):terminal.has(kind)?null:run.pendingRequest,run.id)
+  if(kind==='completed'&&run.commandKind==='run'&&usage){
+    if(nodeId==='@model-api'&&run.adapterKey==='model-api')recordBotUsage(db,run.id,now(),'api_response',usage)
+    if(nodeId==='local'&&run.adapterKey==='codex')recordBotUsage(db,run.id,now(),'codex_turn',usage)
+  }
   const addressed=JSON.parse(run.commandPayload).communication
   const nativeMessage=kind!=='accepted'?message(db,thread.id,'assistant',kind,String(data.text??''),{...data,runId:run.id},[],run.taskId,{
     sender:{kind:'work_bot',id:run.instanceId},recipient:addressed?.sender?.kind==='main_bot'?botAudience('main'):userAudience,

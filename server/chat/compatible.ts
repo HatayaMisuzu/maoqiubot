@@ -60,7 +60,12 @@ async function request(config:Settings,path:string,body:object|null,signal?:Abor
     if(streaming)await receive(response,output.frame);else output.frame(await receive(response))
     return {...output.answer(),streaming}
   }catch(e){
-    if(signal?.aborted)fail('主聊已取消',409)
+    if(signal?.aborted){
+      const reason=signal.reason
+      const message=reason instanceof Error&&reason.name!=='AbortError'&&reason.message ? reason.message :
+        typeof reason==='string'&&reason ? reason : '主聊已取消'
+      fail(message,409)
+    }
     if(clock.aborted)fail('模型请求超时',504)
     if((e as {status?:number}).status)throw e
     fail('无法连接配置的模型服务',502)

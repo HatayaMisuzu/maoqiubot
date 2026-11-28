@@ -16,6 +16,8 @@ import { isLocal } from './api/local.ts'
 import { pluginHost } from './plugins/host.ts'
 import { coordinationWorker } from './chat/coordination.ts'
 import { apiBotWorker } from './tasks/api-bots.ts'
+import { agentMonitor } from './tasks/agent-monitor.ts'
+import type { DshMonitorDatabase } from './tasks/dsh-monitor.ts'
 import { dueReminders } from './chat/daily.ts'
 import { expireApprovals } from './chat/approval.ts'
 import type { DesktopBridge } from './chat/tools.ts'
@@ -131,6 +133,12 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
         if(!principal.owner||!isLocal(req))fail('原生额度限本机所有者读取',403)
         return json(res,200,await nodes.readUsage(nativeUsage[1]))
       }
+      if(method==='GET'&&path==='/agent-monitor'){
+        if(!principal.owner||!isLocal(req))fail('工作 Bot 监控限本机所有者读取',403)
+        const daysParam=url.searchParams.get('days')
+        const days=daysParam==null?undefined:Number(daysParam)
+        return json(res,200,agentMonitor(db,dataDir,{days:Number.isFinite(days)?days:undefined},[]))
+      }
       if(method==='GET'&&nativeHistory){
         if(!principal.owner||!isLocal(req))fail('原生消息限本机所有者读取',403)
         const thread=one(db,"SELECT * FROM threads WHERE id=? AND state IN ('active','archived')",nativeHistory[1])
@@ -217,7 +225,14 @@ export function startServer(opts:{dataDir?:string,port?:number,host?:string,chat
   server.on('close',()=>{clearInterval(interval);clearInterval(heartbeat)})
   const port=opts.port??Number(process.env.PORT??4317),host=opts.host??process.env.HOST??'127.0.0.1'
   server.listen(port,host)
-  return {server,db,auth,ticket,dataDir,async close(){
+  return {server,db,auth,ticket,dataDir,
+    agentMonitor: (options?:{days?:number},dshDatabases?:DshMonitorDatabase[])=>agentMonitor(db,dataDir,options,dshDatabases),
+    agentQuota: (instanceId:string)=>{
+      if(typeof instanceId!=='string'||!one(db,"SELECT 1 FROM instances WHERE id=? AND nodeId='local' AND adapterKey='codex'",instanceId))
+        fail('仅支持已登记的本机 Codex 实例',404)
+      return nodes.readUsage(instanceId)
+    },
+    async close(){
     clearInterval(interval);clearInterval(heartbeat);nodes.close();apiBots.close();chat.abort();coordination.abort()
     for(const r of streams.keys())r.end()
     await new Promise<void>((done)=>server.close(()=>done()))

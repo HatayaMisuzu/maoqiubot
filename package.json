@@ -9,6 +9,7 @@
   },
   "scripts": {
     "desktop": "electron .",
+    "build:agent-manager": "node scripts/build-agent-manager.mjs",
     "package:desktop": "node scripts/package-desktop.mjs",
     "local": "node scripts/local.ts",
     "check": "tsc --noEmit",

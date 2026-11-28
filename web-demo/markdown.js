@@ -3,8 +3,12 @@ import { copyText, el, icon } from './lib.js';
 
 const parser = new MarkdownIt({ html: false, breaks: true });
 parser.validateLink = raw => {
-  const target = URL.parse(raw);
-  return Boolean(target && ['http:', 'https:'].includes(target.protocol) && !target.username && !target.password);
+  try {
+    const target = new URL(raw);
+    return ['http:', 'https:'].includes(target.protocol) && !target.username && !target.password;
+  } catch {
+    return false;
+  }
 };
 parser.renderer.rules.link_open = (tokens, index, options, env, renderer) => {
   tokens[index].attrSet('target', '_blank');
@@ -56,6 +60,11 @@ export function renderMarkdown(text) {
   // The parser escapes source HTML and only emits validated HTTP(S) anchors. Images are rendered as text.
   root.innerHTML = parser.render(String(text));
   root.querySelectorAll('pre > code').forEach(decorateCode);
+  root.querySelectorAll('table').forEach(table => {
+    const wrap = el('div', 'table-scroll scroll-sleek');
+    table.replaceWith(wrap);
+    wrap.append(table);
+  });
   root.querySelectorAll('li').forEach(decorateTask);
   return root;
 }

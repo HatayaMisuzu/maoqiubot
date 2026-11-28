@@ -17,7 +17,7 @@
   --fg: #1b1b1a;
   --fg-strong: #0d0d0c;
   --muted: #666661;
-  --fg-faint: #878781;
+  --fg-faint: #666661;
   --primary: #171717;
   --primary-hover: #2d2d2c;
   --primary-fg: #fafafa;
@@ -88,7 +88,7 @@
   --fg: #e5e5e2;
   --fg-strong: #fafaf8;
   --muted: #9b9b95;
-  --fg-faint: #767670;
+  --fg-faint: #92928c;
   --primary: #f2f2ef;
   --primary-hover: #dcdcd8;
   --primary-fg: #111111;
@@ -305,6 +305,7 @@ dialog {
 }
 dialog.dialog-wide { width: min(680px, calc(100vw - 24px)); }
 dialog.dialog-compact { width: min(420px, calc(100vw - 24px)); }
+#confirm-dialog { z-index: 70; box-shadow: 0 24px 64px color-mix(in srgb, #000 32%, transparent); }
 dialog[open] { display: flex; flex-direction: column; animation: dialog-in 0.12s ease-out; }
 dialog::backdrop { background: var(--backdrop); backdrop-filter: blur(2px); }
 
@@ -416,8 +417,10 @@ label.field > span.field-label { font-size: var(--text-xs); font-weight: 500; co
 .form-err:empty, .model-actions:empty, .model-hint:empty { display: none; }
 
 .settings-list { display: grid; gap: 2px; }
+.agent-configuration-paths { margin: 4px 0 12px; padding-inline-start: 1.4em; overflow-wrap: anywhere; }
 .settings-row {
   width: 100%;
+  min-width: 0;
   justify-content: flex-start;
   min-height: 40px;
   padding: 8px 10px;
@@ -426,9 +429,19 @@ label.field > span.field-label { font-size: var(--text-xs); font-weight: 500; co
   color: var(--fg);
   font-weight: 500;
 }
-.settings-row svg { color: var(--muted); }
+.settings-row svg { flex: none; color: var(--muted); }
 .settings-row:hover svg { color: var(--fg-strong); }
-.settings-row .settings-desc { margin-left: auto; font-size: var(--text-xs); color: var(--muted); font-weight: 400; }
+.settings-row .settings-desc {
+  margin-left: auto;
+  min-width: 0;
+  max-width: 48%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  font-weight: 400;
+}
 
 .record {
   padding: 11px 12px;

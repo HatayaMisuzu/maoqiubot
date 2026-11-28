@@ -56,7 +56,12 @@ export function route(db:DatabaseSync,ctx:any){
   }
   if(['/chat/models','/chat/policy'].includes(path)&&['GET','POST'].includes(method)){
     if(!localRequest)fail('主聊配置限本机所有者操作',403)
-    if(path==='/chat/models')return method==='GET'?modelSettings(dataDir,plugins?.providers()):updateModelSettings(dataDir,b,plugins?.providers())
+    if(path==='/chat/models'){
+      if(method==='GET')return modelSettings(dataDir,plugins?.providers())
+      const updated=updateModelSettings(dataDir,b,plugins?.providers())
+      changed(db,'instance',{})
+      return updated
+    }
     return method==='GET'?chatPolicy(dataDir):saveChatPolicy(dataDir,b)
   }
   if(path==='/chat/approve'&&method==='POST'){
@@ -111,7 +116,7 @@ export function route(db:DatabaseSync,ctx:any){
     return settings
   }
   if(path==='/instances'&&method==='GET')return [{id:'main',name:'小毛球',online:true,availableActions:['message','delegate']},
-    ...listBots(db).map(bot=>({...bot,...bot.settings}))]
+    ...listBots(db,dataDir).map(bot=>({...bot,...bot.settings}))]
   if(path==='/threads/main'&&method==='GET')return mainThread(db)
   if(path==='/threads'&&method==='GET'){
     if(query.get('state')==='purged'&&(!principal.owner||!localRequest))fail('已清理原生绑定目录限本机所有者',403)

@@ -4,9 +4,21 @@ import { EventEmitter } from 'node:events'
 import type {Instance} from './types.ts'
 import {codexEnvironment,codexServiceArgs} from '../contracts/codex-local.ts'
 
+function officialCodex(instance:Instance){
+  return instance.adapterKey==='codex' && instance.codexProviderMode!=='native'
+}
+
+export function agentEnvironment(instance:Instance){
+  const source={...process.env,...instance.env}
+  const env=officialCodex(instance)?codexEnvironment(source):source
+  for(const key of Object.keys(env))if(/^(?:NODE_OPTIONS$|NODE_PATH$|ELECTRON_RUN_AS_NODE$|MAOQIU_EXPECTED_AGENT_SCOPES$|(?:NODE|OWNER)_TOKEN$|MAOQIU_(?:MODEL|PLUGIN)_KEY_)/i.test(key))delete env[key]
+  return env
+}
+
 // Both protocols use newline-delimited JSON-RPC over private stdio.
 export class Rpc extends EventEmitter {
   process: ChildProcessWithoutNullStreams
+  private batch: boolean
   next = 0
   closed = false
   pending = new Map<number,{ok:(value:any)=>void, fail:(err:Error)=>void}>()
@@ -15,12 +27,13 @@ export class Rpc extends EventEmitter {
     const codex=instance.adapterKey==='codex'
     const hermes=instance.adapterKey==='hermes'
     if(codex && instance.args.join(' ')!=='app-server') throw Error('Codex 实例只接受官方 app-server stdio 入口')
+    if(codex && instance.codexProviderMode!==undefined && !['official','native'].includes(instance.codexProviderMode))
+      throw Error('Codex 供应商模式无效')
     if(hermes && (instance.args.length!==1||instance.args[0]!=='acp'))throw Error('Hermes 实例只接受官方 acp stdio 入口')
-    const env = codex?codexEnvironment({...process.env,...instance.env}):{...process.env,...instance.env}
-    for(const key of Object.keys(env))if(/^(NODE_OPTIONS|NODE_PATH|ELECTRON_RUN_AS_NODE)$/i.test(key))delete env[key]
-    for(const key of Object.keys(env))if(/^(?:(?:NODE|OWNER)_TOKEN$|MAOQIU_MODEL_KEY_)/i.test(key))delete env[key]
-    const args=codex?['app-server','--listen','stdio://',...codexServiceArgs]:instance.args
+    const env=agentEnvironment(instance)
+    const args=codex?['app-server','--listen','stdio://',...(officialCodex(instance)?codexServiceArgs:[])]:instance.args
     const batch=process.platform==='win32'&&(instance.adapterKey==='dsh'||hermes)&&/\.cmd$/i.test(instance.command)
+    this.batch=batch
     // Windows requires cmd.exe for native batch launchers.
     if(batch && [instance.command,...args].some(arg=>/[%!&|^"<>\r\n]/.test(arg)))throw Error('ACP 批处理启动参数包含不支持的字符')
     const executable=batch?(process.env.ComSpec||'cmd.exe'):instance.command
@@ -84,6 +97,9 @@ export class Rpc extends EventEmitter {
   }
   close() {
     this.process.stdin.end()
+    if(this.batch && process.platform==='win32' && this.process.pid){
+      try{spawn('taskkill',['/PID',String(this.process.pid),'/T','/F'],{windowsHide:true,stdio:'ignore'}).unref()}catch{}
+    }
     this.process.kill()
     this.stop(new Error('原生连接已关闭'))
   }

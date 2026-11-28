@@ -8,6 +8,7 @@ import { createInspector } from './inspector.js';
 import { createCommandPalette } from './command-palette.js';
 import { chat } from './chat.js';
 import { home } from './home.js';
+import { agentManagement } from './agent-management.js';
 import { desktopSettings, hasDesktopSettings } from './desktop-settings.js';
 import { mainModels } from './main-settings.js';
 
@@ -21,7 +22,7 @@ let subscription;
 let refreshTimer;
 let retryTimer;
 let connection = '正在连接';
-let inspectorOpen = localFlag('mao-inspector-open', window.innerWidth > 1180) === true;
+let inspectorOpen = window.innerWidth > 1180 && localFlag('mao-inspector-open', true) === true;
 
 const threadOffsets = new Map();
 const threadHasMore = new Map();
@@ -31,6 +32,7 @@ function applySavedSideWidth() {
   const saved = Number(localFlag('mao-side-width', 276));
   if (Number.isFinite(saved) && saved >= 220 && saved <= 420) {
     document.documentElement.style.setProperty('--side-width', saved + 'px');
+    $('side-resizer')?.setAttribute('aria-valuenow', String(saved));
   }
 }
 applySavedSideWidth();
@@ -57,7 +59,7 @@ const actions = {
   newThread: id => chats.newThread(id),
   delegateTask: () => chats.delegate(),
   openChatSettings: () => chats.chatSettings(findThreadAny(state.thread)),
-  openDesktopSettings: () => desktopSettings(onSettingsChanged),
+  openDesktopSettings,
   openMainModels: () => mainModels(refresh, load),
   openThreadMenu: thread => chats.threadMenu(thread),
   openTask: id => chats.openTask(id),
@@ -96,29 +98,50 @@ $('inspector-btn').append(icon('panelRight'));
 updateThemeButton();
 
 $('menu').onclick = () => toggleMobileSidebar(true);
-$('shade').onclick = () => toggleMobileSidebar(false);
+$('shade').onclick = () => {
+  toggleMobileSidebar(false);
+  if (mid.matches && inspectorOpen) toggleInspector(false);
+};
 $('cmd-btn').onclick = () => paletteUi.open();
 $('theme-btn').onclick = () => { toggleTheme(); updateThemeButton(); };
 $('inspector-btn').onclick = () => toggleInspector();
 
 const narrow = matchMedia('(max-width: 820px)');
+const mid = matchMedia('(max-width: 1180px)');
+function syncOverlays() {
+  const sideOpen = document.body.classList.contains('open');
+  const inspOpen = mid.matches && state.view === 'chat' && inspectorOpen;
+  const anyOpen = sideOpen || inspOpen;
+  $('side').inert = narrow.matches && !sideOpen;
+  document.querySelector('main').inert = anyOpen;
+  $('shade').hidden = !anyOpen;
+  $('shade').setAttribute('aria-label', inspOpen && !sideOpen ? '收起上下文面板' : '收起侧栏');
+}
 function toggleMobileSidebar(open) {
   const wasOpen = document.body.classList.contains('open');
   document.body.classList.toggle('open', open);
-  $('side').inert = narrow.matches && !open;
-  document.querySelector('main').inert = open;
-  $('shade').hidden = !open;
   $('menu').setAttribute('aria-expanded', String(open));
+  syncOverlays();
   if (open) $('side').querySelector('button:not(:disabled)')?.focus();
   else if (wasOpen && narrow.matches) $('menu').focus();
 }
 narrow.addEventListener('change', () => toggleMobileSidebar(false));
+mid.addEventListener('change', () => {
+  if (mid.matches && inspectorOpen) {
+    inspectorOpen = false;
+    inspectorUi.render();
+  }
+  syncOverlays();
+});
 toggleMobileSidebar(false);
 
 function toggleInspector(force) {
+  const wasOpen = inspectorOpen;
   inspectorOpen = typeof force === 'boolean' ? force : !inspectorOpen;
   setLocalFlag('mao-inspector-open', inspectorOpen);
   inspectorUi.render();
+  syncOverlays();
+  if (wasOpen && !inspectorOpen && mid.matches) $('inspector-btn')?.focus();
 }
 
 // Sidebar width drag resizer
@@ -137,6 +160,7 @@ function toggleInspector(force) {
     if (!dragging) return;
     const width = Math.max(220, Math.min(420, Math.round(e.clientX)));
     document.documentElement.style.setProperty('--side-width', width + 'px');
+    resizer.setAttribute('aria-valuenow', String(width));
     setLocalFlag('mao-side-width', width);
   });
   const endDrag = () => {
@@ -152,6 +176,7 @@ function toggleInspector(force) {
     const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--side-width'), 10) || 276;
     const next = Math.max(220, Math.min(420, current + (e.key === 'ArrowRight' ? 12 : -12)));
     document.documentElement.style.setProperty('--side-width', next + 'px');
+    resizer.setAttribute('aria-valuenow', String(next));
     setLocalFlag('mao-side-width', next);
   });
 })();
@@ -160,19 +185,25 @@ function toggleInspector(force) {
 window.addEventListener('keydown', e => {
   const mod = isMac() ? e.metaKey : e.ctrlKey;
   if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+    if ($('dialog')?.open || $('confirm-dialog')?.open) return;
     e.preventDefault();
     paletteUi.open();
     return;
   }
   if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'i') {
+    if ($('dialog')?.open || $('confirm-dialog')?.open || $('palette')?.open) return;
     if (state.view === 'chat') {
       e.preventDefault();
       toggleInspector();
     }
     return;
   }
-  if (e.key === 'Escape' && !$('dialog').open && !$('palette').open && document.body.classList.contains('open')) {
-    toggleMobileSidebar(false);
+  if (e.key === 'Escape' && !$('dialog').open && !$('confirm-dialog')?.open && !$('palette').open) {
+    if (document.body.classList.contains('open')) {
+      toggleMobileSidebar(false);
+    } else if (mid.matches && state.view === 'chat' && inspectorOpen) {
+      toggleInspector(false);
+    }
   }
 });
 
@@ -181,15 +212,20 @@ function renderSessionFooter() {
   $('session').replaceChildren(
     el('div', 'session-status', el('i', dotCls), el('span', '', connection)),
     el('div', 'session-actions',
-      ...(hasDesktopSettings() ? [btn('Agent 设置', () => desktopSettings(onSettingsChanged), 'ghost', 'sliders')] : []),
+      btn(hasDesktopSettings() ? 'Agent 设置' : 'Bot 监控', openDesktopSettings, 'ghost', 'sliders'),
       btn('访问凭据', login, 'ghost', 'key')
     )
   );
 }
 
+function openDesktopSettings() {
+  return agentManagement(onSettingsChanged, instance => chats.botSettings(instance, openDesktopSettings));
+}
+
 function renderChrome() {
   sidebarUi.render();
   inspectorUi.render();
+  syncOverlays();
 }
 
 async function onSettingsChanged() {
@@ -199,19 +235,35 @@ async function onSettingsChanged() {
 }
 
 function login() {
-  form('连接工作台', [
-    { key: 'token', label: '访问令牌', type: 'password', required: true }
+  const hasSavedToken = Boolean(sessionStorage.getItem('mao-token'));
+  const ui = form('连接工作台', [
+    { key: 'token', label: '访问令牌（ownerToken）', type: 'password', required: true }
   ], '连接', async ({ token }) => {
     const previous = sessionStorage.getItem('mao-token');
     sessionStorage.setItem('mao-token', token);
-    try { await api('/projects'); }
+    try { await api('/events/latest'); }
     catch (e) {
       if (previous) sessionStorage.setItem('mao-token', previous);
       else sessionStorage.removeItem('mao-token');
+      if (e?.status === 403) {
+        throw Error('该令牌为受限项目授权，无法登录完整工作台。请填写数据目录 access.local.json 中的 ownerToken。');
+      }
       throw e;
     }
     await start();
-  }, { compact: true });
+  }, {
+    compact: true,
+    description: hasSavedToken
+      ? '当前使用手动输入的访问令牌。如需恢复本机票据登录，可点击下方「清除本地令牌」。'
+      : '若已通过本机登录链接自动接入，通常无需再次输入；更换会话凭据时请填写 access.local.json 中的 ownerToken。'
+  });
+  if (hasSavedToken) {
+    ui.save.before(btn('清除本地令牌', async () => {
+      sessionStorage.removeItem('mao-token');
+      ui.dialog.close();
+      await start();
+    }, 'ghost'));
+  }
 }
 
 function unauthorized() {
@@ -227,6 +279,7 @@ function unauthorized() {
   $('inspector').hidden = true;
   $('stage').classList.add('inspector-closed');
   $('inspector-btn').hidden = true;
+  syncOverlays();
   $('status-banner').hidden = true;
   $('crumb').hidden = true;
   $('heading').textContent = '小毛球工作台';
@@ -236,7 +289,7 @@ function unauthorized() {
   $('content').replaceChildren(el('div', 'connection-view',
     banner('连接你的', '小毛球工作台'),
     el('div', 'login-panel',
-      el('p', 'muted', '使用访问令牌打开小毛球主控、工作 Bot 与毛球之家。'),
+      el('p', 'muted', '使用访问令牌打开小毛球主控、工作 Bot 与毛球之家。命令行启动请访问终端输出的带 ticket 链接，或填入数据目录 access.local.json 中的 ownerToken。'),
       btn('使用访问令牌', login, 'primary', 'key')
     )
   ));
@@ -876,7 +929,7 @@ async function flushRefresh() {
     const redraw = full || instances || projects || main || updates.some(event =>
       (state.view === 'home' && (event.kind === 'home' || event.taskId)) ||
       (state.view === 'chat' && event.threadId === state.thread) ||
-      (event.taskId && state.snapshot?.linkedTasks?.[event.taskId]));
+      (event.taskId && (state.snapshot?.linkedTasks?.[event.taskId] || state.snapshot?.thread?.taskId === event.taskId)));
     if (redraw) await refresh();
   } catch (e) {
     if (e.status === 401) unauthorized();
@@ -944,9 +997,12 @@ async function start() {
     if (e.status === 401) return unauthorized();
     connection = '连接失败';
     renderSessionFooter();
+    const clearBtn = e.status === 403 && sessionStorage.getItem('mao-token')
+      ? btn('清除本地令牌并重试', () => { sessionStorage.removeItem('mao-token'); return start(); }, 'primary')
+      : null;
     $('content').replaceChildren(el('div', 'page',
       el('p', 'form-err', e.message),
-      btn('重新连接', start, 'secondary')
+      el('div', 'actions', clearBtn, btn('重新连接', start, 'secondary'))
     ));
   }
 }

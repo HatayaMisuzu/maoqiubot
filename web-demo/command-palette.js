@@ -1,4 +1,4 @@
-import { $, at, el, getMainBot, getWorkBots, icon, isMac, state, toggleTheme } from './lib.js';
+import { $, at, el, getMainBot, getWorkBots, icon, iconBtn, isMac, notice, state, toggleTheme } from './lib.js';
 import { hasDesktopSettings } from './desktop-settings.js';
 
 export function createCommandPalette(actions) {
@@ -128,15 +128,13 @@ export function createCommandPalette(actions) {
         run: () => actions.openChatSettings()
       }
     ];
-    if (hasDesktopSettings()) {
-      actionItems.push({
-        label: 'Agent 设置（原生连接器 / Worktree）',
-        meta: '桌面配置',
-        symbol: 'terminal',
-        keywords: 'agent codex dsh hermes worktree 连接器',
-        run: () => actions.openDesktopSettings()
-      });
-    }
+    actionItems.push({
+      label: hasDesktopSettings() ? 'Agent 设置' : '工作 Bot 状态与用量',
+      meta: hasDesktopSettings() ? '外接 Agent / 工作 Bot / 工作区' : '监控与用量',
+      symbol: 'terminal',
+      keywords: 'agent codex dsh hermes worktree 连接器 供应商 MCP Skills 用量 监控',
+      run: () => actions.openDesktopSettings()
+    });
     groups.push({ title: '工作台命令', items: actionItems });
 
     if (!q) return groups;
@@ -148,6 +146,11 @@ export function createCommandPalette(actions) {
         )
       }))
       .filter(g => g.items.length > 0);
+  }
+
+  function runAction(item) {
+    dialog.close();
+    Promise.resolve().then(() => item.run()).catch(e => notice(e?.message || '操作失败', 'error'));
   }
 
   function renderResults(input, listBox) {
@@ -166,14 +169,14 @@ export function createCommandPalette(actions) {
           item.meta ? el('span', 'palette-meta', item.meta) : null
         );
         row.type = 'button';
+        row.id = 'palette-opt-' + index;
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', 'false');
         row.dataset.index = String(index);
-        row.onclick = () => {
-          dialog.close();
-          item.run();
-        };
+        row.onclick = () => runAction(item);
         row.onmouseenter = () => {
           selectedIndex = index;
-          syncSelection(listBox);
+          syncSelection(listBox, input);
         };
         listBox.append(row);
       }
@@ -182,19 +185,29 @@ export function createCommandPalette(actions) {
     if (!visibleEntries.length) {
       listBox.append(el('p', 'empty', '没有匹配的会话、Bot 或命令。'));
       selectedIndex = 0;
+      input.removeAttribute('aria-activedescendant');
       return;
     }
     if (selectedIndex >= visibleEntries.length) selectedIndex = 0;
-    syncSelection(listBox);
+    syncSelection(listBox, input);
   }
 
-  function syncSelection(listBox) {
+  function syncSelection(listBox, input) {
     const buttons = listBox.querySelectorAll('.palette-item');
+    let activeId = '';
     buttons.forEach(b => {
       const active = Number(b.dataset.index) === selectedIndex;
       b.dataset.selected = String(active);
-      if (active) b.scrollIntoView({ block: 'nearest' });
+      b.setAttribute('aria-selected', String(active));
+      if (active) {
+        activeId = b.id;
+        b.scrollIntoView({ block: 'nearest' });
+      }
     });
+    if (input) {
+      if (activeId) input.setAttribute('aria-activedescendant', activeId);
+      else input.removeAttribute('aria-activedescendant');
+    }
   }
 
   function open() {
@@ -205,8 +218,16 @@ export function createCommandPalette(actions) {
     searchInput.type = 'text';
     searchInput.placeholder = '搜索主会话、侧聊、工作 Bot、项目或命令…';
     searchInput.setAttribute('aria-label', '搜索工作台');
+    searchInput.setAttribute('role', 'combobox');
+    searchInput.setAttribute('aria-autocomplete', 'list');
+    searchInput.setAttribute('aria-expanded', 'true');
+    searchInput.setAttribute('aria-controls', 'palette-listbox');
 
+    const closeBtn = iconBtn('关闭搜索', () => dialog.close(), 'close');
     const listBox = el('div', 'palette-list scroll-sleek');
+    listBox.id = 'palette-listbox';
+    listBox.setAttribute('role', 'listbox');
+    listBox.setAttribute('aria-label', '搜索结果');
     const foot = el('div', 'palette-foot',
       el('span', '', el('span', 'kbd', '↑↓'), ' 选择 · ', el('span', 'kbd', 'Enter'), ' 打开'),
       el('span', '', el('span', 'kbd', 'Esc'), ' 关闭')
@@ -222,29 +243,29 @@ export function createCommandPalette(actions) {
         e.preventDefault();
         if (visibleEntries.length) {
           selectedIndex = (selectedIndex + 1) % visibleEntries.length;
-          syncSelection(listBox);
+          syncSelection(listBox, searchInput);
         }
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         if (visibleEntries.length) {
           selectedIndex = (selectedIndex - 1 + visibleEntries.length) % visibleEntries.length;
-          syncSelection(listBox);
+          syncSelection(listBox, searchInput);
         }
       } else if (e.key === 'Enter') {
         e.preventDefault();
         const chosen = visibleEntries[selectedIndex];
-        if (chosen) {
-          dialog.close();
-          chosen.run();
-        }
+        if (chosen) runAction(chosen);
       } else if (e.key === 'Escape') {
         e.preventDefault();
         dialog.close();
       }
     };
 
+    dialog.onclick = e => {
+      if (e.target === dialog) dialog.close();
+    };
     dialog.replaceChildren(
-      el('div', 'palette-input-wrap', icon('search'), searchInput),
+      el('div', 'palette-input-wrap', icon('search'), searchInput, closeBtn),
       listBox,
       foot
     );

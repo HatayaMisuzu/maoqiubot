@@ -135,7 +135,7 @@ const tools=[
         OR EXISTS(SELECT 1 FROM project_workspaces w JOIN instances i ON i.id=w.instanceId
         WHERE w.projectId=p.id AND i.nodeId='local' AND i.workspaceRef=?) LIMIT 1`,ws.path,ws.path)
       const project=mapped??home(c,'POST','/projects',{name,binding:{localDirectory:ws.path,nodeId:'local'}},{},true)
-      const candidates=listBots(c.db).filter(bot=>bot.nodeId==='local'&&bot.workspaceRef===ws.path&&bot.settings.enabled&&bot.settings.allowDelegate&&
+      const candidates=listBots(c.db,c.dir).filter(bot=>bot.nodeId==='local'&&bot.workspaceRef===ws.path&&bot.settings.enabled&&bot.settings.allowDelegate&&
         (!bot.settings.allowedProjects||bot.settings.allowedProjects.includes(project.id))).map(bot=>bot.id)
       return {projectId:project.id,workspaceRef:ws.path,directoryCreated:ws.created,registeredInstances:candidates}
     }}),
@@ -143,7 +143,7 @@ const tools=[
     group:'task',confirm:true,allowed:c=>c.actor==='user'&&(!c.model||c.model.shareProject),execute:(c,a)=>{
       const projectId=required(a.projectId,'项目')
       if(c.thread.projectId&&c.thread.projectId!==projectId)fail('无法修改其他项目的映射',403)
-      const bot=listBots(c.db).find(b=>b.id===a.instanceId)
+      const bot=listBots(c.db,c.dir).find(b=>b.id===a.instanceId)
       if(!bot?.settings.enabled||!bot.settings.allowDelegate||bot.workspaceRef!==a.workspaceRef||
         bot.settings.allowedProjects&&!bot.settings.allowedProjects.includes(projectId))fail('实例不在此项目可映射范围',403)
       const existing=one(c.db,'SELECT 1 FROM project_workspaces WHERE projectId=? AND instanceId=?',projectId,bot.id)
@@ -155,12 +155,12 @@ const tools=[
       return c.db.prepare(`SELECT DISTINCT p.id,p.name FROM projects p LEFT JOIN project_workspaces w ON w.projectId=p.id
         LEFT JOIN instances i ON i.id=w.instanceId WHERE (? IS NULL OR p.id=?)
         AND (instr(lower(p.name),lower(?))>0 OR instr(lower(i.workspaceRef),lower(?))>0)
-        ORDER BY p.name,p.id LIMIT 60`).all(c.thread.projectId,c.thread.projectId,q,q).map(p=>({...p,bots:routingBots(c.db,String(p.id))}))
+        ORDER BY p.name,p.id LIMIT 60`).all(c.thread.projectId,c.thread.projectId,q,q).map(p=>({...p,bots:routingBots(c.db,String(p.id),c.dir)}))
     }}),
   define('bot_workspace_discover','查询已配置实例的真实工作目录、节点、profile 与映射的项目。不会创建目录或执行原生命令。',{query:'string'},[],{
     group:'task',allowed:c=>c.actor==='user'&&(!c.model||c.model.shareProject),execute:(c,a)=>{
       const q=String(a.query??'').trim().toLowerCase()
-      const bots=c.thread.projectId?routingBots(c.db,c.thread.projectId):listBots(c.db).filter(b=>b.settings.enabled&&b.settings.allowDelegate)
+      const bots=c.thread.projectId?routingBots(c.db,c.thread.projectId,c.dir):listBots(c.db,c.dir).filter(b=>b.settings.enabled&&b.settings.allowDelegate)
       return bots.filter(b=>b.workspaceRef&&[b.name,b.workspaceRef,b.id].some(x=>String(x).toLowerCase().includes(q)))
         .slice(0,60).map(b=>({instanceId:b.id,nodeId:b.nodeId,workspaceRef:b.workspaceRef,profileId:b.profileId,
           projects:c.db.prepare('SELECT p.id,p.name FROM projects p JOIN project_workspaces w ON w.projectId=p.id WHERE w.instanceId=? AND (? IS NULL OR p.id=?)')
@@ -211,7 +211,7 @@ const tools=[
       }}),
   define('bot_desktop_status','查看桌面管理的连接器及工作 Bot 配置',{},[],{
     group:'desktop',allowed:c=>!c.thread.projectId,execute:c=>desktop(c).status()}),
-  define('bot_desktop_save','在桌面保存经过校验的 Codex 或 DSH 实例配置',{settings:'object'},['settings'],{
+  define('bot_desktop_save','在桌面保存经过校验的 Codex、DSH 或 Hermes 实例配置（支持 configurationHome 与 codexProviderMode）',{settings:'object'},['settings'],{
     group:'desktop',allowed:c=>!c.thread.projectId,confirm:true,execute:(c,a)=>desktop(c).save(a.settings)}),
   define('bot_desktop_reconnect','重启本机连接器以载入设置。存在在途运行时由桌面服务拒绝。',{},[],{
     group:'desktop',allowed:c=>!c.thread.projectId,confirm:true,async:true,execute:c=>desktop(c).restart()}),
@@ -645,7 +645,7 @@ export function toolCall(c:Core,name:string,raw:string,pluginAuthorization?:{dig
     const projectId=required(args.projectId,'项目 ID')
     if(c.actor!=='user'||c.model&&!c.model.shareProject||c.thread.projectId&&c.thread.projectId!==projectId)fail('当前模型或会话未获准路由到该项目',403)
     if(!one(c.db,'SELECT 1 FROM projects WHERE id=?',projectId))fail('路由项目不存在',404)
-    if(!c.thread.projectId)c={...c,thread:{...c.thread,projectId},allowedInstances:routingBots(c.db,projectId),materials:[],attachmentIds:[]}
+    if(!c.thread.projectId)c={...c,thread:{...c.thread,projectId},allowedInstances:routingBots(c.db,projectId,c.dir),materials:[],attachmentIds:[]}
   }
   const needsConfirmation=typeof entry.confirm==='function'?entry.confirm(args):entry.confirm===true
   const confirm=needsConfirmation&&!routineWrite(c,name,args)

@@ -128,8 +128,9 @@ export function iconBtn(label, fn, symbol, extraCls = '') {
 let noticeTimer;
 export function notice(msg, tone = 'info') {
   const dialog = $('dialog');
+  const confirm = $('confirm-dialog');
   const isError = tone === 'error';
-  if (dialog?.open) {
+  if (dialog?.open && !confirm?.open) {
     let n = dialog.querySelector('.dialog-notice');
     if (!n) {
       n = el('p', 'dialog-notice');
@@ -209,6 +210,7 @@ export const phase = value => ({
 
 export function displayDialog(title, nodes = [], footerButtons = [], opts = {}) {
   const dialog = $('dialog');
+  dialog._removeCancelGuard?.();
   if (dialog.open) dialog.close();
   dialog.className = opts.wide ? 'dialog-wide' : opts.compact ? 'dialog-compact' : '';
   const backBtn = typeof opts.back === 'function' ? iconBtn('返回上一步', opts.back, 'chevronLeft') : null;
@@ -227,6 +229,7 @@ export function displayDialog(title, nodes = [], footerButtons = [], opts = {}) 
 
 export function form(title, fields, submit, onSave, opts = {}) {
   const dialog = $('dialog');
+  dialog._removeCancelGuard?.();
   if (dialog.open) dialog.close();
   dialog.className = opts.wide ? 'dialog-wide' : opts.compact ? 'dialog-compact' : '';
   const backBtn = typeof opts.back === 'function' ? iconBtn('返回上一步', opts.back, 'chevronLeft') : null;
@@ -239,6 +242,9 @@ export function form(title, fields, submit, onSave, opts = {}) {
   for (const field of fields) {
     const input = el(field.options ? 'select' : field.type === 'textarea' ? 'textarea' : 'input');
     if (input.tagName === 'INPUT') input.type = field.type || 'text';
+    if (field.min != null) input.min = String(field.min);
+    if (field.max != null) input.max = String(field.max);
+    if (field.step != null) input.step = String(field.step);
     if (field.options) {
       for (const option of field.options) {
         const o = el('option', '', option.name);
@@ -266,17 +272,54 @@ export function form(title, fields, submit, onSave, opts = {}) {
   const f = el('form', '', head, body, foot);
   dialog.replaceChildren(f);
 
+  const snapshot = () => JSON.stringify(
+    Object.entries(controls).map(([k, v]) => [k, v.type === 'file' ? Array.from(v.files || []).map(x => x.name).join(',') : v.value])
+  );
+  const initialSnapshot = snapshot();
+  const hasLongInput = fields.some(field => field.type === 'textarea') || fields.length >= 3;
+  const onCancel = event => {
+    if (!hasLongInput || f.parentNode !== dialog || $('confirm-dialog')?.open) return;
+    if (snapshot() === initialSnapshot) return;
+    event.preventDefault();
+    void confirmDialog({
+      title: '放弃未保存的修改？',
+      body: '当前表单有尚未保存的内容，确认关闭并丢弃修改？',
+      confirmLabel: '放弃修改',
+      destructive: true
+    }).then(ok => {
+      if (ok && dialog.open && f.parentNode === dialog) {
+        dialog._removeCancelGuard?.();
+        dialog.close();
+      }
+    });
+  };
+  const removeCancelGuard = () => {
+    dialog.removeEventListener('cancel', onCancel);
+    if (dialog._removeCancelGuard === removeCancelGuard) delete dialog._removeCancelGuard;
+  };
+  dialog._removeCancelGuard = removeCancelGuard;
+  dialog.addEventListener('cancel', onCancel);
+  dialog.addEventListener('close', removeCancelGuard, { once: true });
+
   f.onsubmit = async event => {
     event.preventDefault();
     if (save.disabled) return;
     save.disabled = true;
     error.textContent = '';
+    const staleNotice = dialog.querySelector('.dialog-notice');
+    if (staleNotice) staleNotice.hidden = true;
     try {
       const values = Object.fromEntries(
         Object.entries(controls).map(([k, v]) => [k, v.type === 'file' ? v.files[0] : v.value.trim()])
       );
       await onSave(values);
-      if (dialog.open && f.parentNode === dialog) dialog.close();
+      const pendingNotice = f.parentNode === dialog ? dialog.querySelector('.dialog-notice:not([hidden])') : null;
+      const promoted = pendingNotice ? { msg: pendingNotice.textContent, tone: pendingNotice.classList.contains('error') ? 'error' : 'info' } : null;
+      if (dialog.open && f.parentNode === dialog) {
+        removeCancelGuard();
+        dialog.close();
+      }
+      if (promoted?.msg) notice(promoted.msg, promoted.tone);
     } catch (e) {
       error.textContent = e?.message || '提交失败';
     } finally {
@@ -299,18 +342,18 @@ export function confirmDialog({
   destructive = false
 } = {}) {
   return new Promise(resolve => {
-    const dialog = $('dialog');
-    if (dialog.open) dialog.close();
-    dialog.className = 'dialog-compact';
+    const host = ($('dialog')?.open && $('confirm-dialog')) ? $('confirm-dialog') : $('dialog');
+    if (host.open) host.close();
+    host.className = 'dialog-compact';
     let settled = false;
     const finish = result => {
       if (settled) return;
       settled = true;
-      dialog.removeEventListener('close', onClose);
-      if (dialog.open && dialog.contains(shell)) dialog.close();
+      host.removeEventListener('close', onClose);
+      if (host.open && host.contains(shell)) host.close();
       resolve(result);
     };
-    const onClose = () => { if (!dialog.open || !dialog.contains(shell)) finish(false); };
+    const onClose = () => { if (!host.open || !host.contains(shell)) finish(false); };
 
     const head = el('div', 'dialog-head',
       destructive ? icon('warning') : null,
@@ -327,9 +370,9 @@ export function confirmDialog({
     cancelBtn.onclick = () => finish(false);
 
     const shell = el('div', 'dialog-shell', head, bodyBox, el('div', 'dialog-foot', cancelBtn, confirmBtn));
-    dialog.addEventListener('close', onClose);
-    dialog.replaceChildren(shell);
-    dialog.showModal();
+    host.addEventListener('close', onClose);
+    host.replaceChildren(shell);
+    host.showModal();
     requestAnimationFrame(() => confirmBtn.focus());
   });
 }

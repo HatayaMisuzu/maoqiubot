@@ -1,19 +1,20 @@
 import {readFileSync} from 'node:fs'
 import {randomUUID} from 'node:crypto'
-import {basename,isAbsolute,resolve} from 'node:path'
+import {resolve} from 'node:path'
 import {registry} from './adapters/index.ts'
 import {Acp} from './adapters/acp.ts'
+import {agentCommand,agentHome,agentHomeVariable} from '../contracts/agent-runtime.ts'
 import type {Instance,Run} from './types.ts'
 const [filename,id,...prompts]=process.argv.slice(2)
 const config=JSON.parse(readFileSync(filename,'utf8'))
 const instance:Instance=config.instances.find((x:Instance)=>x.id===id)
 if(!instance) throw new Error('没有该实例')
-const dshExecutable=process.env.MAOQIU_DSH_EXECUTABLE
-if(instance.adapterKey==='dsh'&&!isAbsolute(instance.command)&&dshExecutable&&isAbsolute(dshExecutable)&&
-  /^dsh(?:\.cmd|\.exe)?$/i.test(basename(dshExecutable)))instance.command=dshExecutable
+instance.command=agentCommand(instance.adapterKey,instance.command)
 instance.workspaceRef=resolve(instance.workspaceRef)
 const registration=registry.get(instance.adapterKey)
 if(!registration)throw Error('未注册原生连接器：'+instance.adapterKey)
+const homeKey=agentHomeVariable(instance.adapterKey)!
+instance.env={...instance.env,[homeKey]:agentHome(instance.adapterKey,instance.env)!}
 const adapter=new registration.create(instance)
 const timer=setTimeout(()=>adapter.close(),120000)
 try {

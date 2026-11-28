@@ -22,7 +22,7 @@ export type NodeCommand = {
     homeAccess?: {token:string,projectId:string,permission?:'read'|'append'|'manage'}}
 }
 export type NodeEvent = {
-  key: string, seq: number, instanceId: string, commandId: string, runId: string,
+  key: string, seq: number, instanceId: string, commandId: string, runId: string, threadId?: string, taskId?: string | null,
   kind: 'accepted' | 'message' | 'activity' | 'input_required' | 'artifact' | 'model_state' | 'completed' | 'failed' | 'cancelled' | 'blocked',
-  data: {text?: string, sessionId?: string, nativeRunId?: string, requestId?: string, options?: unknown[], [key: string]: any}
+  data: {text?: string, sessionId?: string, nativeRunId?: string, requestId?: string, options?: unknown[], usage?: unknown, [key: string]: any}
 }

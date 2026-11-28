@@ -1,5 +1,6 @@
 import type {DatabaseSync} from 'node:sqlite'
 import {fail, must, now} from '../db/index.ts'
+import {selectedModel} from '../chat/model-settings.ts'
 
 export type BotAction='direct'|'delegate'
 
@@ -51,15 +52,27 @@ export function botSettings(db:DatabaseSync,instanceId:string){
   return settings(db,instanceId)
 }
 
-export function listBots(db:DatabaseSync){
+export function listBots(db:DatabaseSync,dataDir?:string){
   return db.prepare('SELECT id,name,adapterKey,workspaceRef,profileId,nodeId,online,lastSeen,availableActions,capabilities FROM instances ORDER BY name,id')
-    .all().map((row:any)=>({
-      ...row,
-      online:Boolean(row.online),
-      availableActions:JSON.parse(row.availableActions||'[]'),
-      capabilities:JSON.parse(row.capabilities||'{}'),
-      settings:settings(db,String(row.id))
-    }))
+    .all().map((row:any)=>{
+      let online=Boolean(row.online)
+      const capabilities=JSON.parse(row.capabilities||'{}')
+      if(row.nodeId==='@model-api'&&dataDir){
+        let ready=false
+        try{ready=Boolean(selectedModel(dataDir,String(row.profileId)))}catch{ready=false}
+        if(!ready){
+          online=false
+          capabilities.error='绑定的模型配置已失效或已停用'
+        }
+      }
+      return {
+        ...row,
+        online,
+        availableActions:JSON.parse(row.availableActions||'[]'),
+        capabilities,
+        settings:settings(db,String(row.id))
+      }
+    })
 }
 
 export function saveBotSettings(db:DatabaseSync,instanceId:string,body:any){
@@ -115,10 +128,10 @@ export function tasksForThread(db:DatabaseSync,threadId:string){
     WHERE x.threadId=? ORDER BY t.createdAt DESC,t.id`).all(threadId)
 }
 
-export function routingBots(db:DatabaseSync,projectId:string|null){
+export function routingBots(db:DatabaseSync,projectId:string|null,dataDir?:string){
   const mapped=projectId?new Set(db.prepare('SELECT instanceId FROM project_workspaces WHERE projectId=?')
     .all(projectId).map(row=>row.instanceId)):null
-  return listBots(db).filter(bot=>{
+  return listBots(db,dataDir).filter(bot=>{
     const s=bot.settings
     return s.enabled&&s.allowDelegate&&(!mapped||mapped.has(bot.id))&&(!s.allowedProjects||projectId&&s.allowedProjects.includes(projectId))
   }).map(({id,adapterKey,name,nodeId,profileId,workspaceRef,online,availableActions,capabilities,settings})=>({

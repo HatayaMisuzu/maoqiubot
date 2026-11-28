@@ -1,6 +1,6 @@
 import {
   $, basenamePath, btn, el, findThreadAny, getMainBot, getWorkBots,
-  icon, iconBtn, localFlag, resolveActiveContext, setLocalFlag, state
+  icon, iconBtn, localFlag, notice, resolveActiveContext, setLocalFlag, state
 } from './lib.js';
 import { hasDesktopSettings } from './desktop-settings.js';
 
@@ -341,7 +341,7 @@ export function createSidebar(actions) {
       el('div', 'side-section-header',
         el('span', 'side-section-title', '工作 Bot', el('span', 'side-section-count', onlineCount + '/' + bots.length)),
         el('div', 'side-section-tools',
-          hasDesktopSettings() ? iconBtn('Agent 设置', () => actions.openDesktopSettings(), 'sliders') : null
+          iconBtn(hasDesktopSettings() ? 'Agent 设置' : 'Bot 监控', () => actions.openDesktopSettings(), 'sliders')
         )
       ),
       listWrap

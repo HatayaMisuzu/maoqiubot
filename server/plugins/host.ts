@@ -130,6 +130,7 @@ export function pluginHost(dir:string){
           confirm:tool.risk==='confirm',allowed:c=>c.actor==='user'&&(!pkg.projectId||pkg.projectId===c.thread.projectId)&&
             (!c.model||tool.network==='network.public'||(c.thread.projectId?c.model.shareProject:c.model.sharePersonal)),
           execute:async(c,args)=>withLiveCall(()=>tool.execute(args,{actor:c.actor,threadId:c.thread.id,messageId:c.current.id,projectId:c.thread.projectId,
+            taskId:c.coordination?.taskId??c.thread.taskId??undefined,runId:c.coordination?.runId,
             signal:c.signal,maxResultBytes:7500,requestText:c.current.text,authorizedDestinations:[...(c.webDestinations??[])]}))}))
       },
       registerProvider(provider){

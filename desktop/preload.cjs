@@ -4,5 +4,9 @@ contextBridge.exposeInMainWorld('maoqiuDesktop', {
   settings: () => ipcRenderer.invoke('connector:settings'),
   saveInstance: value => ipcRenderer.invoke('connector:save', value),
   createWorktree: value => ipcRenderer.invoke('connector:worktree', value),
-  restartConnector: () => ipcRenderer.invoke('connector:restart')
+  restartConnector: () => ipcRenderer.invoke('connector:restart'),
+  agentManagerStatus: () => ipcRenderer.invoke('agent-manager:status'),
+  openAgentManager: instanceId => ipcRenderer.invoke('agent-manager:open', instanceId),
+  agentMonitor: options => ipcRenderer.invoke('agent-manager:monitor', options),
+  agentQuota: instanceId => ipcRenderer.invoke('agent-manager:quota', instanceId)
 })

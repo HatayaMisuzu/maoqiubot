@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import {spawn} from 'node:child_process'
 import {once} from 'node:events'
-import {mkdirSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs'
+import {mkdirSync,mkdtempSync,readFileSync,realpathSync,rmSync,writeFileSync} from 'node:fs'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import test from 'node:test'
@@ -60,6 +60,42 @@ test('connector filters Node launcher overrides while preserving ordinary enviro
   }finally{
     rpc.close()
     for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key]}
+  }
+})
+
+test('connector keeps other instances online when a pinned runtime changes',async()=>{
+  const temp=realpathSync(mkdtempSync(join(tmpdir(),'maoqiu-changed-scope-')))
+  const app=startServer({port:0,dataDir:join(temp,'server'),chat:false})
+  let child,exit
+  try {
+    await once(app.server,'listening')
+    const port=app.server.address().port
+    const config=join(temp,'node.json')
+    const fixture={name:'DSH fixture',adapterKey:'dsh',workspaceRef:temp,command:process.execPath,
+      args:['--input-type=commonjs','-e',`(async()=>{${fakeAcp}})()`],env:{MAOQIU_ACP_TEST_LOG:join(temp,'native.log'),DSH_HOME:join(temp,'dsh')}}
+    const oldScope='a'.repeat(64)
+    app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,profileId,runtimeScopeId)
+      VALUES('stale','local','DSH stale','dsh',?,'[]',?,'default',?)`).run(temp,new Date().toISOString(),oldScope)
+    writeFileSync(config,JSON.stringify({url:'ws://127.0.0.1:'+port+'/api/v1/node',nodeId:'local',stateDir:join(temp,'node'),
+      instances:[{...fixture,id:'stale'},{...fixture,id:'fresh'}]}))
+    child=spawn(process.execPath,['connector/index.ts',config],{
+      env:{...process.env,NODE_TOKEN:app.auth.cfg.nodes.local,MAOQIU_EXPECTED_AGENT_SCOPES:JSON.stringify({stale:oldScope})},
+      stdio:['ignore','ignore','inherit','ipc'],windowsHide:true
+    })
+    exit=once(child,'exit')
+    const read=app.db.prepare('SELECT online,capabilities,runtimeScopeId FROM instances WHERE id=?')
+    const end=Date.now()+8000
+    while(!read.get('fresh')?.online&&Date.now()<end)await delay(50)
+    assert.equal(read.get('fresh')?.online,1)
+    const stale=read.get('stale')
+    assert.equal(stale.online,0)
+    assert.equal(stale.runtimeScopeId,oldScope)
+    assert.match(JSON.parse(stale.capabilities).error,/使用新实例 ID/)
+  } finally {
+    if(child?.connected)child.disconnect()
+    if(exit)await exit
+    await app.close()
+    rmSync(temp,{recursive:true,force:true,maxRetries:4,retryDelay:100})
   }
 })
 

@@ -1,16 +1,35 @@
 const { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } = require('node:fs')
-const { basename, delimiter, isAbsolute, join, relative, resolve, sep } = require('node:path')
+const { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } = require('node:path')
 const { randomUUID } = require('node:crypto')
-const { homedir } = require('node:os')
 const { execFile } = require('node:child_process')
 const { promisify } = require('node:util')
+const { agentCommand, agentHome, agentHomeVariable, agentRuntimeKey, agentRuntimeScope } = require('../contracts/agent-runtime.ts')
 const git = promisify(execFile)
 const officialNames = {
   codex: /^codex(?:\.exe)?$/i,
   dsh: /^dsh(?:\.exe|\.cmd)?$/i,
   hermes: /^hermes(?:\.exe|\.cmd)?$/i
 }
-function detectedCommand(adapterKey, command) {
+
+function normalizeStablePath(targetPath) {
+  if (!targetPath || typeof targetPath !== 'string') return targetPath
+  const resolved = resolve(targetPath)
+  const suffix = []
+  let probe = resolved
+  while (true) {
+    try {
+      const real = realpathSync.native(probe)
+      return suffix.length ? join(real, ...suffix.reverse()) : real
+    } catch (error) {
+      if (error?.code !== 'ENOENT' && error?.code !== 'ENOTDIR') return resolved
+      const parent = dirname(probe)
+      if (parent === probe) return resolved
+      suffix.push(basename(probe))
+      probe = parent
+    }
+  }
+}
+function detectedCommand(adapterKey, command, configurationHome) {
   if (!officialNames[adapterKey]?.test(basename(command))) return null
   const names = adapterKey === 'hermes' && command.toLowerCase() !== 'hermes' ? [basename(command)] :
     ['dsh','hermes'].includes(adapterKey) && process.platform === 'win32' ? [adapterKey+'.exe', adapterKey+'.cmd'] :
@@ -19,9 +38,7 @@ function detectedCommand(adapterKey, command) {
     .map(dir => dir.replace(/^"|"$/g, '')).filter(dir => isAbsolute(dir))
   const installs = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA,'Programs')]
     .filter(Boolean).map(dir => join(dir,'DeepSeekHarness','resources','runtime','cli','bin'))
-  const hermesHome = process.env.HERMES_HOME || (process.platform === 'win32' ?
-    join(process.env.LOCALAPPDATA || join(homedir(),'AppData','Local'),'hermes'+(process.env.HERMES_DATA_DIR_SUFFIX || '')) :
-    join(homedir(),'.hermes'+(process.env.HERMES_DATA_DIR_SUFFIX || '')))
+  const hermesHome = configurationHome ?? agentHome('hermes')
   const candidates = isAbsolute(command) ? [command] : [
     ...(adapterKey === 'dsh' && process.env.MAOQIU_DSH_EXECUTABLE ? [process.env.MAOQIU_DSH_EXECUTABLE] : []),
     ...[...(adapterKey==='hermes'?[join(hermesHome,'bin')]:[]),...pathDirs,...(adapterKey==='dsh'?installs:[])]
@@ -69,9 +86,28 @@ function write(file, config) {
 }
 
 function settingsView(settings) {
-  const instances = configFrom(settings.file).instances.map(({ id, name, adapterKey, profileId, workspaceRef, command, worktree }) =>
-    ({ id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, worktree,
-      detectedCommand:detectedCommand(adapterKey,command) }))
+  const instances = configFrom(settings.file).instances.map(instance => {
+    const { id, name, adapterKey, profileId, workspaceRef, command, args, env, worktree } = instance
+    const home = agentHome(adapterKey, env, settings.workspace)
+    const configurationHome = home ? normalizeStablePath(home) : home
+    let dsh
+    if (adapterKey === 'dsh' && Array.isArray(args)) {
+      const at = args.indexOf('--profile')
+      const selected = at >= 0 ? args[at+1] : args.find(arg => typeof arg === 'string' && arg.startsWith('--profile='))?.slice(10) ?? args[0]
+      const nativeProfile = typeof selected === 'string' && /^[\w-]+$/.test(selected) ? selected : null
+      dsh = {
+        nativeProfile,
+        nativeProfileInitialized: Boolean(nativeProfile && existsSync(join(home,'profiles',nativeProfile,'cordis.patch.yml'))),
+        dshRuntimeScopeId: agentRuntimeScope(agentRuntimeKey(profileId ?? 'default',home,agentCommand(adapterKey,command),args)),
+        hasDshOverrides: existsSync(join(home,'cordis.patch.yml')) ||
+          args.some(arg => typeof arg === 'string' && (arg === '--patch' || arg.startsWith('--patch=')))
+      }
+    }
+    return { id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, worktree, configurationHome,
+      configuredHome: env?.[agentHomeVariable(adapterKey)] || '',
+      ...(adapterKey === 'codex' ? { codexProviderMode: instance.codexProviderMode ?? 'official' } : {}),
+      ...dsh, detectedCommand: detectedCommand(adapterKey,command,home) }
+  })
   return { file: settings.file, editable: settings.editable, workspace: settings.workspace, instances }
 }
 
@@ -92,36 +128,69 @@ function saveInstance(settings, db, input) {
   if (!basenamePattern.test(basename(requested)) || (!isAbsolute(requested) && requested !== basename(requested))) {
     throw Error('请填写官方可执行程序名或完整路径')
   }
-  const command = adapterKey === 'hermes' ? detectedCommand(adapterKey,requested) ?? requested : requested
-  if (isAbsolute(command) && !statSync(command, { throwIfNoEntry: false })?.isFile()) throw Error('找不到指定的 Agent 可执行程序')
   const workspace = resolve(settings.workspace, required('workspaceRef'))
   if (!statSync(workspace, { throwIfNoEntry: false })?.isDirectory()) throw Error('找不到指定的工作区目录')
   const workspaceRef = realpathSync(workspace), config = configFrom(settings.file)
   const existing = config.instances.find(i => i.id === id)
-  const registered = db.prepare('SELECT workspaceRef,profileId,adapterKey FROM instances WHERE id=?').get(id)
+  const source = input.sourceId === undefined ? undefined : config.instances.find(i => i.id === input.sourceId)
+  if (input.sourceId !== undefined && (!source || existing || source.adapterKey !== adapterKey)) throw Error('复制来源或目标实例已变化')
+  const defaults = existing ?? source
+  const homeKey = agentHomeVariable(adapterKey)
+  const env = {...defaults?.env}
+  if (input.configurationHome !== undefined) {
+    if (typeof input.configurationHome !== 'string' || input.configurationHome.length > 1000 || /[\r\n\0]/.test(input.configurationHome)) {
+      throw Error('请填写有效的 Agent 配置目录')
+    }
+    const configuredHome = input.configurationHome.trim()
+    if (configuredHome) {
+      if (!isAbsolute(configuredHome) && configuredHome !== defaults?.env?.[homeKey]) throw Error('Agent 配置目录须为绝对路径')
+      env[homeKey] = configuredHome
+    } else delete env[homeKey]
+  }
+  const home = agentHome(adapterKey, env, settings.workspace)
+  const command = adapterKey === 'hermes' ? detectedCommand(adapterKey,requested,home) ?? requested : requested
+  if (isAbsolute(command) && !statSync(command, { throwIfNoEntry: false })?.isFile()) throw Error('找不到指定的 Agent 可执行程序')
+  const oldMode = defaults?.codexProviderMode ?? 'official'
+  const codexProviderMode = input.codexProviderMode ?? oldMode
+  if (adapterKey === 'codex' && !['official','native'].includes(codexProviderMode)) throw Error('请选择有效的 Codex 供应商模式')
+  const registered = db.prepare('SELECT workspaceRef,profileId,adapterKey,runtimeScopeId FROM instances WHERE id=?').get(id)
   const inUse = registered && db.prepare('SELECT 1 FROM threads WHERE instanceId=? LIMIT 1').get(id)
   if (registered && (registered.workspaceRef !== workspaceRef || registered.profileId !== profileId || registered.adapterKey !== adapterKey ||
-    (inUse && existing?.command !== command))) throw Error('此实例已登记。修改执行入口、工作区或 profile 时请使用新实例 ID')
-  const args = existing?.adapterKey === adapterKey ? existing.args :
+    ((inUse || registered.runtimeScopeId) && (existing?.command !== command || home !== agentHome(adapterKey, existing?.env, settings.workspace) ||
+      (adapterKey === 'codex' && codexProviderMode !== oldMode))))) {
+    throw Error('此实例已登记。更换执行入口、配置目录、供应商模式、工作区或 profile 时请使用新实例 ID')
+  }
+  const args = defaults?.adapterKey === adapterKey ? defaults.args :
     adapterKey === 'codex' ? ['app-server'] : adapterKey === 'hermes' ? ['acp'] : ['--profile', 'acp']
   const next = { ...existing, id, name, adapterKey, profileId, workspaceRef, command, args }
+  if (Object.keys(env).length) next.env = env
+  else delete next.env
+  if (adapterKey === 'codex' && codexProviderMode === 'native') next.codexProviderMode = codexProviderMode
+  else delete next.codexProviderMode
   if (workspaceRef !== existing?.workspaceRef || adapterKey !== existing?.adapterKey) delete next.worktree
   config.instances = existing ? config.instances.map(i => i.id === id ? next : i) : [...config.instances, next]
   write(settings.file, config)
   return settingsView(settings)
 }
 
-async function createWorktree(settings, db, sourceId, instanceId, parent) {
+function validateWorktreeRequest(settings, db, sourceId, instanceId) {
   if (!settings.editable) throw Error('当前使用独立 JSON 配置，请在原环境管理工作区')
   if (typeof instanceId !== 'string' || !/^[a-zA-Z0-9][\w-]{0,47}$/.test(instanceId) || instanceId === 'main' ||
     /^(?:aux|con|nul|prn|com[1-9]|lpt[1-9])$/i.test(instanceId)) throw Error('请为新实例填写有效且唯一的 ID')
-  const source = configFrom(settings.file).instances.find(item => item.id === sourceId)
+  const config = configFrom(settings.file)
+  const source = config.instances.find(item => item.id === sourceId)
   if (!source || !officialNames[source.adapterKey]?.test(basename(source.command))) throw Error('请选择本机 Agent 实例')
+  if (config.instances.some(i => i.id.toLowerCase() === instanceId.toLowerCase()) ||
+    db.prepare('SELECT id FROM instances WHERE id=? COLLATE NOCASE').get(instanceId)) throw Error('这个实例 ID 已存在，请换一个 ID')
+  return source
+}
+
+async function createWorktree(settings, db, sourceId, instanceId, parent) {
+  const source = validateWorktreeRequest(settings, db, sourceId, instanceId)
   function available(config) {
     if (config.instances.some(i => i.id.toLowerCase() === instanceId.toLowerCase()) ||
       db.prepare('SELECT id FROM instances WHERE id=? COLLATE NOCASE').get(instanceId)) throw Error('这个实例 ID 已存在，请换一个 ID')
   }
-  available(configFrom(settings.file))
   // Git can expand Windows short paths even when Node's realpathSync preserves them.
   const cwd = realpathSync.native(resolve(settings.workspace, source.workspaceRef))
   const destinationParent = realpathSync.native(parent)
@@ -171,4 +240,4 @@ function worktreeSource(settings, instance) {
     i.adapterKey === instance.adapterKey)?.worktree?.sourceId
 }
 
-module.exports = { connectorSettings, settingsView, saveInstance, createWorktree, worktreeSource }
+module.exports = { connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath }

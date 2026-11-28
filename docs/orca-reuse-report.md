@@ -1,5 +1,7 @@
 # Orca 复用与小毛球升级验收
 
+> **历史验收快照**：本文档记录对应阶段完成时的基线与实测结果，不再随后续改动重写；现行架构、接口与操作说明请以 [docs/README.md](README.md) 及各专题文档为准。
+
 ## 基线与上游
 
 目标 `main` 起始提交 `705b77a07fc6af43b363b3202b89013e99e8f321`，执行 `git fetch origin` 后与 `origin/main` 一致，工作区起始干净。基线在 Windows 使用 Node.js 22.22.3 运行 `npm ci`、`npm run check`、`npm test` 与 `node scripts/smoke-live.ts`，46 项测试及真实 Codex 冒烟通过。

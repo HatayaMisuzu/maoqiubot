@@ -57,6 +57,7 @@ export function generationRequest(model:ModelConfig,i:Input):{path:string;body:B
           tool_calls:[{id:call.id,type:'function',function:{name:call.name,arguments:call.arguments}}]},
         {role:'tool',tool_call_id:call.id,content:json(result)}])],
       [model.outputLimitField??'max_completion_tokens']:model.outputTokens,stream,...temperature,
+      ...(stream?{stream_options:{include_usage:true}}:{}),
       ...(structured?{response_format:{type:'json_schema',json_schema:{name:'maoqiu_decision',strict:true,schema:structured}}}:{}),
       ...(tools.length?{tools:tools.map(tool=>({type:'function',function:tool})),parallel_tool_calls:false}:{})})
   }
@@ -90,6 +91,7 @@ export function protocolAnswer(protocol:ModelConfig['protocol'],stream:boolean,d
       if(raw.type==='response.output_text.delta')chunk=raw.delta??''
       if(raw.type==='response.completed')response=raw.response
     }else if(protocol==='anthropic'){
+      if(raw.type==='message_start')usage=raw.message?.usage??usage
       if(raw.type==='content_block_start'){
         blocks[raw.index]=raw.content_block
         chunk=raw.content_block?.type==='text'?raw.content_block.text??'':''
@@ -102,7 +104,10 @@ export function protocolAnswer(protocol:ModelConfig['protocol'],stream:boolean,d
         if(part.type==='thinking_delta')block.thinking+=part.thinking
         if(part.type==='signature_delta')block.signature=part.signature
       }
-      if(raw.type==='message_delta'){finish=raw.delta?.stop_reason;usage=raw.usage}
+      if(raw.type==='message_delta'){
+        finish=raw.delta?.stop_reason??finish
+        if(raw.usage&&typeof raw.usage==='object')usage={...usage as object,...raw.usage}
+      }
       if(raw.type==='message_stop')response={content:blocks,stop_reason:finish,usage}
     }else{
       if(raw.promptFeedback?.blockReason)incomplete()

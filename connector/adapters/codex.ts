@@ -1,6 +1,8 @@
-import {relative,resolve} from 'node:path'
+import {join,relative,resolve} from 'node:path'
 import {createHash} from 'node:crypto'
+import {readFileSync} from 'node:fs'
 import {Native} from './base.ts'
+import {agentEnvironment} from '../rpc.ts'
 import type {Input,Run,Adapter} from '../types.ts'
 import type {ModelOption,ModelState,NativeAction,NativeHistory,UsageWindow} from '../../contracts/node.ts'
 
@@ -9,22 +11,82 @@ function inputs(input:Input) {
     ? {type:'localImage',path:f.path}
     : {type:'text',text:'用户附件 '+f.name+' ['+f.id+']\n'+f.path,text_elements:[]})]
 }
-function terminal(turn:any,emit:Run['emit']) {
+const usageFields=['inputTokens','outputTokens','totalTokens'] as const
+type TokenCounts=Record<typeof usageFields[number],number>
+type TokenUsage=TokenCounts & {model:string|null}
+
+function tokenCounts(value:any):TokenCounts|undefined {
+  if(!value || !usageFields.every(key=>Number.isSafeInteger(value[key])&&value[key]>=0))return
+  return {inputTokens:value.inputTokens,outputTokens:value.outputTokens,totalTokens:value.totalTokens}
+}
+
+function terminal(turn:any,emit:Run['emit'],usage?:TokenUsage) {
   const status=turn.status
   if(!['completed','interrupted','failed'].includes(status)) return false
-  emit(status==='interrupted'?'cancelled':status,{text:turn.error?.message || '',nativeRunId:turn.id})
+  emit(status==='interrupted'?'cancelled':status,{
+    text:turn.error?.message || '',nativeRunId:turn.id,...(status==='completed'&&usage?{usage}:{})
+  })
   return true
 }
+
+const hash=(value:string)=>createHash('sha256').update(value).digest('hex')
+function orderedJson(value:unknown){
+  return JSON.stringify(value,(_key,item)=>item && typeof item==='object' && !Array.isArray(item)?
+    Object.fromEntries(Object.entries(item).sort(([first],[second])=>first.localeCompare(second))):item)
+}
+
 export class Codex extends Native implements Adapter {
   turnStartTimeoutMs=30000
   models:ModelOption[]=[]
   sessionModels=new Map<string,string>()
+  private providerId?:string
+  private defaultModel?:string
+  private officialQuota=true
+  private turnUsage=new WeakMap<Run,{turnId:string,total:TokenCounts,used:TokenUsage}>()
+  private reroutedModel=new WeakMap<Run,string>()
   async identity(){
-    const {account}=await this.rpc.request('account/read',{refreshToken:false},10000)
-    if(account?.type!=='chatgpt')throw Error('请在本机使用官方 Codex 登录 ChatGPT')
-    return createHash('sha256').update(String(account.email??'local-chatgpt')).digest('hex')
+    if(this.instance.codexProviderMode!=='native'){
+      const {account}=await this.rpc.request('account/read',{refreshToken:false},10000)
+      if(account?.type!=='chatgpt')throw Error('请在本机使用官方 Codex 登录 ChatGPT')
+      return hash(String(account.email??'local-chatgpt'))
+    }
+    // Inspect the configuration Codex resolves for this cwd, including native project overrides.
+    const {config}=await this.rpc.request('config/read',{cwd:this.instance.workspaceRef},10000)
+    if(!config||typeof config!=='object'||Array.isArray(config))throw Error('无法核对本机 Codex 供应商配置')
+    const providerId=config.model_provider??'openai'
+    if(typeof providerId!=='string'||!providerId)throw Error('无法核对本机 Codex 供应商标识')
+    const {account,userId,workspaceRouting,requiresOpenaiAuth}=await this.rpc.request('account/read',{refreshToken:false,modelProvider:providerId},10000)
+    if(!account && requiresOpenaiAuth!==false)throw Error('请先在本机登录此 Codex 供应商')
+    const defaultModel=typeof config.model==='string'&&config.model?config.model:undefined
+    const officialQuota=providerId==='openai'&&account?.type==='chatgpt'&&!config.openai_base_url&&!config.chatgpt_base_url
+    const provider=config.model_providers?.[providerId]
+    const env=agentEnvironment(this.instance)
+    const envNames=[provider?.env_key,...Object.values(provider?.env_http_headers??{}),
+      ...(providerId==='openai'?['OPENAI_API_KEY','CODEX_API_KEY','OPENAI_BASE_URL','CHATGPT_BASE_URL']:[])]
+    const routeEnv=Object.fromEntries(envNames.filter((key):key is string=>typeof key==='string').map(key=>[key,env[key]??null]))
+    let fileKey:string|null=null
+    if(account?.type==='apiKey'&&this.instance.env?.CODEX_HOME){
+      // Only include the API key fingerprint. Refreshing a ChatGPT token must not invalidate its sessions.
+      try{
+        const localAuth=JSON.parse(readFileSync(join(this.instance.env.CODEX_HOME,'auth.json'),'utf8'))
+        if(typeof localAuth.OPENAI_API_KEY==='string')fileKey=hash(localAuth.OPENAI_API_KEY)
+      }catch(error){
+        if((error as NodeJS.ErrnoException).code!=='ENOENT')throw Error('无法核对本机 Codex API 登录')
+      }
+    }
+    this.providerId=providerId
+    this.defaultModel=defaultModel
+    this.officialQuota=officialQuota
+    return hash(orderedJson([
+      'native',providerId,config.openai_base_url,config.chatgpt_base_url,account?.type,account?.email,userId,
+      workspaceRouting?.chatgptAccountId,workspaceRouting?.backendOrigin,routeEnv,fileKey,
+      provider?.base_url,provider?.model_catalog_url,provider?.wire_api,provider?.auth,provider?.gateway_oauth,
+      provider?.query_params,provider?.http_headers,provider?.experimental_bearer_token,provider?.credential_file,
+      provider?.location,provider?.project_id,provider?.aws,provider?.requires_openai_auth
+    ]))
   }
   async readUsage():Promise<UsageWindow[]>{
+    if(!this.officialQuota)return []
     const result=await this.rpc.request('account/rateLimits/read',{},5000)
     const limits=result?.rateLimitsByLimitId?.codex??result?.rateLimits
     return [limits?.primary,limits?.secondary].flatMap(window=>
@@ -41,9 +103,12 @@ export class Codex extends Native implements Adapter {
     await this.rpc.write({method:'initialized'})
     await this.identity()
     try{
-      const result=await this.rpc.request('model/list',{limit:100,includeHidden:false},5000)
+      const result=await this.rpc.request('model/list',{limit:100,includeHidden:false,
+        ...(this.providerId?{modelProvider:this.providerId}:{})},5000)
       this.models=result.data.filter((m:any)=>typeof m.model==='string' && !m.hidden).map((m:any)=>({id:m.model,label:m.displayName||m.model}))
     }catch{this.models=[]}
+    if(this.defaultModel&&!this.models.some(model=>model.id===this.defaultModel))
+      this.models.unshift({id:this.defaultModel,label:this.defaultModel})
     // Invalid empty parameters can only validate a method; no session or turn is addressed.
     const supported=async (method:string)=>{
       try {await this.rpc.request(method,{},5000);return true}
@@ -55,9 +120,11 @@ export class Codex extends Native implements Adapter {
     if(fork)nativeActions.push('fork')
     if(archive&&unarchive)nativeActions.push('archive','unarchive')
     let sessionList=false
-    if(history)try{await this.catalog({limit:1});sessionList=true}catch{}
+    // Older native threads record only a provider ID. The same ID may now point to another account or endpoint.
+    if(history&&(!this.providerId||this.officialQuota))try{await this.catalog({limit:1});sessionList=true}catch{}
     return {availableActions:['run','prepare','answer',...(steer?['steer']:[]),...(cancel?['cancel']:[])],
-      version:hello.userAgent,resume:true,history,sessionList,sessionImport:sessionList,nativeHistory,nativeActions,models:this.models}
+      version:hello.userAgent,resume:true,history,sessionList,sessionImport:sessionList,nativeHistory,nativeActions,models:this.models,
+      usage:this.officialQuota}
   }
   private async catalog(options:object){
     const result=await this.rpc.request('thread/list',{...options,cwd:this.instance.workspaceRef,currentAccountOnly:true,useStateDbOnly:true},5000)
@@ -88,9 +155,11 @@ export class Codex extends Native implements Adapter {
   async open(sessionId?:string) {
     if(sessionId && this.sessions.has(sessionId)) return sessionId
     const method=sessionId?'thread/resume':'thread/start'
-    const {thread,model}=await this.rpc.request(method,{cwd:this.instance.workspaceRef,...(sessionId?{threadId:sessionId,excludeTurns:true}:{})})
-    if(!thread?.id || (sessionId && thread.id!==sessionId) || relative(resolve(thread.cwd),this.instance.workspaceRef)!=='')
-      throw new Error('原生工作区或线程不符')
+    const {thread,model}=await this.rpc.request(method,{cwd:this.instance.workspaceRef,
+      ...(this.providerId?{modelProvider:this.providerId}:{}),
+      ...(sessionId?{threadId:sessionId,excludeTurns:true}:{})})
+    if(!thread?.id || (sessionId && thread.id!==sessionId) || relative(resolve(thread.cwd),this.instance.workspaceRef)!=='' ||
+      (this.providerId && thread.modelProvider!==this.providerId))throw new Error('原生工作区、线程或供应商不符')
     this.sessions.add(thread.id)
     if(typeof model==='string')this.sessionModels.set(thread.id,model)
     return thread.id as string
@@ -190,8 +259,25 @@ export class Codex extends Native implements Adapter {
         run.nativeRunId=p.turn.id
         run.emit('accepted',{sessionId:run.sessionId,nativeRunId:p.turn.id})
       }
-      if(terminal(p.turn,run.emit)) this.endings.get(run.sessionId)?.finish()
+      const counts=this.turnUsage.get(run)
+      const usage=counts&&counts.turnId===p.turn.id?counts.used:undefined
+      if(terminal(p.turn,run.emit,usage)) this.endings.get(run.sessionId)?.finish()
+    } else if(msg.method==='thread/tokenUsage/updated' && typeof p.turnId==='string' &&
+      (!run.nativeRunId || p.turnId===run.nativeRunId)) {
+      if(!run.nativeRunId)run.nativeRunId=p.turnId
+      const total=tokenCounts(p.tokenUsage?.total),latest=tokenCounts(p.tokenUsage?.last)
+      if(!total||!latest)return
+      const previous=this.turnUsage.get(run)
+      const currentModel=this.reroutedModel.get(run)??run.command.payload.modelId??this.sessionModels.get(run.sessionId)??null
+      // Native totals are cumulative for the thread, and a turn can include multiple model requests.
+      if(previous&&previous.turnId===p.turnId){
+        if(usageFields.some(key=>total[key]<previous.total[key]))return
+        if(usageFields.every(key=>total[key]===previous.total[key]))return
+        const used=tokenCounts(Object.fromEntries(usageFields.map(key=>[key,previous.used[key]+total[key]-previous.total[key]])))
+        if(used)this.turnUsage.set(run,{turnId:p.turnId,total,used:{...used,model:previous.used.model===currentModel?currentModel:null}})
+      }else this.turnUsage.set(run,{turnId:p.turnId,total,used:{...latest,model:currentModel}})
     } else if(msg.method==='model/rerouted' && typeof p.toModel==='string') {
+      this.reroutedModel.set(run,p.toModel)
       run.emit('activity',{text:'本轮原生路由使用 '+p.toModel,fromModel:p.fromModel,toModel:p.toModel,reason:p.reason})
     } else if(msg.method==='item/completed' || msg.method==='item/started') {
       const i=p.item

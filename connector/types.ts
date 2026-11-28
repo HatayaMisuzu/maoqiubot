@@ -5,6 +5,7 @@ export interface Instance {
   adapterKey: string
   workspaceRef: string
   profileId?: string
+  codexProviderMode?: 'official' | 'native'
   runtimeKey?: string
   runtimeScopeId?:string
   command: string
@@ -20,7 +21,7 @@ export interface Run {
   nativeRunId?: string
   emit: Emit
 }
-export type Capabilities = {availableActions: string[], version?: string, history: boolean, resume: boolean, sessionList?:boolean, sessionImport?:boolean, nativeHistory?:boolean, nativeActions?:NativeAction[], models?:ModelOption[]}
+export type Capabilities = {availableActions: string[], version?: string, history: boolean, resume: boolean, sessionList?:boolean, sessionImport?:boolean, nativeHistory?:boolean, nativeActions?:NativeAction[], models?:ModelOption[], usage?:boolean}
 export interface Adapter {
   onDisconnect(handler:(error:Error)=>void):void
   probe(): Promise<Capabilities>

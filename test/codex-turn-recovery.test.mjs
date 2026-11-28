@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {Codex} from '../connector/adapters/codex.ts'
+import {agentEnvironment} from '../connector/rpc.ts'
 
 const fakeAppServer=String.raw`(async()=>{
   const {createInterface}=require('node:readline')
@@ -10,6 +11,15 @@ const fakeAppServer=String.raw`(async()=>{
     const request=JSON.parse(line)
     if(request.method==='fixture/ready'){
       write({id:request.id,result:{ready:true}})
+      continue
+    }
+    if(request.method==='config/read'){
+      write({id:request.id,result:{config:{model:'fixture-model',model_provider:'local-gateway',
+        model_providers:{'local-gateway':{base_url:'https://'+mode+'.example/v1',env_key:'MAOQIU_CODEX_FIXTURE_KEY'}}}}})
+      continue
+    }
+    if(request.method==='account/read'){
+      write({id:request.id,result:{account:null,requiresOpenaiAuth:false}})
       continue
     }
     if(request.method!=='turn/start')continue
@@ -24,6 +34,17 @@ const fakeAppServer=String.raw`(async()=>{
     }else if(mode==='started-then-timeout'){
       setTimeout(()=>write({method:'turn/started',params:{threadId,turn:{id:turn.id}}}),5)
       setTimeout(()=>write({method:'turn/completed',params:{threadId,turn}}),500)
+    }else if(mode==='usage'){
+      const update=(turnId,input,output,lastInput,lastOutput)=>write({method:'thread/tokenUsage/updated',params:{threadId,turnId,
+        tokenUsage:{total:{inputTokens:input,outputTokens:output,totalTokens:input+output},
+          last:{inputTokens:lastInput,outputTokens:lastOutput,totalTokens:lastInput+lastOutput}}}})
+      write({method:'turn/started',params:{threadId,turn}})
+      update('previous-turn',900,100,900,100)
+      update(turn.id,905,103,5,3)
+      update(turn.id,905,103,5,3)
+      update(turn.id,912,107,7,4)
+      write({id:request.id,result:{turn}})
+      write({method:'turn/completed',params:{threadId,turn}})
     }
   }
 })()`
@@ -75,4 +96,31 @@ test('Codex leaves an unidentified start timeout without a success result',async
   assert.equal(run.nativeRunId,null)
   assert.equal(events.some(event=>event.kind==='completed'),false)
   assert.equal(adapter.active.has(run.sessionId),false)
+})
+
+test('Codex sums only the current turn’s usage across native requests',async t=>{
+  const {adapter,run,events}=await start('usage')
+  t.after(()=>adapter.close())
+  adapter.sessionModels.set(run.sessionId,'fixture-model')
+  await adapter.run(run,{text:'fixture',files:[]})
+  assert.deepEqual(events.find(event=>event.kind==='completed').data.usage,
+    {model:'fixture-model',inputTokens:12,outputTokens:7,totalTokens:19})
+})
+
+test('Codex native identity changes when the same provider ID points to another endpoint or key',async t=>{
+  const first=await start('first')
+  t.after(()=>first.adapter.close())
+  const second=await start('second')
+  t.after(()=>second.adapter.close())
+  await assert.rejects(first.adapter.identity(),/官方 Codex/)
+  for(const {adapter} of [first,second])adapter.instance.codexProviderMode='native'
+  const initial=await first.adapter.identity()
+  assert.notEqual(initial,await second.adapter.identity())
+  first.adapter.instance.env.MAOQIU_CODEX_FIXTURE_KEY='rotated-fixture-key'
+  assert.notEqual(initial,await first.adapter.identity())
+  const env={OPENAI_API_KEY:'provider-fixture-key',OWNER_TOKEN:'owner-fixture-token'}
+  assert.equal(agentEnvironment({adapterKey:'codex',env}).OPENAI_API_KEY,undefined)
+  const nativeEnv=agentEnvironment({adapterKey:'codex',codexProviderMode:'native',env})
+  assert.equal(nativeEnv.OPENAI_API_KEY,env.OPENAI_API_KEY)
+  assert.equal(nativeEnv.OWNER_TOKEN,undefined)
 })

@@ -92,6 +92,73 @@ async function configure(api,baseUrl,fields={}){
   return configured
 }
 const inputContext=request=>JSON.parse(request.messages.at(-1).content)
+test('桌面工作 Bot 监控按供应商回执记录用量，缺失数据保持未知',async t=>{
+  const {app,api}=await server(t)
+  let calls=0
+  const endpoint=await modelEndpoint(t,(req,res,input,json)=>{
+    assert.equal(req.headers.authorization,'Bearer fixture-monitor-secret')
+    assert.equal(input.model,'fixture/monitor-model')
+    calls++
+    json({...modelChoice('工作 Bot 回执'),...(calls===1?{usage:{prompt_tokens:12,completion_tokens:4,total_tokens:16}}:{})})
+  })
+  const {models}=await api('/chat/models',{action:'save',name:'测试 API Bot',baseUrl:endpoint,
+    model:'fixture/monitor-model',apiKey:'fixture-monitor-secret'})
+  const model=models.at(-1)
+  const bot=await api('/instances/api',{modelId:model.id})
+  app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,online) VALUES('remote','remote','Remote','codex','remote',1)`).run()
+  const work=await api('/threads',{instanceId:bot.id})
+  for(const text of ['测量用量','供应商未提供用量']){
+    const queued=await api('/threads/'+work.id+'/messages',{text})
+    await eventually(()=>app.db.prepare("SELECT id FROM runs WHERE id=? AND status='completed'").get(queued.runId))
+  }
+  const snapshot=app.agentMonitor({days:7})
+  assert.equal(snapshot.days,7)
+  assert.equal(snapshot.instances.length,1)
+  assert.equal(snapshot.instances[0].canRun,true)
+  assert.equal(snapshot.instances[0].model,'fixture/monitor-model')
+  assert.equal(snapshot.usage.length,1)
+  const {source,reportedRuns,inputTokens,outputTokens,totalTokens}=snapshot.usage[0]
+  assert.deepEqual({source,reportedRuns,inputTokens,outputTokens,totalTokens},
+    {source:'api_response',reportedRuns:1,inputTokens:12,outputTokens:4,totalTokens:16})
+  assert.doesNotMatch(JSON.stringify(snapshot),/fixture-monitor-secret/)
+  assert.throws(()=>app.agentQuota('remote'),/本机 Codex/)
+  assert.equal((await api('/chat/models')).activeId,'codex')
+  await api('/chat/models',{action:'toggle',id:model.id,disabled:true})
+  assert.equal(app.agentMonitor().instances[0].issue,'api_configuration')
+  assert.equal(app.agentMonitor().instances[0].canRun,false)
+})
+test('桌面监控仅关联已验证本机 DSH 范围中的原生会话用量',async t=>{
+  const {app,dir}=await server(t)
+  const scope='a'.repeat(64), wrongScope='b'.repeat(64)
+  const addInstance=app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,runtimeScopeId) VALUES(?,?,?,'dsh',?,?)`)
+  addInstance.run('dsh','local','DSH',dir,scope)
+  addInstance.run('remote','remote','Remote',dir,scope)
+  const addThread=app.db.prepare('INSERT INTO threads(id,instanceId,sessionId) VALUES(?,?,?)')
+  addThread.run('bound','dsh','native-session')
+  addThread.run('remote-topic','remote','remote-session')
+  const writeCompanionDb=path=>{
+    const native=new DatabaseSync(path)
+    native.exec(`CREATE TABLE proxy_request_logs(request_id TEXT PRIMARY KEY,session_id TEXT,model TEXT,app_type TEXT,data_source TEXT,
+      created_at INTEGER,input_tokens INTEGER,output_tokens INTEGER,cache_read_tokens INTEGER,cache_creation_tokens INTEGER)`)
+    const write=native.prepare(`INSERT INTO proxy_request_logs VALUES(?,?,'meter-model','dsh',?, ?,6,3,4,2)`)
+    for(const [id,session,source] of [['known','native-session','dsh_session'],['unknown','other-session','dsh_session'],
+      ['remote','remote-session','dsh_session'],['proxy','native-session','proxy']])
+      write.run(id,session,source,Math.floor(Date.now()/1000))
+    native.close()
+  }
+  const databasePath=join(dir,'first.db'), duplicate=join(dir,'duplicate.db')
+  writeCompanionDb(databasePath)
+  writeCompanionDb(duplicate)
+  const instances=[{id:'dsh',runtimeScopeId:scope},{id:'remote',runtimeScopeId:scope}]
+  const monitor=app.agentMonitor({days:7},[{databasePath,instances},{databasePath:duplicate,instances}])
+  assert.equal(monitor.usage.length,1)
+  const {instanceId,reportedRuns,inputTokens,outputTokens,totalTokens,source}=monitor.usage[0]
+  assert.deepEqual({instanceId,reportedRuns,inputTokens,outputTokens,totalTokens,source},
+    {instanceId:'dsh',reportedRuns:1,inputTokens:12,outputTokens:3,totalTokens:15,source:'dsh_session'})
+  assert.equal(app.agentMonitor(undefined,[{databasePath,instances:[{id:'dsh',runtimeScopeId:wrongScope}]}]).usage.length,0)
+  app.db.prepare("UPDATE threads SET nativeReleased=1 WHERE id='bound'").run()
+  assert.equal(app.agentMonitor(undefined,[{databasePath,instances}]).usage.length,0)
+})
 async function replyTo(api,threadId,messageId,kind='message'){
   return eventually(async()=>(await api('/threads/'+threadId)).messages.find(m=>
     m.data.replyTo===messageId&&m.kind===kind&&(kind!=='message'||m.role==='assistant')))
@@ -1396,7 +1463,7 @@ test('旧版主库及连接器库迁移可重复打开，备份恢复前检查�
   legacyConnector.close()
   for(let i=0;i<2;i++){
     const migrated=openDatabase(old)
-    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,9)
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version,10)
     assert.equal(migrated.prepare('SELECT sessionId FROM threads WHERE id=?').get('old-thread').sessionId,'old-session')
     assert.equal(migrated.prepare('SELECT count(*) n FROM run_grants').get().n,0)
     assert.ok(Date.parse(migrated.prepare('SELECT expiresAt FROM grants').get().expiresAt)>Date.now())

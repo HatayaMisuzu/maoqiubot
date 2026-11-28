@@ -1,0 +1,1330 @@
+diff --git a/src-tauri/src/codex_config.rs b/src-tauri/src/codex_config.rs
+index d535ca449b93cd8b4e8c2b6031d06fb45e824114..dcfadf895be5f95c6882ed93fef64bb45224270f 100644
+--- a/src-tauri/src/codex_config.rs
++++ b/src-tauri/src/codex_config.rs
+@@ -285,7 +285,10 @@ pub fn get_codex_config_dir() -> PathBuf {
+         return custom;
+     }
+ 
+-    get_home_dir().join(".codex")
++    std::env::var_os("CODEX_HOME")
++        .map(PathBuf::from)
++        .filter(|path| path.is_absolute())
++        .unwrap_or_else(|| get_home_dir().join(".codex"))
+ }
+ 
+ /// 获取 Codex auth.json 路径
+diff --git a/src-tauri/src/commands/import_export.rs b/src-tauri/src/commands/import_export.rs
+index e2a0ecd78570b0db783ef9fd61d6929bc446f408..c0edd69bc59d3c1e44c81ff749473e81e59272bd 100644
+--- a/src-tauri/src/commands/import_export.rs
++++ b/src-tauri/src/commands/import_export.rs
+@@ -46,34 +46,22 @@ pub async fn export_config_to_file(
+     .map_err(|e: AppError| e.to_string())
+ }
+ 
+-/// 从 SQL 备份导入数据库
++/// Merge configuration cards into the local catalog without activating anything.
+ #[tauri::command]
+ pub async fn import_config_from_file(
+     #[allow(non_snake_case)] filePath: String,
+     state: State<'_, AppState>,
+ ) -> Result<Value, String> {
+-    let app_state_for_sync = state.inner().clone();
+-    let db = app_state_for_sync.db.clone();
+-    run_with_database_restore_lock(move || {
+-        tauri::async_runtime::spawn_blocking(move || {
+-            let path_buf = PathBuf::from(&filePath);
+-            let backup_id = {
+-                // SQL restore replaces the `skills` table. Exclude local Skill
+-                // mutations while the database image is being swapped.
+-                let _skill_state_guard = skill_state_write_guard();
+-                db.import_sql(&path_buf)?
+-            };
+-            let warning =
+-                post_sync_warning_from_result(Ok(run_post_import_sync(&app_state_for_sync)));
+-            if let Some(msg) = warning.as_ref() {
+-                log::warn!("[Import] post-import sync warning: {msg}");
+-            }
+-            Ok::<_, AppError>(success_payload_with_warning(backup_id, warning))
+-        })
++    let db = state.db.clone();
++    tauri::async_runtime::spawn_blocking(move || {
++        let imported = crate::maoqiu_host::legacy_catalog(
++            std::path::Path::new(&filePath), &db, true,
++        )?;
++        Ok::<_, AppError>(json!({ "success": true, "imported": imported }))
+     })
+     .await
+-    .map_err(|e| format!("导入配置失败: {e}"))?
+-    .map_err(|e: AppError| e.to_string())
++    .map_err(|e| e.to_string())?
++    .map_err(|e| e.to_string())
+ }
+ 
+ #[tauri::command]
+@@ -116,7 +104,7 @@ pub async fn open_file_dialog<R: tauri::Runtime>(
+     let dialog = app.dialog();
+     let result = dialog
+         .file()
+-        .add_filter("SQL", &["sql"])
++        .add_filter("CC Switch", &["sql", "db", "sqlite", "sqlite3"])
+         .blocking_pick_file();
+ 
+     Ok(result.map(|p| p.to_string()))
+diff --git a/src-tauri/src/commands/settings.rs b/src-tauri/src/commands/settings.rs
+index 37de5791b4dbb8ce1d1e87aa8323c8e42950b97a..82d873bfcdbfb60b3141a9f3122f2e0166627c2a 100644
+--- a/src-tauri/src/commands/settings.rs
++++ b/src-tauri/src/commands/settings.rs
+@@ -345,7 +345,7 @@ pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
+         crate::cleanup_before_exit(&app).await;
+         // 与自更新共用 restart_process，而不是 app.restart()：macOS 上经
+         // LaunchServices 启动，新窗口才能回到前台。
+-        crate::restart_process(&app);
++        app.exit(0);
+     });
+     Ok(true)
+ }
+diff --git a/src-tauri/src/config.rs b/src-tauri/src/config.rs
+index 85eaef0d8082c931df6b365e1cb6e62026df5335..fd96d3543ceae65453a9439e28406900321fb199 100644
+--- a/src-tauri/src/config.rs
++++ b/src-tauri/src/config.rs
+@@ -312,6 +312,11 @@ pub fn get_claude_settings_path() -> PathBuf {
+ 
+ /// 获取应用配置目录路径 (~/.cc-switch)
+ pub fn get_app_config_dir() -> PathBuf {
++    if let Some(path) = std::env::var_os("MAOQIU_AGENT_MANAGER_DATA").map(PathBuf::from) {
++        if path.is_absolute() {
++            return path;
++        }
++    }
+     if let Some(custom) = crate::app_store::get_app_config_dir_override() {
+         return custom;
+     }
+diff --git a/src-tauri/src/dsh_config.rs b/src-tauri/src/dsh_config.rs
+index ad5aa33f03b2cbbcacbd6ea7d731c52e71f11f4e..11955a97755558161fd26389913c566089e97534 100644
+--- a/src-tauri/src/dsh_config.rs
++++ b/src-tauri/src/dsh_config.rs
+@@ -51,7 +51,9 @@ pub(crate) fn target_paths() -> Vec<PathBuf> {
+         .iter()
+         .filter_map(|name| {
+             let path = profile_path(name);
+-            (DISPLAY_PROFILES.contains(name) || path.exists()).then_some(path)
++            let managed_acp = *name == "acp" && std::env::var_os("DSH_HOME").is_some()
++                && std::env::var_os("MAOQIU_AGENT_MANAGER_DATA").is_some();
++            (DISPLAY_PROFILES.contains(name) || path.exists() || managed_acp).then_some(path)
+         })
+         .filter(|path| {
+             let identity = path_identity(path);
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 56dea01ff548e12ba5e79db7cad1db92c2021523..d6081f94e7a325f48036f615958f9f1d61430bef 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -4,6 +4,7 @@ mod agy_smoke_tests;
+ mod app_config;
+ mod app_store;
+ mod app_update;
++mod maoqiu_host;
+ mod auto_launch;
+ mod claude_desktop_config;
+ mod claude_mcp;
+@@ -102,7 +103,6 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::{fmt, sync::Arc};
+-use tauri::tray::TrayIconBuilder;
+ use tauri::RunEvent;
+ use tauri::{Emitter, Manager};
+ use tauri_plugin_window_state::{AppHandleExt, StateFlags};
+@@ -496,19 +496,6 @@ pub fn run() {
+         );
+     }
+ 
+-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+-    {
+-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+-            log::info!("=== Single Instance Callback Triggered ===");
+-            // Windows 上这个回调跑在主线程处理 WM_COPYDATA 的窗口过程里，第二个实例的
+-            // SendMessage 正等它返回：轻量模式下要在这里同步重建主窗口，WebView2 会把主线程
+-            // 卡死（托盘随之无响应）。挪到后台线程，建窗口改由事件循环处理，和 macOS / Linux
+-            // 本来就不在主线程上调用一致。
+-            let app = app.clone();
+-            tauri::async_runtime::spawn_blocking(move || handle_second_instance(&app, args));
+-        }));
+-    }
+-
+     #[cfg(target_os = "windows")]
+     {
+         let startup_page_handled = AtomicBool::new(false);
+@@ -517,7 +504,6 @@ pub fn run() {
+                 && payload.event() == tauri::webview::PageLoadEvent::Finished
+                 && payload.url().scheme() != "about"
+                 && !startup_page_handled.swap(true, Ordering::Relaxed)
+-                && !crate::settings::get_settings().silent_startup
+             {
+                 let window = webview.window();
+                 if let Some(main) = webview.app_handle().get_webview_window("main") {
+@@ -542,30 +528,8 @@ pub fn run() {
+             }
+             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                 log::info!("收到窗口关闭请求: label={}", window.label());
+-                // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
+-                let in_db_recovery = crate::init_status::get_init_error()
+-                    .map(|p| p.kind.as_deref() == Some("db_version_too_new"))
+-                    .unwrap_or(false);
+-                if in_db_recovery {
+-                    api.prevent_close();
+-                    window.app_handle().exit(0);
+-                    return;
+-                }
+-
+-                let settings = crate::settings::get_settings();
+-
+-                if settings.minimize_to_tray_on_close {
+-                    api.prevent_close();
+-                    #[cfg(target_os = "macos")]
+-                    if window.label() == "main" && macos_tray_window::close_to_tray(window) {
+-                        return;
+-                    }
+-                    tray::hide_main_to_tray(window);
+-                } else {
+-                    api.prevent_close();
+-                    log::info!("关闭请求已处理：退出应用");
+-                    window.app_handle().exit(0);
+-                }
++                api.prevent_close();
++                window.app_handle().exit(0);
+             }
+         })
+         .plugin(tauri_plugin_process::init())
+@@ -636,18 +600,6 @@ pub fn run() {
+             #[cfg(target_os = "windows")]
+             set_windows_app_user_model_id(app.handle());
+ 
+-            // 注册 Updater 插件（桌面端）；放在 logger 之后，确保失败可诊断。
+-            #[cfg(desktop)]
+-            {
+-                if let Err(e) = app
+-                    .handle()
+-                    .plugin(tauri_plugin_updater::Builder::new().build())
+-                {
+-                    // 若配置不完整（如缺少 pubkey），跳过 Updater 而不中断应用
+-                    log::warn!("初始化 Updater 插件失败，已跳过：{e}");
+-                }
+-            }
+-
+             // 注入 AppHandle 给 usage_events，让无 AppHandle 持有的写日志路径
+             // 也能向前端推送 `usage-log-recorded`。
+             // 放在日志系统初始化之后，确保 init 的日志能正常输出。
+@@ -903,10 +855,6 @@ pub fn run() {
+                 }
+             }
+ 
+-            if let Err(error) = crate::services::provider::initialize_dsh_profiles(&app_state) {
+-                log::warn!("Initializing DeepSeek Harness profiles failed: {error}");
+-            }
+-
+             match app_state.db.init_default_official_providers() {
+                 Ok(count) if count > 0 => {
+                     log::info!("✓ Seeded {count} official provider(s)");
+@@ -915,94 +863,6 @@ pub fn run() {
+                 Err(e) => log::warn!("✗ Failed to seed official providers: {e}"),
+             }
+ 
+-            {
+-                let db_for_codex_history_migration = app_state.db.clone();
+-                tauri::async_runtime::spawn_blocking(move || {
+-                    match crate::codex_history_migration::maybe_migrate_codex_third_party_history_provider_bucket(
+-                        &db_for_codex_history_migration,
+-                    ) {
+-                        Ok(outcome) => {
+-                            if let Some(reason) = outcome.skipped_reason {
+-                                log::debug!("○ Codex history provider bucket migration skipped: {reason}");
+-                            } else {
+-                                log::info!(
+-                                    "✓ Codex history provider bucket migration completed: sources={}, jsonl_files={}, state_rows={}",
+-                                    outcome.source_provider_ids.len(),
+-                                    outcome.migrated_jsonl_files,
+-                                    outcome.migrated_state_rows
+-                                );
+-                            }
+-                        }
+-                        Err(e) => {
+-                            log::warn!("✗ Codex history provider bucket migration failed: {e}");
+-                        }
+-                    }
+-
+-                    match crate::codex_history_migration::maybe_migrate_codex_provider_template_bucket(
+-                        &db_for_codex_history_migration,
+-                    ) {
+-                        Ok(outcome) => {
+-                            if let Some(reason) = outcome.skipped_reason {
+-                                log::debug!("○ Codex provider template bucket migration skipped: {reason}");
+-                            } else if !outcome.migrated_provider_ids.is_empty() {
+-                                log::info!(
+-                                    "✓ Codex provider template bucket migration completed: providers={}",
+-                                    outcome.migrated_provider_ids.len()
+-                                );
+-                            }
+-                        }
+-                        Err(e) => {
+-                            log::warn!("✗ Codex provider template bucket migration failed: {e}");
+-                        }
+-                    }
+-
+-                    // 旧版官方路由桶（cc-switch-official）迁回 openai，须在统一迁移之前：
+-                    // 开关开着时，紧接着的统一迁移会把它们按正常流程带进 custom。
+-                    match crate::codex_history_migration::maybe_migrate_codex_legacy_official_history_to_openai_bucket() {
+-                        Ok(outcome) => {
+-                            if let Some(reason) = outcome.skipped_reason {
+-                                log::debug!("○ Codex legacy official history bucket migration skipped: {reason}");
+-                            } else {
+-                                log::info!(
+-                                    "✓ Codex legacy official history bucket migration completed: jsonl_files={}, state_rows={}",
+-                                    outcome.migrated_jsonl_files,
+-                                    outcome.migrated_state_rows
+-                                );
+-                            }
+-                        }
+-                        Err(e) => {
+-                            log::warn!("✗ Codex legacy official history bucket migration failed: {e}");
+-                        }
+-                    }
+-
+-                    // 统一会话开关的官方历史迁移：开关开着且勾选了迁入既有会话时，每次启动
+-                    // 都把留在 openai 桶的会话迁进 custom（新版 Codex 会把它们锁成只读）；
+-                    // 函数内部自门控，state DB 里没有 openai 线程时直接跳过。
+-                    match crate::codex_history_migration::maybe_migrate_codex_official_history_to_unified_bucket() {
+-                        Ok(outcome) => {
+-                            if let Some(reason) = outcome.skipped_reason {
+-                                log::debug!("○ Codex official history unify migration skipped: {reason}");
+-                            } else {
+-                                log::info!(
+-                                    "✓ Codex official history unify migration completed: jsonl_files={}, state_rows={}",
+-                                    outcome.migrated_jsonl_files,
+-                                    outcome.migrated_state_rows
+-                                );
+-                            }
+-                        }
+-                        Err(e) => {
+-                            log::warn!("✗ Codex official history unify migration failed: {e}");
+-                        }
+-                    }
+-                });
+-            }
+-
+-            // 老用户 / 已确认的路径由 `fresh_install_at_startup` 自行拦截，这里不做写入。
+-            // 字段只由前端在用户点击"我知道了"时 save_settings 回写，语义是"用户显式确认过"。
+-            if !first_run_already_confirmed && fresh_install_at_startup {
+-                log::info!("✓ First-run welcome notice pending");
+-            }
+-
+             // 1.6. 自动同步累加模式应用的原生 providers 到数据库
+             //
+             // additive 模式的 import 函数按 id 幂等——
+@@ -1161,129 +1021,8 @@ pub fn run() {
+ 
+             // 启动阶段不再无条件保存,避免意外覆盖用户配置。
+ 
+-            // 注册 deep-link URL 处理器（使用正确的 DeepLinkExt API）
+-            log::info!("=== Registering deep-link URL handler ===");
++            maoqiu_host::listen_for_owner(app.handle().clone());
+ 
+-            // Linux 和 Windows 调试模式需要显式注册
+-            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+-            {
+-                #[cfg(target_os = "linux")]
+-                {
+-                    // Use Tauri's path API to get correct path (includes app identifier)
+-                    // tauri-plugin-deep-link writes to: ~/.local/share/com.ccswitch.desktop/applications/cc-switch-handler.desktop
+-                    // Only register if .desktop file doesn't exist to avoid overwriting user customizations
+-                    let should_register = app
+-                        .path()
+-                        .data_dir()
+-                        .map(|d| !d.join("applications/cc-switch-handler.desktop").exists())
+-                        .unwrap_or(true);
+-
+-                    if should_register {
+-                        if let Err(e) = app.deep_link().register_all() {
+-                            log::error!("✗ Failed to register deep link schemes: {}", e);
+-                        } else {
+-                            log::info!("✓ Deep link schemes registered (Linux)");
+-                        }
+-                    } else {
+-                        log::info!("⊘ Deep link handler already exists, skipping registration");
+-                    }
+-                }
+-
+-                #[cfg(all(debug_assertions, windows))]
+-                {
+-                    if let Err(e) = app.deep_link().register_all() {
+-                        log::error!("✗ Failed to register deep link schemes: {}", e);
+-                    } else {
+-                        log::info!("✓ Deep link schemes registered (Windows debug)");
+-                    }
+-                }
+-            }
+-
+-            // 注册 URL 处理回调（所有平台通用）
+-            app.deep_link().on_open_url({
+-                let app_handle = app.handle().clone();
+-                move |event| {
+-                    log::info!("=== Deep Link Event Received (on_open_url) ===");
+-                    let urls = event.urls();
+-                    log::info!("Received {} URL(s)", urls.len());
+-
+-                    if crate::lightweight::is_lightweight_mode() {
+-                        if let Err(e) = crate::lightweight::exit_lightweight_mode(&app_handle) {
+-                            log::error!("退出轻量模式重建窗口失败: {e}");
+-                        }
+-                    }
+-
+-                    for (i, url) in urls.iter().enumerate() {
+-                        let url_str = url.as_str();
+-                        log::debug!("  URL[{i}]: {}", url_for_log(url_str));
+-
+-                        if handle_deeplink_url(&app_handle, url_str, true, "on_open_url") {
+-                            break; // Process only first ccswitch:// URL
+-                        }
+-                    }
+-                }
+-            });
+-            log::info!("✓ Deep-link URL handler registered");
+-
+-            // 冷启动补取：Windows/Linux 上插件在自身初始化时就解析了启动参数并发出事件，
+-            // macOS 的 Opened 也可能早于这里，都赶在上面的回调注册之前，只能从 get_current 取。
+-            // 万一两边都处理了同一条链接也无妨：暂存区只留最新一条，前端处理完就清除。
+-            let mut startup_deeplink = false;
+-            match app.deep_link().get_current() {
+-                Ok(Some(urls)) => {
+-                    for url in urls {
+-                        if handle_deeplink_url(app.handle(), url.as_str(), true, "get_current") {
+-                            startup_deeplink = true;
+-                            break;
+-                        }
+-                    }
+-                }
+-                Ok(None) => {}
+-                Err(e) => log::warn!("读取启动时的深链接失败: {e}"),
+-            }
+-
+-            // 构建托盘：Windows 左键打开主界面，右键默认弹出面板；macOS 左右键默认都弹出面板。
+-            // 设置里打开「原生托盘菜单」就挂原生菜单（`tray::apply_tray_style` 运行时切换）。
+-            // Linux（AppIndicator）不派发点击事件，只能出原生菜单，菜单里有一项打开面板。
+-            let native_menu = tray_panel::uses_native_menu();
+-            let mut tray_builder = TrayIconBuilder::with_id(tray::TRAY_ID)
+-                .on_tray_icon_event(tray::handle_tray_icon_event)
+-                .on_menu_event(|app, event| {
+-                    tray::handle_tray_menu_event(app, &event.id.0);
+-                })
+-                .show_menu_on_left_click(tray::native_menu_on_left_click(native_menu));
+-            // 鼠标悬停提示（macOS 不设，见 `tray::TRAY_TOOLTIP_ENABLED`）
+-            if tray::TRAY_TOOLTIP_ENABLED {
+-                tray_builder = tray_builder.tooltip("CC Switch");
+-            }
+-            if native_menu {
+-                let menu = tray::create_tray_menu(app.handle(), &app_state)?;
+-                tray_builder = tray_builder.menu(&menu);
+-            }
+-
+-            // 使用平台对应的托盘图标（macOS 使用模板图标适配深浅色）；出问题时 tray.rs 换成带圆点的那张
+-            if let Some((icon, template)) = tray::base_tray_icon(app.handle()) {
+-                tray_builder = tray_builder.icon(icon).icon_as_template(template);
+-            }
+-
+-            // Linux 托盘需要把图标写入磁盘。WSL 的 XDG_RUNTIME_DIR 可能指向
+-            // 不存在或不可写的目录，使用应用缓存目录避免因此中止启动。
+-            #[cfg(target_os = "linux")]
+-            {
+-                tray_builder =
+-                    tray_builder.temp_dir_path(app.path().app_cache_dir()?.join("tray-icon"));
+-            }
+-
+-            let _tray = tray_builder.build(app)?;
+-            #[cfg(target_os = "windows")]
+-            tray_compat::install(app.handle());
+-            crate::services::auto_sync::start_worker::<
+-                crate::services::webdav_auto_sync::WebDavAutoSync,
+-            >(app_state.db.clone(), app.handle().clone());
+-            crate::services::auto_sync::start_worker::<crate::services::s3_auto_sync::S3AutoSync>(
+-                app_state.db.clone(),
+-                app.handle().clone(),
+-            );
+             // 将同一个实例注入到全局状态，避免重复创建导致的不一致
+             app.manage(app_state);
+             app.manage(services::kimi_oauth::KimiOAuthManager::default());
+@@ -1399,43 +1138,12 @@ pub fn run() {
+                 }
+             }
+ 
+-            // 自动更新：开关打开时后台定时检查并下载新版本（装不装由用户确认）
+-            crate::app_update::spawn_background_loop(app.handle().clone());
+-
+-            // 异常退出恢复 + 代理状态自动恢复
+             let app_handle = app.handle().clone();
+             tauri::async_runtime::spawn(async move {
+                 let state = app_handle.state::<AppState>();
+ 
+-                // 必须排在 auto-extract 之前：先把历史泄漏进 Gemini 共享片段的凭据
+-                // 清干净，否则紧接着的提取会基于被污染的 live 再写一遍。
+-                if let Err(e) =
+-                    crate::services::provider::ProviderService::scrub_leaked_gemini_common_config(
+-                        &state,
+-                    )
+-                    .await
+-                {
+-                    log::warn!("清理 Gemini 通用配置泄漏凭据失败: {e}");
+-                }
+-
+                 initialize_common_config_snippets(&state);
+ 
+-                // 定下各应用的直连 / 代理模式（处理旧版遗留的接管状态），再把代理模式的
+-                // 应用接上。要排在通用配置片段的自动提取之后：它读的是直连的 live。
+-                crate::mode::controller::startup(&state).await;
+-                // #8268 测试版给 agy 装过包装脚本、改过 shell 启动文件，撤掉带标记的部分。
+-                if let Err(e) =
+-                    crate::services::provider::agy_direct::migrate_legacy_launcher(&state.db)
+-                {
+-                    log::warn!("清理旧版 agy 启动器失败: {e}");
+-                }
+-                // 启动流程走完：托盘这时才开始报「路由服务没在运行」，并记下退回直连的应用。
+-                crate::tray::mark_startup_settled(&app_handle);
+-                // Codex 官方做路由、发布了 Stack 模型时，官方模型列表过期就在后台刷新。
+-                crate::services::provider::codex_official_models::start_background_checks(
+-                    state.inner().clone(),
+-                );
+-
+                 // Backup and log maintenance can hold the database lock for a
+                 // long time. Keep disk work off both the UI and async workers.
+                 // The first interval tick runs startup maintenance; later ticks
+@@ -1513,6 +1221,7 @@ pub fn run() {
+             });
+ 
+             // 静默启动：根据设置决定是否显示主窗口
++            #[cfg(target_os = "linux")]
+             let settings = crate::settings::get_settings();
+             if let Some(window) = app.get_webview_window("main") {
+                 // 在窗口首次显示前同步装饰状态，避免前端加载后再切换导致标题栏闪烁
+@@ -1528,45 +1237,14 @@ pub fn run() {
+                 // window-state 插件恢复的位置可能压在任务栏 / Dock 下面，首次显示前收回工作区。
+                 // 放在装饰设置之后，按最终的窗口外框计算。
+                 window_fit::fit_to_work_area(&window);
+-                // 上次退出时在轻量模式：照旧只留托盘。由深链接冷启动的要给用户看导入对话框，正常启动。
+-                if settings.lightweight_mode && !startup_deeplink {
+-                    if let Err(e) = crate::lightweight::enter_lightweight_mode(app.handle()) {
+-                        log::error!("启动时恢复轻量模式失败: {e}");
+-                    } else {
+-                        log::info!("上次退出时在轻量模式，启动后已恢复");
+-                    }
+-                } else if settings.silent_startup {
+-                    // 静默启动模式：保持窗口隐藏
+-                    if window.hide().is_ok() {
+-                        let _ = window.emit("main-window-visibility-changed", ());
+-                    }
+-                    #[cfg(target_os = "windows")]
+-                    let _ = window.set_skip_taskbar(true);
+-                    #[cfg(target_os = "macos")]
+-                    tray::apply_tray_policy(app.handle(), false);
+-                    log::info!("静默启动模式：主窗口已隐藏");
+-                } else {
+-                    // 正常启动模式：显示窗口
+-                    #[cfg(not(target_os = "windows"))]
+-                    if window.show().is_ok() {
+-                        let _ = window.emit("main-window-visibility-changed", ());
+-                    }
+-                    #[cfg(target_os = "windows")]
+-                    log::info!("正常启动模式：等待主页面加载完成后显示主窗口");
+-                    #[cfg(not(target_os = "windows"))]
+-                    log::info!("正常启动模式：主窗口已显示");
+-
+-                    // Linux: 解决首次启动 UI 无响应问题（Tauri #10746 + wry #637）。
+-                    // 启动时 webview 未获取焦点 + surface 尺寸协商失败，导致点击无效。
+-                    // 这里做 set_focus + 伪 resize，等价于无视觉版本的"最大化-还原"。
+-                    #[cfg(target_os = "linux")]
+-                    {
+-                        linux_fix::nudge_main_window(window.clone(), "startup");
+-                    }
++                #[cfg(not(target_os = "windows"))]
++                if window.show().is_ok() {
++                    let _ = window.emit("main-window-visibility-changed", ());
+                 }
++                #[cfg(target_os = "linux")]
++                linux_fix::nudge_main_window(window.clone(), "startup");
+             }
+ 
+-
+             Ok(())
+         })
+         .invoke_handler(tauri::generate_handler![
+@@ -1614,12 +1292,7 @@ pub fn run() {
+             commands::get_log_config,
+             commands::set_log_config,
+             commands::restart_app,
+-            commands::install_update_and_restart,
+-            commands::get_auto_update_status,
+-            commands::download_app_update,
+-            commands::check_app_update_available,
+-            commands::check_for_updates,
+-            commands::open_portable_update_download,
++            maoqiu_host::preview_legacy_config,
+             commands::is_portable_mode,
+             commands::copy_text_to_clipboard,
+             commands::list_installed_plugins,
+@@ -1697,24 +1370,13 @@ pub fn run() {
+             commands::remove_custom_endpoint,
+             // app_config_dir override via Store
+             commands::get_app_config_dir_override,
+-            commands::set_app_config_dir_override,
+             // provider sort order management
+             commands::update_providers_sort_order,
+             // theirs: config import/export and dialogs
+             commands::export_config_to_file,
+             commands::import_config_from_file,
+-            commands::webdav_test_connection,
+-            commands::webdav_sync_upload,
+-            commands::webdav_sync_download,
+-            commands::webdav_sync_save_settings,
+             commands::webdav_sync_clear_settings,
+-            commands::webdav_sync_fetch_remote_info,
+-            commands::s3_test_connection,
+-            commands::s3_sync_upload,
+-            commands::s3_sync_download,
+-            commands::s3_sync_save_settings,
+             commands::s3_sync_clear_settings,
+-            commands::s3_sync_fetch_remote_info,
+             commands::save_file_dialog,
+             commands::open_file_dialog,
+             commands::open_zip_file_dialog,
+@@ -1723,10 +1385,8 @@ pub fn run() {
+             commands::list_backup_locations,
+             commands::delete_backup_location,
+             commands::reveal_backup_location,
+-            commands::restore_db_backup,
+             commands::rename_db_backup,
+             commands::delete_db_backup,
+-            commands::sync_current_providers_live,
+             // Deep link import
+             commands::merge_deeplink_config,
+             commands::fetch_deeplink_icon,
+@@ -1767,15 +1427,11 @@ pub fn run() {
+             commands::delete_skill_repo_token,
+             commands::install_skills_from_zip,
+             // Auto launch
+-            commands::set_auto_launch,
+             // Proxy server management
+-            commands::start_proxy_server,
+             commands::stop_proxy_server,
+             commands::stop_proxy_with_restore,
+             commands::get_proxy_takeover_status,
+-            commands::set_proxy_takeover_for_app,
+             commands::get_app_mode,
+-            commands::set_proxy_route,
+             commands::take_startup_attach_failures,
+             tray::take_tray_navigation,
+             tray_panel::tray_panel_state,
+@@ -1796,8 +1452,6 @@ pub fn run() {
+             commands::get_pricing_model_source,
+             commands::set_pricing_model_source,
+             commands::get_proxy_stack,
+-            commands::set_proxy_stack_member,
+-            commands::adopt_codex_stack_catalog,
+             commands::restart_codex_app_server_daemon,
+             commands::acknowledge_codex_stale_clients,
+             // Proxy failover commands
+@@ -1807,7 +1461,6 @@ pub fn run() {
+             commands::add_to_failover_queue,
+             commands::remove_from_failover_queue,
+             commands::get_auto_failover_enabled,
+-            commands::set_auto_failover_enabled,
+             // Usage statistics
+             commands::get_usage_summary,
+             commands::get_session_usage_summary,
+@@ -1845,9 +1498,6 @@ pub fn run() {
+             commands::get_session_image,
+             commands::reveal_session_path,
+             commands::export_session_markdown,
+-            commands::delete_session,
+-            commands::delete_sessions,
+-            commands::launch_session_terminal,
+             commands::get_tool_versions,
+             commands::run_tool_lifecycle_action,
+             commands::prepare_tool_uninstall,
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index f5329eedaa22306ea17588bf35a9e51f49b25b43..f11b528f52930eb547cf306229e58ff7ae7436a9 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -2,6 +2,13 @@
+ #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+ 
+ fn main() {
++    let Some(data_dir) = std::env::var_os("MAOQIU_AGENT_MANAGER_DATA") else {
++        return;
++    };
++    let data_dir = std::path::Path::new(&data_dir);
++    if !data_dir.is_absolute() || std::fs::create_dir_all(data_dir).is_err() {
++        std::process::exit(2);
++    }
+     // 在 Linux 上设置 WebKit 环境变量以解决 DMA-BUF 渲染问题
+     // 某些 Linux 系统（如 Debian 13.2、Nvidia GPU）上 WebKitGTK 的 DMA-BUF 渲染器可能导致白屏/黑屏
+     // 参考: https://github.com/tauri-apps/tauri/issues/9394
+diff --git a/src-tauri/src/maoqiu_host.rs b/src-tauri/src/maoqiu_host.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b96a781f53e6bc2334e17318e05a43b1ea8077b
+--- /dev/null
++++ b/src-tauri/src/maoqiu_host.rs
+@@ -0,0 +1,187 @@
++use std::{
++    io::{self, BufRead},
++    path::Path,
++};
++use rusqlite::{Connection, OpenFlags};
++use serde::Serialize;
++use tauri::{AppHandle, Manager, State};
++
++use crate::{database::Database, error::AppError, store::AppState};
++
++/// The Electron owner holds this pipe open until it exits.
++pub(crate) fn listen_for_owner(app: AppHandle) {
++    std::thread::spawn(move || {
++        for line in io::stdin().lock().lines() {
++            match line.as_deref() {
++                Ok("show") => {
++                    if let Some(window) = app.get_webview_window("main") {
++                        let _ = window.unminimize();
++                        let _ = window.show();
++                        let _ = window.set_focus();
++                    }
++                }
++                Ok("quit") | Err(_) => break,
++                _ => {}
++            }
++        }
++        app.exit(0);
++    });
++}
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++pub(crate) struct CatalogImport {
++    providers: usize,
++    mcp_servers: usize,
++    prompts: usize,
++    skill_repos: usize,
++}
++
++const PROVIDER_COLUMNS: &[&str] = &[
++    "id", "app_type", "name", "settings_config", "website_url", "category",
++    "created_at", "sort_index", "notes", "icon", "icon_color", "meta",
++];
++const MCP_COLUMNS: &[&str] = &[
++    "id", "name", "server_config", "description", "homepage", "docs", "tags",
++];
++const PROMPT_COLUMNS: &[&str] = &[
++    "id", "app_type", "name", "content", "description", "created_at", "updated_at", "enabled",
++];
++const SKILL_REPO_COLUMNS: &[&str] = &["owner", "name", "branch", "host", "enabled"];
++
++fn merge_rows(
++    source: &Connection,
++    destination: &Connection,
++    table: &str,
++    columns: &[&str],
++    select: &str,
++    conflict: &str,
++) -> Result<usize, AppError> {
++    let mut source_rows = source.prepare(&format!("SELECT {select} FROM {table} LIMIT 10001"))?;
++    let mut read = source_rows.query([])?;
++    let parameters = vec!["?"; columns.len()].join(",");
++    let mut write = destination.prepare(&format!(
++        "INSERT INTO {table} ({}) VALUES ({parameters}) ON CONFLICT ({conflict}) DO NOTHING",
++        columns.join(",")
++    ))?;
++    let mut copied = 0;
++    let mut rows_seen = 0;
++    while let Some(row) = read.next()? {
++        rows_seen += 1;
++        if rows_seen > 10_000 {
++            return Err(AppError::Message("导入配置记录过多".into()));
++        }
++        let values = (0..columns.len())
++            .map(|index| row.get::<_, rusqlite::types::Value>(index))
++            .collect::<Result<Vec<_>, _>>()?;
++        copied += write.execute(rusqlite::params_from_iter(values))?;
++    }
++    Ok(copied)
++}
++
++fn merge_catalog(
++    source: &Connection,
++    destination: &mut Connection,
++    apply: bool,
++) -> Result<CatalogImport, AppError> {
++    let transaction = destination.transaction()?;
++    let providers = merge_rows(
++        source, &transaction, "providers", PROVIDER_COLUMNS,
++        "id, app_type, name, settings_config, website_url, category, created_at, sort_index, notes,
++         icon, icon_color, CASE WHEN json_valid(meta) THEN json_remove(meta, '$.liveConfigManaged') ELSE '{}' END",
++        "id, app_type",
++    )?;
++    let mcp_servers = merge_rows(
++        source, &transaction, "mcp_servers", MCP_COLUMNS, &MCP_COLUMNS.join(","), "id",
++    )?;
++    let prompts = merge_rows(
++        source, &transaction, "prompts", PROMPT_COLUMNS,
++        "id, app_type, name, content, description, created_at, updated_at, 0", "id, app_type",
++    )?;
++    let skill_repos = merge_rows(
++        source, &transaction, "skill_repos", SKILL_REPO_COLUMNS,
++        "owner, name, branch, host, 0", "owner, name",
++    )?;
++    if apply {
++        transaction.commit()?;
++    } else {
++        transaction.rollback()?;
++    }
++    Ok(CatalogImport { providers, mcp_servers, prompts, skill_repos })
++}
++
++pub(crate) fn legacy_catalog(
++    source: &Path,
++    destination: &Database,
++    apply: bool,
++) -> Result<CatalogImport, AppError> {
++    if !source.is_file() {
++        return Err(AppError::Message("请选择 CC Switch 的配置数据库或 SQL 导出文件".into()));
++    }
++    let conn = if source.extension().is_some_and(|suffix| suffix.eq_ignore_ascii_case("sql")) {
++        let staging = Database::memory()?;
++        // Reuse the upstream SQL validator, authorizer and time/size limits.
++        staging.import_sql(source)?;
++        staging.snapshot_to_memory()?
++    } else {
++        Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?
++    };
++    conn.execute_batch("PRAGMA query_only = ON; PRAGMA trusted_schema = OFF;")?;
++    let mut destination = destination.conn.lock().map_err(|_| {
++        AppError::Database("无法打开管理设置数据库".into())
++    })?;
++    merge_catalog(&conn, &mut destination, apply)
++}
++
++#[tauri::command]
++pub(crate) async fn preview_legacy_config(
++    file_path: String,
++    state: State<'_, AppState>,
++) -> Result<CatalogImport, String> {
++    let db = state.db.clone();
++    tauri::async_runtime::spawn_blocking(move || legacy_catalog(Path::new(&file_path), &db, false))
++        .await
++        .map_err(|error| error.to_string())?
++        .map_err(|error| error.to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn preview_and_merge_preserve_local_and_do_not_enable_imported_items() {
++        let source = Database::memory().unwrap();
++        let destination = Database::memory().unwrap();
++        let source = source.conn.lock().unwrap();
++        let mut destination = destination.conn.lock().unwrap();
++        source.execute_batch(
++            "INSERT INTO providers (id, app_type, name, settings_config, is_current, meta)
++             VALUES ('legacy', 'dsh', 'Imported', '{}', 1, '{\"liveConfigManaged\":true}'),
++                    ('same', 'dsh', 'Old', '{}', 1, '{}');
++             INSERT INTO prompts (id, app_type, name, content, enabled)
++             VALUES ('prompt', 'dsh', 'Imported prompt', 'text', 1);
++             INSERT INTO mcp_servers (id, name, server_config, enabled_dsh)
++             VALUES ('mcp', 'Imported MCP', '{}', 1);",
++        ).unwrap();
++        destination.execute_batch(
++            "INSERT INTO providers (id, app_type, name, settings_config)
++             VALUES ('same', 'dsh', 'Local', '{}');",
++        ).unwrap();
++        assert_eq!(merge_catalog(&source, &mut destination, false).unwrap().providers, 1);
++        let count: i64 = destination.query_row(
++            "SELECT COUNT(*) FROM providers WHERE id = 'legacy'", [], |row| row.get(0)
++        ).unwrap();
++        assert_eq!(count, 0);
++        assert_eq!(merge_catalog(&source, &mut destination, true).unwrap().providers, 1);
++        assert_eq!(merge_catalog(&source, &mut destination, true).unwrap().providers, 0);
++        let options: (String, bool, bool, bool) = destination.query_row(
++            "SELECT (SELECT name FROM providers WHERE id = 'same'),
++                    (SELECT is_current FROM providers WHERE id = 'legacy'),
++                    (SELECT enabled FROM prompts WHERE id = 'prompt'),
++                    (SELECT enabled_dsh FROM mcp_servers WHERE id = 'mcp')",
++            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
++        ).unwrap();
++        assert_eq!(options, ("Local".into(), false, false, false));
++    }
++}
+diff --git a/src-tauri/src/services/skill.rs b/src-tauri/src/services/skill.rs
+index 69b980461901d69e6efeef6f33338916c6542820..e76f7d10cba77708cfd0b1ca0b0424983232232e 100644
+--- a/src-tauri/src/services/skill.rs
++++ b/src-tauri/src/services/skill.rs
+@@ -795,7 +795,7 @@ impl SkillService {
+             AppType::Codebuddy => crate::codebuddy_config::data_dir().join("skills"),
+             AppType::Claude => home.join(".claude").join("skills"),
+             AppType::ClaudeDesktop => home.join(".claude-desktop").join("skills"),
+-            AppType::Codex => home.join(".codex").join("skills"),
++            AppType::Codex => crate::codex_config::get_codex_config_dir().join("skills"),
+             AppType::Gemini => home.join(".gemini").join("skills"),
+             AppType::GrokBuild => home.join(".grok").join("skills"),
+             AppType::OpenCode => home.join(".config").join("opencode").join("skills"),
+diff --git a/src-tauri/src/settings.rs b/src-tauri/src/settings.rs
+index be57bebb6ac1d170f62329c6edbe02ab91f4ca32..30da531223958eaa9ed8b9a05011ae9ffe63a584 100644
+--- a/src-tauri/src/settings.rs
++++ b/src-tauri/src/settings.rs
+@@ -1321,6 +1321,21 @@ pub fn reload_settings() -> Result<(), AppError> {
+ 
+ /// 用户在设置里为该应用指定的配置目录。没有目录覆盖项的应用返回 `None`。
+ pub fn get_override_dir(app: &AppType) -> Option<PathBuf> {
++    if std::env::var_os("MAOQIU_AGENT_MANAGER_DATA").is_some() {
++        let native_home = match app {
++            AppType::Codex => Some("CODEX_HOME"),
++            AppType::Dsh => Some("DSH_HOME"),
++            AppType::Hermes => Some("HERMES_HOME"),
++            _ => None,
++        };
++        if let Some(path) = native_home
++            .and_then(std::env::var_os)
++            .map(PathBuf::from)
++            .filter(|path| path.is_absolute())
++        {
++            return Some(path);
++        }
++    }
+     let settings = read_settings();
+     let dir = match app {
+         AppType::Claude => &settings.claude_config_dir,
+diff --git a/src-tauri/tauri.conf.json b/src-tauri/tauri.conf.json
+index 3357482f3a32d990b576b6365521add908cc657c..d1dd4e50994e24fe3b5cbe47265946988764432e 100644
+--- a/src-tauri/tauri.conf.json
++++ b/src-tauri/tauri.conf.json
+@@ -1,8 +1,8 @@
+ {
+   "$schema": "https://schema.tauri.app/config/2",
+-  "productName": "CC Switch",
++  "productName": "小毛球外接 Agent 管理",
+   "version": "4.0.43",
+-  "identifier": "com.ccswitch.desktop",
++  "identifier": "com.xiaomaoqiu.agent-manager",
+   "build": {
+     "frontendDist": "../dist",
+     "devUrl": "http://localhost:3000",
+@@ -14,9 +14,12 @@
+     "windows": [
+       {
+         "label": "main",
+-        "title": "",
++        "title": "小毛球 · 外接 Agent 管理",
+         "titleBarStyle": "Overlay",
+-        "trafficLightPosition": { "x": 14, "y": 16 },
++        "trafficLightPosition": {
++          "x": 14,
++          "y": 16
++        },
+         "width": 1000,
+         "height": 650,
+         "minWidth": 900,
+@@ -36,9 +39,9 @@
+     }
+   },
+   "bundle": {
+-    "active": true,
++    "active": false,
+     "targets": "all",
+-    "createUpdaterArtifacts": true,
++    "createUpdaterArtifacts": false,
+     "icon": [
+       "icons/32x32.png",
+       "icons/128x128.png",
+@@ -58,15 +61,8 @@
+   "plugins": {
+     "deep-link": {
+       "desktop": {
+-        "schemes": ["ccswitch"]
++        "schemes": []
+       }
+-    },
+-    "updater": {
+-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM4MDI4QzlBNTczOTI4RTMKUldUaktEbFhtb3dDeUM5US9kT0FmdGR5Ti9vQzcwa2dTMlpibDVDUmQ2M0VGTzVOWnd0SGpFVlEK",
+-      "endpoints": [
+-        "https://dl.ccswitch.io/latest.json",
+-        "https://github.com/farion1231/cc-switch/releases/latest/download/latest.json"
+-      ]
+     }
+   }
+ }
+diff --git a/src/App.tsx b/src/App.tsx
+index f8476540dcd5feb3aa185e2c5793f7df3f237377..f646576d6aaf79036240f26108bc9598cedc2ee5 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -107,7 +107,6 @@ import { proxyApi } from "@/lib/api/proxy";
+ import type { AppMode, StartupAttachFailure } from "@/types/proxy";
+ import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
+ import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
+-import { WhatsNewNotice } from "@/components/WhatsNewDialog";
+ import { Badge } from "@/components/ui/badge";
+ import { Button } from "@/components/ui/button";
+ import { HoverTip } from "@/components/ui/hover-tip";
+@@ -2089,7 +2088,6 @@ function App() {
+       <DeepLinkImportDialog />
+       <FirstRunNoticeDialog />
+       <NewLayoutDialog />
+-      <WhatsNewNotice />
+     </WindowControlsContext.Provider>
+   );
+ }
+diff --git a/src/components/sessions/utils.ts b/src/components/sessions/utils.ts
+index 2da3387f5e36f7abbb36eaccda1dd3dc12cafb90..74f62caf3dbedc62104f12cbce87251d52236b7e 100644
+--- a/src/components/sessions/utils.ts
++++ b/src/components/sessions/utils.ts
+@@ -82,8 +82,7 @@ export const nativeDeleteHintKey = (
+       : undefined
+     : NATIVE_DELETE_HINT_KEYS[session.providerId];
+ 
+-export const canDeleteSession = (session: SessionMeta) =>
+-  Boolean(session.sourcePath) && !nativeDeleteHintKey(session);
++export const canDeleteSession = (_session: SessionMeta) => false;
+ 
+ export interface SessionProjectGroup {
+   key: string;
+diff --git a/src/components/settings/ImportExportSection.tsx b/src/components/settings/ImportExportSection.tsx
+index dbfd843cf8475e766937dcf4278e303a977b649f..9781102aa4b5e40803a40215ef4341ca58f63948 100644
+--- a/src/components/settings/ImportExportSection.tsx
++++ b/src/components/settings/ImportExportSection.tsx
+@@ -9,11 +9,12 @@ import {
+ } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { useTranslation } from "react-i18next";
+-import type { ImportStatus } from "@/hooks/useImportExport";
++import type { ImportStatus, UseImportExportResult } from "@/hooks/useImportExport";
+ 
+ interface ImportExportSectionProps {
+   status: ImportStatus;
+   selectedFile: string;
++  preview?: UseImportExportResult["preview"];
+   errorMessage: string | null;
+   backupId: string | null;
+   isImporting: boolean;
+@@ -26,6 +27,7 @@ interface ImportExportSectionProps {
+ export function ImportExportSection({
+   status,
+   selectedFile,
++  preview,
+   errorMessage,
+   backupId,
+   isImporting,
+@@ -48,7 +50,9 @@ export function ImportExportSection({
+         <h3 className="text-base font-semibold text-fg-1">
+           {t("settings.importExport")}
+         </h3>
+-        <p className="text-sm text-fg-2">{t("settings.importExportHint")}</p>
++        <p className="text-sm text-fg-2">{t("settings.importExportHintMaoqiu", {
++          defaultValue: "选择 CC Switch 数据库或 SQL 导出，已有同名记录保留。导入的配置需手动启用。",
++        })}</p>
+       </header>
+ 
+       <div className="space-y-4 rounded-lg border border-border bg-subtle p-6">
+@@ -111,6 +115,14 @@ export function ImportExportSection({
+           </div>
+         </div>
+ 
++        {selectedFile && preview && (
++          <p className="text-sm text-fg-2" role="status">
++            {t("settings.maoqiuImportPreview", {
++              defaultValue: "可导入 {{providers}} 个供应商、{{mcpServers}} 个 MCP、{{prompts}} 个提示词、{{skillRepos}} 个 Skill 来源",
++              ...preview,
++            })}
++          </p>
++        )}
+         <ImportStatusMessage
+           status={status}
+           errorMessage={errorMessage}
+diff --git a/src/components/settings/SettingsPage.tsx b/src/components/settings/SettingsPage.tsx
+index 6d079b3ba94307b7779f2e39d5cc5161475a329a..492df73d58a62c470c693b469b9d7566133b1f17 100644
+--- a/src/components/settings/SettingsPage.tsx
++++ b/src/components/settings/SettingsPage.tsx
+@@ -31,10 +31,7 @@ import { settingsApi, type AppId } from "@/lib/api";
+ import { useSettingsQuery } from "@/lib/query";
+ import type { SettingsSection } from "@/lib/navigation";
+ import { AppPageHeader } from "@/components/shell/AppPageHeader";
+-import { DirectoryInput } from "@/components/settings/DirectorySettings";
+ import { ImportExportSection } from "@/components/settings/ImportExportSection";
+-import { BackupListSection } from "@/components/settings/BackupListSection";
+-import { WebdavSyncSection } from "@/components/settings/WebdavSyncSection";
+ import { AboutSection } from "@/components/settings/AboutSection";
+ import { RoutingSection } from "@/components/settings/sections/RoutingSection";
+ import { PrivacyFilterConfigPanel } from "@/components/settings/PrivacyFilterConfigPanel";
+@@ -46,8 +43,6 @@ import { AppConfigSection } from "@/components/settings/sections/AppConfigSectio
+ import {
+   SettingsBlock,
+   SettingsBody,
+-  SettingsCard,
+-  SettingsRow,
+ } from "@/components/settings/SettingsLayout";
+ import { useSettings } from "@/hooks/useSettings";
+ import { useImportExport } from "@/hooks/useImportExport";
+@@ -94,16 +89,11 @@ export function SettingsPage({
+     isLoading,
+     isSaving,
+     isPortable,
+-    appConfigDir,
+-    initialAppConfigDir,
+     resolvedDirs,
+     updateSettings,
+     updateDirectory,
+-    updateAppConfigDir,
+     browseDirectory,
+-    browseAppConfigDir,
+     resetDirectory,
+-    resetAppConfigDir,
+     saveSettings,
+     autoSaveSettings,
+     requiresRestart,
+@@ -113,6 +103,7 @@ export function SettingsPage({
+ 
+   const {
+     selectedFile,
++    preview,
+     status: importStatus,
+     errorMessage,
+     backupId,
+@@ -362,10 +353,6 @@ export function SettingsPage({
+   const isBusy = useMemo(() => isLoading && !settings, [isLoading, settings]);
+   const SectionIcon = SECTION_ICON[section];
+ 
+-  const appConfigDirty =
+-    (appConfigDir?.trim() || undefined) !==
+-    (initialAppConfigDir?.trim() || undefined);
+-
+   const renderSection = () => {
+     if (!settings) return null;
+     switch (section) {
+@@ -413,44 +400,6 @@ export function SettingsPage({
+       case "data":
+         return (
+           <>
+-            <SettingsBlock
+-              title={t("settings.data.location")}
+-              actions={
+-                appConfigDirty ? (
+-                  <Button
+-                    variant="solid"
+-                    size="compact"
+-                    disabled={isSaving}
+-                    onClick={() => void handleSave()}
+-                  >
+-                    {isSaving && (
+-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+-                    )}
+-                    {t("common.save")}
+-                  </Button>
+-                ) : null
+-              }
+-            >
+-              <SettingsCard>
+-                <SettingsRow
+-                  label={t("settings.appConfigDir")}
+-                  help={{
+-                    title: t("settings.appConfigDir"),
+-                    body: t("settings.appConfigDirDescription"),
+-                  }}
+-                >
+-                  <DirectoryInput
+-                    label=""
+-                    value={appConfigDir}
+-                    resolvedValue={resolvedDirs.appConfig}
+-                    placeholder={t("settings.browsePlaceholderApp")}
+-                    onChange={updateAppConfigDir}
+-                    onBrowse={browseAppConfigDir}
+-                    onReset={resetAppConfigDir}
+-                  />
+-                </SettingsRow>
+-              </SettingsCard>
+-            </SettingsBlock>
+             <SettingsBlock
+               title={t("settings.advanced.data.title")}
+               help={{
+@@ -462,6 +411,7 @@ export function SettingsPage({
+                 <ImportExportSection
+                   status={importStatus}
+                   selectedFile={selectedFile}
++                  preview={preview}
+                   errorMessage={errorMessage}
+                   backupId={backupId}
+                   isImporting={isImporting}
+@@ -472,38 +422,6 @@ export function SettingsPage({
+                 />
+               </div>
+             </SettingsBlock>
+-            <SettingsBlock
+-              title={t("settings.advanced.backup.title")}
+-              help={{
+-                title: t("settings.advanced.backup.title"),
+-                body: t("settings.advanced.backup.description"),
+-              }}
+-            >
+-              <div className="rounded-panel border border-border bg-surface p-5">
+-                <BackupListSection
+-                  backupIntervalHours={settings.backupIntervalHours}
+-                  backupRetainCount={settings.backupRetainCount}
+-                  backupMaxTotalMb={settings.backupMaxTotalMb}
+-                  onSettingsChange={(updates) => handleAutoSave(updates)}
+-                />
+-              </div>
+-            </SettingsBlock>
+-            <SettingsBlock
+-              title={t("settings.advanced.cloudSync.title")}
+-              help={{
+-                title: t("settings.advanced.cloudSync.title"),
+-                body: t("settings.advanced.cloudSync.description"),
+-              }}
+-            >
+-              <div className="rounded-panel border border-border bg-surface p-5">
+-                <WebdavSyncSection
+-                  config={settings.webdavSync}
+-                  s3Config={settings.s3Sync}
+-                  settings={settings}
+-                  onAutoSave={handleAutoSave}
+-                />
+-              </div>
+-            </SettingsBlock>
+             <SettingsBlock
+               title={t("settings.advanced.privacyFilter.title")}
+               help={{
+diff --git a/src/components/shell/Sidebar.tsx b/src/components/shell/Sidebar.tsx
+index 78a80ae76f77684b6d3443115c26f51c9c1a5779..7fb3272c81a492100415a98341e45bbbd48f9fd4 100644
+--- a/src/components/shell/Sidebar.tsx
++++ b/src/components/shell/Sidebar.tsx
+@@ -12,7 +12,6 @@ import {
+   Folder,
+   Globe,
+   History,
+-  Info,
+   KeyRound,
+   Layers,
+   LayoutGrid,
+@@ -152,7 +151,7 @@ function SidebarTopBar({
+             className="pointer-events-none h-5 w-5 shrink-0"
+           />
+           <span className="pointer-events-none me-auto min-w-0 truncate text-strong font-semibold text-fg-1">
+-            CC Switch
++            外接 Agent 管理
+           </span>
+           {toggleButton}
+         </div>
+@@ -197,7 +196,7 @@ function SidebarTopBar({
+             className="h-[22px] w-[22px] shrink-0"
+           />
+           <span className="truncate text-strong font-semibold text-fg-1">
+-            CC Switch
++            外接 Agent 管理
+           </span>
+         </span>
+       )}
+@@ -699,10 +698,8 @@ function NavItem({
+ const SETTINGS_ITEMS: { section: SettingsSection; icon: IconComponent }[] = [
+   { section: "general", icon: SlidersHorizontal },
+   { section: "appConfig", icon: Folder },
+-  { section: "routing", icon: Route },
+   { section: "network", icon: Globe },
+   { section: "data", icon: Database },
+-  { section: "about", icon: Info },
+ ];
+ 
+ function SettingsDirectory({
+@@ -770,7 +767,7 @@ function SettingsDirectory({
+       </div>
+       {!collapsed && version && (
+         <div className="shrink-0 px-4 pb-4 text-caption text-fg-3">
+-          CC Switch v{version}
++          管理引擎 v{version}
+         </div>
+       )}
+     </>
+diff --git a/src/config/appSpecs.ts b/src/config/appSpecs.ts
+index 0eacb7edcda21e742f97014ba4a5b88210d2f91e..3d3a963d413440b38ac9bf879be25ce7bf39a7bb 100644
+--- a/src/config/appSpecs.ts
++++ b/src/config/appSpecs.ts
+@@ -316,6 +316,7 @@ export function appHas<Cap extends keyof AppCaps>(
+   cap: Cap,
+ ): app is AppIdWith<Cap> {
+   return (
++    cap !== "routeMode" && cap !== "localProxy" && cap !== "stack" &&
+     Object.prototype.hasOwnProperty.call(APP_SPECS, app) &&
+     APP_SPECS[app as AppId][cap]
+   );
+diff --git a/src/hooks/useImportExport.ts b/src/hooks/useImportExport.ts
+index 03c41bbd90d049cd9ea335e58c65f03601eabffa..53c16a25d9847a93f5ed6cd7b212ee125e652582 100644
+--- a/src/hooks/useImportExport.ts
++++ b/src/hooks/useImportExport.ts
+@@ -1,3 +1,4 @@
++import { invoke } from "@tauri-apps/api/core";
+ import { useCallback, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import { toast } from "@/lib/toast";
+@@ -16,6 +17,7 @@ export interface UseImportExportOptions {
+ 
+ export interface UseImportExportResult {
+   selectedFile: string;
++  preview: { providers: number; mcpServers: number; prompts: number; skillRepos: number } | null;
+   status: ImportStatus;
+   errorMessage: string | null;
+   backupId: string | null;
+@@ -34,6 +36,7 @@ export function useImportExport(
+   const { onImportSuccess } = options;
+ 
+   const [selectedFile, setSelectedFile] = useState("");
++  const [preview, setPreview] = useState<UseImportExportResult["preview"]>(null);
+   const [status, setStatus] = useState<ImportStatus>("idle");
+   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+   const [backupId, setBackupId] = useState<string | null>(null);
+@@ -41,6 +44,7 @@ export function useImportExport(
+ 
+   const clearSelection = useCallback(() => {
+     setSelectedFile("");
++    setPreview(null);
+     setStatus("idle");
+     setErrorMessage(null);
+     setBackupId(null);
+@@ -50,9 +54,16 @@ export function useImportExport(
+     try {
+       const filePath = await settingsApi.openFileDialog();
+       if (filePath) {
++        const preview = await invoke<{
++          providers: number;
++          mcpServers: number;
++          prompts: number;
++          skillRepos: number;
++        }>("preview_legacy_config", { filePath });
+         setSelectedFile(filePath);
+         setStatus("idle");
+         setErrorMessage(null);
++        setPreview(preview);
+       }
+     } catch (error) {
+       console.error("[useImportExport] Failed to open file dialog", error);
+@@ -191,6 +202,7 @@ export function useImportExport(
+ 
+   return {
+     selectedFile,
++    preview,
+     status,
+     errorMessage,
+     backupId,
+diff --git a/src/index.html b/src/index.html
+index 2ee4c89608b883c9177a29a111b0d5b622e83356..f9b836b7b8bd6b9996f0c322079ff24078e6925b 100644
+--- a/src/index.html
++++ b/src/index.html
+@@ -3,7 +3,7 @@
+   <head>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-    <title>Claude Code 供应商切换器</title>
++    <title>小毛球 · 外接 Agent 管理</title>
+     <script>(function(){try{var t=localStorage.getItem("cc-switch-theme")||"system";var d=t==="dark"||(t==="system"&&matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.classList.toggle("dark",d);}catch(e){}})()</script>
+   </head>
+   <body>

@@ -216,7 +216,7 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
       const tasks=db.prepare(`SELECT t.id,t.instanceId,t.goal,t.status,t.workThreadId,
         (SELECT r.status FROM runs r WHERE r.threadId=t.workThreadId ORDER BY r.rowid DESC LIMIT 1) AS runStatus
         FROM tasks t WHERE originThreadId=? OR (? IS NOT NULL AND projectId=?) ORDER BY t.rowid DESC LIMIT 40`).all(thread.id,thread.projectId,thread.projectId)
-      const instances=routingBots(db,thread.projectId)
+      const instances=routingBots(db,thread.projectId,dir)
       const project=thread.projectId&&mayShareProject?prepareProjectContext(db,thread.projectId):null
       const {attachmentIds,materials}=validateChatMaterials(db,dir,current,thread.projectId)
       const receiveFiles=mayShareProject&&mayShareAttachments
@@ -353,7 +353,10 @@ export function mainWorker(db:DatabaseSync,dir:string,providerOverride?:ChatProv
         }catch(e){
           if(!db.isOpen)return {tool,ok:false,error:'工作台已关闭'}
           const error=(e as {status?:number}).status?(e as Error).message:'工具未能执行'
-          transaction(db,()=>message(db,thread.id,'system','tool',tool+' · '+error,{...evidence,ok:false,error}))
+          transaction(db,()=>{
+            const messageId=message(db,thread.id,'system','tool',tool+' · '+error,{...evidence,ok:false,error})
+            plugins?.publish({type:'tool.finished',threadId:thread.id,projectId:thread.projectId,messageId,name:tool,ok:false})
+          })
           return {tool,ok:false,error}
         }
       }

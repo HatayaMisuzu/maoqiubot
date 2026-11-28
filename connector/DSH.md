@@ -10,7 +10,7 @@ DSH 的 `desktop`、`web` 和 `acp` 分别加载各自的 profile。桌面里选
 node connector/native-smoke.ts connector/config.example.json dsh-local --inspect-models
 ```
 
-启动器路径因安装位置而异。可使用 PATH 或设置 `MAOQIU_DSH_EXECUTABLE` 指向官方启动器。也可在「Agent 设置」保存实际路径后点「测试连接」。更换已绑定实例的执行入口、工作目录或 profile 时，登记新的实例 ID。连接测试确认节点登记和握手。实际发送一条消息可验证供应方登录及额度。
+启动器路径因安装位置而异。可使用 PATH 或设置 `MAOQIU_DSH_EXECUTABLE` 指向官方启动器。也可在桌面端「Agent 设置 → 执行实例与工作区」编辑实例并保存实际路径后点「测试连接」。更换已绑定实例的执行入口、工作目录或 profile 时，登记新的实例 ID。连接测试确认节点登记和握手。实际发送一条消息可验证供应方登录及额度。
 
 握手声明 `sessionCapabilities.list` 时，工作台按配置工作目录查询并分页显示外部会话，核对后可导入。原生分支和删除也按握手开放。没有只读历史 API 时，工作台显示本地已收到的聊天记录。[会话能力矩阵](../docs/sessions.md)
 
@@ -55,7 +55,7 @@ node connector/native-smoke.ts connector/config.example.json dsh-local --inspect
 
 ## 检查原生状态
 
-当 ACP 握手同时声明目录和 `resume` 或 `loadSession` 时，工作台开放原生导入。仅声明目录时仍可分页查看。DSH 没有只读历史和订阅额度接口时，界面保留工作台历史并显示额度未知。测试模型和续接时请使用独立 `DSH_HOME` 与临时工作目录。
+当 ACP 握手同时声明目录和 `resume` 或 `loadSession` 时，工作台开放原生导入。仅声明目录时仍可分页查看。DSH 没有只读历史和订阅额度接口时，界面保留工作台历史并提示「额度见原生客户端」，任务级/绑定会话统计用量见「Agent 设置」（或浏览器模式「Bot 监控」）。测试模型和续接时请使用独立 `DSH_HOME` 与临时工作目录。
 
 ```powershell
 node connector/native-smoke.ts connector/config.local.json dsh-go-local --inspect-models

@@ -7,6 +7,11 @@ const root = realpathSync(fileURLToPath(new URL('../', import.meta.url)))
 const out = process.env.MAOQIU_PACKAGE_OUT ? resolve(process.env.MAOQIU_PACKAGE_OUT) : join(root, 'dist')
 const name = 'Xiaomaoqiu'
 const target = join(out, name + '-win32-x64')
+const agentManager = join(root, 'dist', 'agent-manager')
+if (!lstatSync(join(agentManager, 'agent-manager.exe'), { throwIfNoEntry: false })?.isFile() ||
+  !lstatSync(join(agentManager, 'LICENSE-CC-Switch.txt'), { throwIfNoEntry: false })?.isFile()) {
+  throw Error('缺少内置 Agent 管理程序或其许可证文件。先运行 npm run build:agent-manager。')
+}
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const lockfile = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'))
 const checksums = JSON.parse(readFileSync(join(root, 'node_modules/electron/checksums.json'), 'utf8'))
@@ -53,6 +58,7 @@ const [release] = await packager({
   download: { checksums },
   icon: join(root, 'desktop', 'icon.ico'),
   win32metadata: { ProductName: '小毛球工作台', FileDescription: '小毛球工作台' },
+  extraResource: [agentManager],
   asar: false,
   prune: false,
   overwrite: true,

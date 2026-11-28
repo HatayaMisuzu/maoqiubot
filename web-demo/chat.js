@@ -1,6 +1,6 @@
 import {
   $, api, at, banner, basenamePath, btn, confirmDialog, copyText, displayDialog,
-  download, el, form, getWorkBots, icon, iconBtn, notice, phase,
+  download, el, form, getWorkBots, icon, iconBtn, items, notice, phase,
   resolveActiveContext, state, upload, url
 } from './lib.js';
 import { renderMarkdown } from './markdown.js';
@@ -52,7 +52,10 @@ const actorLabel = actor => actor?.kind === 'user' ? '你' : actor?.id === 'main
   actor?.kind === 'tool' ? '主聊工具' : actor?.kind === 'system' ? '工作台' : instance(actor?.id)?.name || actor?.id || '工作台';
 const commTypes = {
   assignment: '委派', question: '澄清问题', request: '协作请求', progress: '进度', blocked: '阻塞',
-  handoff: '交接', delivery: '交付', reply: '回复', control: '转达', review: '验收', recovery: '恢复记录'
+  handoff: '交接', delivery: '交付', reply: '回复', control: '转达', review: '验收', recovery: '恢复记录',
+  task_continue: '续派任务', bot_message: 'Bot 对话', user_message: '用户发言',
+  input_required: '请求回应', question_notice: '追问通知', blocked_notice: '阻塞通知',
+  request_notice: '协作请求通知', clarification_notice: '澄清通知', delivery_notice: '交付通知'
 };
 const commLabel = comm => actorLabel(comm.sender) + ' → ' + actorLabel(comm.recipient) +
   (commTypes[comm.type] ? ' · ' + commTypes[comm.type] : '');
@@ -118,27 +121,99 @@ function modelField(ui) {
   return { select, field, hint, action };
 }
 
+async function projectBoundInstances(projectId, cache) {
+  if (!projectId) return null;
+  if (!cache?.has(projectId)) {
+    const req = api('/projects/' + url(projectId) + '/workspaces').then(res => new Set(items(res).map(w => w.instanceId)));
+    if (cache) cache.set(projectId, req);
+    try { return await req; }
+    catch { cache?.delete(projectId); return null; }
+  }
+  try { return await cache.get(projectId); }
+  catch { cache.delete(projectId); return null; }
+}
+
+function trackFold(detail, key) {
+  detail.open = expandedMessages.has(key);
+  detail.ontoggle = () => {
+    if (detail.open) expandedMessages.add(key);
+    else expandedMessages.delete(key);
+  };
+  return detail;
+}
+
 export const chat = actions => {
   let previewEvent = null;
+  let previewTimer = null;
+  let lastPreviewAt = 0;
+  let forceScrollBottom = false;
+  let lastContentThread = null;
+  let lastContentCount = 0;
+  let lastRunSig = '';
+  let lastPendingSig = '';
+  let scrollListenerBound = false;
+
+  function renderPreviewNode(node, text) {
+    const card = node.closest('.chat-preview-msg');
+    if (!text) {
+      node.replaceChildren();
+      node.hidden = true;
+      if (card) card.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    if (card) card.hidden = false;
+    node.replaceChildren(renderMarkdown(text));
+  }
+
+  function syncScrollBottomBtn(content = $('content')) {
+    const btnNode = content?.querySelector('.scroll-bottom-btn');
+    if (!btnNode) return;
+    const distance = content.scrollHeight - content.clientHeight - content.scrollTop;
+    btnNode.hidden = distance < 60 || content.scrollHeight <= content.clientHeight + 20;
+  }
+
+  function flushPreview() {
+    if (previewTimer) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    const previewEl = $('chat-preview');
+    if (!previewEl) return;
+    const content = $('content');
+    const following = content.scrollHeight - content.clientHeight - content.scrollTop < 60;
+    lastPreviewAt = Date.now();
+    renderPreviewNode(previewEl, previewEvent?.text || '');
+    if (following && previewEvent?.text) content.scrollTop = content.scrollHeight;
+    syncScrollBottomBtn(content);
+  }
 
   function preview(event) {
     if (state.view !== 'chat' || event.threadId !== state.thread) return;
     if (event.text && !state.snapshot?.mainChat?.pending?.some(job => job.messageId === event.messageId && ['queued', 'working'].includes(job.status))) return;
     if (!event.text && previewEvent?.messageId !== event.messageId) return;
     previewEvent = event.text ? event : null;
-    const previewEl = $('chat-preview');
-    if (!previewEl) return;
-    const content = $('content');
-    const following = content.scrollHeight - content.scrollTop - content.clientHeight < 60;
-    previewEl.textContent = event.text;
-    previewEl.hidden = !event.text;
-    if (following) content.scrollTop = content.scrollHeight;
+    if (!previewEvent) {
+      flushPreview();
+      return;
+    }
+    const elapsed = Date.now() - lastPreviewAt;
+    if (elapsed >= 80) {
+      flushPreview();
+    } else if (!previewTimer) {
+      previewTimer = setTimeout(flushPreview, 80 - elapsed);
+    }
   }
 
   function clearPreview() {
     previewEvent = null;
+    if (previewTimer) {
+      clearTimeout(previewTimer);
+      previewTimer = null;
+    }
+    lastPreviewAt = 0;
     const node = $('chat-preview');
-    if (node) { node.textContent = ''; node.hidden = true; }
+    if (node) renderPreviewNode(node, '');
   }
 
   function modelPicker(snapshot, agent) {
@@ -440,6 +515,31 @@ export const chat = actions => {
     });
 
     if (sourceProject) ui.controls.projectId.disabled = true;
+    const workspaceHint = el('small', 'muted');
+    workspaceHint.hidden = true;
+    ui.controls.projectId.closest('label')?.after(workspaceHint);
+    const workspaceCache = new Map();
+    let workspaceReq = 0;
+    async function syncWorkspaceHint() {
+      const req = ++workspaceReq;
+      const pid = ui.controls.projectId.value;
+      const iid = ui.controls.instanceId.value;
+      if (!pid || !iid || iid === 'main') {
+        workspaceHint.hidden = true;
+        return;
+      }
+      const bound = await projectBoundInstances(pid, workspaceCache);
+      if (req !== workspaceReq || !activeForm(ui)) return;
+      if (bound && !bound.has(iid)) {
+        workspaceHint.textContent = '所选工作 Bot 尚未绑定此项目工作区，派发前需在 Home 的项目「工作区设置」中绑定。';
+        workspaceHint.hidden = false;
+      } else {
+        workspaceHint.hidden = true;
+      }
+    }
+    ui.controls.instanceId.addEventListener('change', () => void syncWorkspaceHint());
+    ui.controls.projectId.addEventListener('change', () => void syncWorkspaceHint());
+    void syncWorkspaceHint();
     const preparedThread = draftModels(ui, originThreadId);
   }
 
@@ -484,8 +584,9 @@ export const chat = actions => {
     }
   }
 
-  async function botSettings(agent) {
+  async function botSettings(agent, back) {
     if (!agent || agent.id === 'main') return;
+    agent = instance(agent.id) || agent;
     const current = await api('/instances/' + url(agent.id) + '/settings');
     const selectedProjects = new Set(current.allowedProjects || []);
     let allProjects = current.allowedProjects == null;
@@ -509,12 +610,12 @@ export const chat = actions => {
       actions.renderChrome();
       await actions.refresh();
       notice('Bot 设置已保存。');
-    });
+    }, { back });
 
     if (['codex', 'dsh', 'hermes'].includes(agent.adapterKey)) {
-      const usage = el('div', 'muted', '额度未知');
+      const usage = el('div', 'muted', agent.adapterKey === 'codex' ? '额度未知' : '额度见原生客户端（工作台任务用量见 Agent 设置）');
       usage.setAttribute('role', 'status');
-      const read = agent.online && agent.capabilities?.usage ? btn('查询原生额度', async () => {
+      const read = agent.adapterKey === 'codex' && agent.online && agent.capabilities?.usage ? btn('查询原生额度', async () => {
         usage.textContent = '正在查询…';
         try {
           const data = await api('/instances/' + url(agent.id) + '/usage');
@@ -525,8 +626,7 @@ export const chat = actions => {
             usage.append(el('div', '', duration + ' · 已用 ' + window.usedPercent + '%' + reset));
           }
         } catch (error) {
-          usage.textContent = '额度未知';
-          throw error;
+          usage.textContent = error?.message ? '额度读取失败：' + error.message : '额度未知';
         }
       }, 'secondary btn-sm') : null;
       ui.body.prepend(el('div', 'record',
@@ -1132,10 +1232,14 @@ export const chat = actions => {
     );
   }
 
-  function drawContent() {
+  function drawContent(options = {}) {
     const ctx = resolveActiveContext();
     const snap = state.snapshot;
     const content = $('content');
+    if (!scrollListenerBound) {
+      content.addEventListener('scroll', () => syncScrollBottomBtn(content), { passive: true });
+      scrollListenerBound = true;
+    }
     const prev = content.scrollTop;
     const nearBottom = content.scrollHeight - content.clientHeight - prev < 60;
     const isNew = content.dataset.topic !== draftKey();
@@ -1191,9 +1295,30 @@ export const chat = actions => {
     drawBanner(t);
 
     if (!t?.sessionId && !snap?.messages?.length && !snap?.task && (!snap?.run || (snap.run.modelSetup && snap.run.status !== 'uncertain'))) {
+      lastContentThread = null;
+      lastContentCount = 0;
+      lastRunSig = '';
+      lastPendingSig = '';
+      forceScrollBottom = false;
       content.replaceChildren(drawWelcome(ctx, agent));
       return;
     }
+
+    const msgCount = snap?.messages?.length || 0;
+    const runSig = `${snap?.run?.id || ''}:${snap?.run?.status || ''}`;
+    const pendingSig = (snap?.mainChat?.pending || []).map(j => `${j.messageId}:${j.status}:${j.proposal?.id || ''}`).join('|');
+    if (!options.force && !isNew && !forceScrollBottom && t?.id && t.id === lastContentThread &&
+        msgCount === lastContentCount && runSig === lastRunSig && pendingSig === lastPendingSig) {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().trim() && content.contains(sel.anchorNode)) {
+        syncScrollBottomBtn(content);
+        return;
+      }
+    }
+    lastContentThread = t?.id ?? null;
+    lastContentCount = msgCount;
+    lastRunSig = runSig;
+    lastPendingSig = pendingSig;
 
     const stream = el('div', 'stream');
     const box = runBox(snap);
@@ -1203,9 +1328,19 @@ export const chat = actions => {
 
     for (const m of snap.messages || []) {
       const comm = m.data?.communication;
-      const role = comm ? actorLabel(comm.sender) : m.role === 'user' ? '你' : m.role === 'assistant' ? (agent?.name || '小毛球') : ({ activity: '原生活动', artifact: '成果', input_required: '请求回应' }[m.kind] || '工作台');
+      const hasLinkedOtherTask = Boolean(m.taskId && m.taskId !== t?.taskId);
+      const hasClarificationNotice = Boolean(m.data?.communicationId && m.data?.workThreadId &&
+        ['clarification_notice', 'question_notice', 'blocked_notice', 'request_notice'].includes(comm?.type));
+      if (!m.text && ['completed', 'accepted'].includes(m.kind) &&
+        !m.data?.webReferences?.length && !m.data?.webResult &&
+        !m.data?.usedMemories?.length && !m.data?.deliveryCheck &&
+        !m.data?.attachmentIds?.length && !m.refs?.length &&
+        !hasClarificationNotice && !m.data?.workThreadId && !hasLinkedOtherTask) {
+        continue;
+      }
+      const role = comm ? actorLabel(comm.sender) : m.role === 'user' ? '你' : m.role === 'assistant' ? (agent?.name || '小毛球') : ({ activity: '原生活动', artifact: '成果', input_required: '请求回应', error: '执行错误' }[m.kind] || '工作台');
       const isSelected = selectedMessages.has(m.id);
-      const article = el('article', 'msg' + (m.role === 'user' ? ' user' : '') + (isSelected ? ' selected' : ''));
+      const article = el('article', 'msg' + (m.role === 'user' ? ' user' : '') + (m.kind === 'error' ? ' msg-error' : '') + (isSelected ? ' selected' : ''));
       article.append(el('div', 'msg-meta', el('span', '', role), el('small', '', at(m.createdAt))));
 
       if (m.text) {
@@ -1219,7 +1354,7 @@ export const chat = actions => {
       if (m.data?.webReferences?.length || m.data?.webResult) {
         const web = m.data.webResult;
         const refs = m.data.webReferences ?? web.references ?? [];
-        const sources = el('details', 'fold-card', el('summary', '', '网页来源 · ' + refs.length));
+        const sources = trackFold(el('details', 'fold-card', el('summary', '', '网页来源 · ' + refs.length)), m.id + ':web');
         if (web?.query) sources.append(el('p', 'muted', web.query + ' · ' + web.provider + ' · ' + web.elapsedMs + ' ms'));
         if (web?.body) sources.append(el('p', 'text', web.body));
         for (const item of refs) {
@@ -1237,21 +1372,21 @@ export const chat = actions => {
       }
 
       if (m.data?.usedMemories?.length) {
-        article.append(el('details', 'fold-card',
+        article.append(trackFold(el('details', 'fold-card',
           el('summary', '', '引用记忆 · ' + m.data.usedMemories.length),
           ...m.data.usedMemories.map(memory => el('p', 'muted', (memory.projectId ? '项目' : '个人') + ' · 版本 ' + memory.revision + ' · ' + memory.id))
-        ));
+        ), m.id + ':mem'));
       }
 
       const check = m.data?.deliveryCheck;
       if (check) {
-        article.append(el('details', 'fold-card',
+        article.append(trackFold(el('details', 'fold-card',
           el('summary', '', '查看交付核对依据'),
           el('p', 'muted', '运行 ' + (check.runStatus || '无') + ' · ' + check.reportIds.length + ' 条交付回执'),
           ...check.files.map(f => el('p', 'muted', (f.status === 'readable' ? '可读 · ' : '待核对 · ') + f.path + (f.bytes !== undefined ? ' · ' + f.bytes + ' 字节' : ''))),
           ...check.materials.map(a => el('p', 'muted', (a.status === 'available' ? '可访问 · ' : '待核对 · ') + (a.title || a.id))),
           ...check.criteria.map(criterion => el('p', 'muted', '验收条件 · ' + criterion))
-        ));
+        ), m.id + ':delivery'));
       }
 
       if (m.taskId && m.taskId !== t?.taskId) {
@@ -1266,7 +1401,8 @@ export const chat = actions => {
         article.append(btn('打开工作话题', () => actions.openThread(m.data.workThreadId), 'task-card', 'task'));
       }
 
-      if (m.data?.communicationId && m.data?.workThreadId && comm?.type === 'clarification_notice') {
+      if (m.data?.communicationId && m.data?.workThreadId &&
+        ['clarification_notice', 'question_notice', 'blocked_notice', 'request_notice'].includes(comm?.type)) {
         article.append(btn('回复工作 Bot', () => form('回复工作 Bot', [
           { key: 'text', label: '你的原话', type: 'textarea', required: true }
         ], '发送', async ({ text }) => {
@@ -1300,7 +1436,7 @@ export const chat = actions => {
           btn(isSelected ? '取消分享选中' : '选择分享', () => {
             if (selectedMessages.has(m.id)) selectedMessages.delete(m.id);
             else selectedMessages.add(m.id);
-            drawContent();
+            drawContent({ force: true });
           }, 'ghost'),
           btn('归档到资料', () => form('保存这段原话', [
             { key: 'title', label: '资料标题', value: m.text.slice(0, 40), required: true },
@@ -1375,19 +1511,25 @@ export const chat = actions => {
               hasCode ? el('label', 'field', trust, el('span', 'field-label', '我已审查这些文件，并授权该摘要版本在工作台宿主进程中执行代码')) : null,
               hasNetwork ? el('label', 'field', network, el('span', 'field-label', '我授权该版本使用清单声明的网络能力')) : null
             ];
+            let settled = false;
+            const finish = value => {
+              if (settled) return;
+              settled = true;
+              resolveAuthorization(value);
+            };
             const accept = btn('确认授权并执行', () => {
               if (hasCode && !trust.checked || hasNetwork && !network.checked) {
                 notice('请分别勾选需要授予的权限');
                 return;
               }
+              finish({ digest: review.digest, trustCode: trust.checked, allowNetwork: network.checked });
               $('dialog').close();
-              resolveAuthorization({ digest: review.digest, trustCode: trust.checked, allowNetwork: network.checked });
             }, 'primary');
             const reject = btn('取消', () => {
+              finish(null);
               $('dialog').close();
-              resolveAuthorization(null);
             }, 'ghost');
-            displayDialog('审查插件授权', [
+            const { dialog } = displayDialog('审查插件授权', [
               el('small', 'muted', manifest.name + ' · ' + manifest.version + ' · ' + review.source),
               el('p', 'text', manifest.description),
               el('p', 'muted', 'SHA-256 · ' + review.digest),
@@ -1398,6 +1540,7 @@ export const chat = actions => {
               ...permissions,
               ...changedFiles
             ], [reject, accept], { wide: true });
+            dialog.addEventListener('close', () => finish(null), { once: true });
           });
           if (!authorize) return;
           await api('/chat/approve', {
@@ -1453,14 +1596,31 @@ export const chat = actions => {
 
     const activePreview = previewEvent?.threadId === t?.id && snap.mainChat?.pending?.some(job =>
       job.messageId === previewEvent?.messageId && ['queued', 'working'].includes(job.status));
-    if (!activePreview) previewEvent = null;
-    const previewNode = el('div', 'msg text', activePreview ? previewEvent.text : '');
+    if (!activePreview) {
+      previewEvent = null;
+      if (previewTimer) { clearTimeout(previewTimer); previewTimer = null; }
+    }
+    const previewNode = el('div', 'chat-preview-body');
     previewNode.id = 'chat-preview';
-    previewNode.hidden = !activePreview;
-    stream.append(previewNode);
+    const previewCard = el('article', 'msg chat-preview-msg',
+      el('div', 'msg-meta', el('span', '', '小毛球'), el('small', '', '正在生成…')),
+      previewNode
+    );
+    renderPreviewNode(previewNode, activePreview ? previewEvent.text : '');
+    stream.append(previewCard);
+
+    const scrollBtn = btn('回到底部', () => {
+      content.scrollTo({ top: content.scrollHeight, behavior: 'smooth' });
+    }, 'secondary btn-xs scroll-bottom-btn');
+    scrollBtn.hidden = true;
+    const scrollWrap = el('div', 'scroll-bottom-wrap', scrollBtn);
+    stream.append(scrollWrap);
 
     content.replaceChildren(stream);
-    content.scrollTop = (nearBottom || isNew) ? content.scrollHeight : prev;
+    const shouldScrollBottom = forceScrollBottom || nearBottom || isNew;
+    forceScrollBottom = false;
+    content.scrollTop = shouldScrollBottom ? content.scrollHeight : prev;
+    syncScrollBottomBtn(content);
   }
 
   function buildScopeOptions(contact) {
@@ -1543,6 +1703,18 @@ export const chat = actions => {
         el('span', '', ctx.isMain ? '新侧边会话草稿 · 首次发送时创建' : (contact?.name || '工作 Bot') + ' 新话题草稿 · 首次发送时创建'),
         el('label', 'inline', el('span', '', '范围'), scopeSelect)
       );
+      if (contact && contact.id !== 'main' && target.projectId && permitted) {
+        const hint = el('small', 'muted draft-workspace-hint');
+        hint.hidden = true;
+        draftBar.append(hint);
+        void projectBoundInstances(target.projectId, null).then(bound => {
+          if (!draftBar.isConnected || !atTarget(target)) return;
+          if (bound && !bound.has(contact.id)) {
+            hint.textContent = '尚未在此项目绑定工作区 · 请先到对应项目 Home 绑定后再发送';
+            hint.hidden = false;
+          }
+        });
+      }
     }
 
     const input = el('textarea');
@@ -1558,15 +1730,43 @@ export const chat = actions => {
     picker.multiple = true;
     picker.hidden = true;
 
+    const MAX_UPLOAD_BYTES = 16 * 1024 * 1024;
+    const thumbUrls = new WeakMap();
     const renderFiles = () => files.replaceChildren(
       ...draft.refs.map((r, i) => btn('引用 · ' + r.excerpt + ' ×', () => { draft.refs.splice(i, 1); renderFiles(); }, 'chip')),
-      ...draft.files.map((f, i) => btn(f.name + ' ×', () => { draft.files.splice(i, 1); renderFiles(); }, 'chip'))
+      ...draft.files.map((f, i) => {
+        const chip = btn(f.name + ' ×', () => {
+          draft.files.splice(i, 1);
+          const url = thumbUrls.get(f);
+          if (url) { URL.revokeObjectURL(url); thumbUrls.delete(f); }
+          renderFiles();
+        }, 'chip');
+        if (f.type?.startsWith('image/')) {
+          let url = thumbUrls.get(f);
+          if (!url) { url = URL.createObjectURL(f); thumbUrls.set(f, url); }
+          const thumb = el('img', 'chip-thumb');
+          thumb.src = url;
+          thumb.alt = '';
+          chip.prepend(thumb);
+        }
+        return chip;
+      })
     );
 
-    picker.onchange = () => {
-      if (atTarget(target) && !input.readOnly) draft.files.push(...Array.from(picker.files));
-      picker.value = '';
+    const addDraftFiles = incoming => {
+      if (!atTarget(target) || input.readOnly) return;
+      const rejected = [];
+      for (const file of incoming) {
+        if (file.size > MAX_UPLOAD_BYTES) rejected.push(file.name);
+        else draft.files.push(file);
+      }
+      if (rejected.length) notice('以下文件超过 16 MB 上限，已跳过：' + rejected.join('、'), 'error');
       renderFiles();
+    };
+
+    picker.onchange = () => {
+      addDraftFiles(Array.from(picker.files || []));
+      picker.value = '';
     };
 
     function resizeInput() {
@@ -1580,10 +1780,7 @@ export const chat = actions => {
     };
     input.onpaste = event => {
       const pasted = Array.from(event.clipboardData?.files || []);
-      if (pasted.length && atTarget(target) && !input.readOnly) {
-        draft.files.push(...pasted);
-        renderFiles();
-      }
+      if (pasted.length) addDraftFiles(pasted);
     };
 
     const feedback = el('small', 'compose-feedback');
@@ -1659,6 +1856,7 @@ export const chat = actions => {
           });
         }
         sent = true;
+        forceScrollBottom = true;
         created = !target.id;
         draft.unknownCreate = false;
         if (draft.text.trim() === text) draft.text = '';
@@ -1733,10 +1931,7 @@ export const chat = actions => {
       e.preventDefault();
       composerBox.classList.remove('drag-over');
       const dropped = Array.from(e.dataTransfer?.files || []);
-      if (dropped.length && atTarget(target) && !input.readOnly) {
-        draft.files.push(...dropped);
-        renderFiles();
-      }
+      if (dropped.length) addDraftFiles(dropped);
     };
 
     $('compose').replaceChildren(composerBox);

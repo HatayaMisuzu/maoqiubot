@@ -104,3 +104,34 @@ test('Bot 设置可停用工作 Bot 并反映到聊天入口', async ({ page, wo
   await bot.click();
   await expect(page.locator('#compose')).toContainText('此 Bot 已停用');
 });
+
+test('桌面 Agent 设置关联本机 Bot 配置和监控', async ({ page, workbench }) => {
+  await page.addInitScript(() => {
+    const opened = [];
+    window.openedAgentHomes = opened;
+    window.maoqiuDesktop = {
+      settings: async () => ({ instances: [
+        { id: 'dsh-default', name: '默认 DSH', adapterKey: 'dsh', configurationHome: 'C:/native/dsh' },
+        { id: 'dsh-lab', name: '实验 DSH', adapterKey: 'dsh', configurationHome: 'E:/agents/dsh-lab' }
+      ] }),
+      agentManagerStatus: async () => ({ available: true, active: opened.length > 0 }),
+      openAgentManager: async instanceId => { opened.push(instanceId); },
+      agentMonitor: async () => ({
+        fetchedAt: new Date().toISOString(), usage: [],
+        instances: [{
+          id: 'dsh-default', name: '默认 DSH', adapterKey: 'dsh', canRun: true, online: true,
+          settings: { enabled: true }, activeRuns: 0, uncertainRuns: 0
+        }]
+      })
+    };
+  });
+  await workbench.login();
+  await page.locator('#session').getByRole('button', { name: 'Agent 设置', exact: true }).click();
+  const settings = page.getByRole('dialog');
+  await expect(settings.getByText('可接任务', { exact: true })).toBeVisible();
+  await settings.getByLabel('目标配置').selectOption('dsh-lab');
+  await settings.getByRole('button', { name: '打开管理窗口' }).click();
+  await expect(settings.getByText('管理窗口已打开。', { exact: false })).toBeVisible();
+  await expect(settings.getByLabel('目标配置')).toBeDisabled();
+  expect(await page.evaluate(() => window.openedAgentHomes)).toEqual(['dsh-lab']);
+});

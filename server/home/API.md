@@ -62,15 +62,17 @@ $restored = Write-Maoqiu "/spaces/$($space.id)/restore" @{ expectedRevision = $a
 (Read-Maoqiu $entryPath).items[0].values
 ```
 
-预览和应用均检查 `expectedRevision`，过期时响应中的 `current` 给出当前版本。新集合、页面或块需要在同批后续操作中引用时，自行指定稳定 ID。应用后用响应中的 `pageId` 打开 `GET /spaces/:id/pages/:pageId`。已有值的字段改变类型时，`updateField` 须带 `migration: {entryId: newValue}`。可同时传 `entryRevisions: {entryId: revision}`，防止转换覆盖刚被编辑的条目。
+预览和应用均检查 `expectedRevision`，过期时响应中的 `current` 给出当前版本。新集合、页面或块需要在同批后续操作中引用时，自行指定稳定 ID。应用后用响应中的 `pageId` 打开 `GET /spaces/:id/pages/:pageId`。已有值的字段改变类型或收敛单选选项导致受影响条目需要转换时，`updateField` **必须同时传** `migration: {entryId: newValue}` 与对应受影响条目的 `entryRevisions: {entryId: revision}`（缺少版本号校验会拒绝迁移，防止覆盖刚被编辑的条目）。
 
-`POST /spaces/:id/restore` 默认使用 `scope: 'layout'`，保留当前集合字段与条目。`scope: 'structure'` 会采用历史字段定义。先传 `mode: 'preview'` 查看 `conflicts`，再通过 `migrations: {entryId: {fieldId: newValue}}` 提交需要转换的值，并使用 `mode: 'apply'` 应用。未解决的冲突返回 409。
+`POST /spaces/:id/restore` 默认使用 `scope: 'layout'`，保留当前集合字段与条目。`scope: 'structure'` 会采用历史字段定义。先传 `mode: 'preview'` 查看 `conflicts`，存在冲突时**必须同时提交** `migrations: {entryId: {fieldId: newValue}}` 与 `entryRevisions: {entryId: revision}` 并使用 `mode: 'apply'` 应用。未解决的冲突或过期版本号会返回 409。
+
+所有有权限读取的项目或个人空间列表可通过 `GET /spaces` 读取（其中条目均经过项目读取权限过滤）。
 
 ### 访问范围、原件与修订
 
 | 调用 | 约定 |
 | --- | --- |
-| `POST /grants`、`DELETE /grants/:id` | 所有者以 `{projectId,expiresInDays?}` 发放项目邀请，默认 30 天，可设为 1 至 365 天。受邀端使用 Bearer 令牌读写指定项目。删除邀请后令牌失效。 |
+| `POST /grants`、`DELETE /grants/:id` | 所有者以 `{projectId,expiresInDays?,requestId?}` 发放项目邀请，默认 30 天，可设为 1 至 365 天。授权令牌仅在首次签发响应中返回；服务端在请求幂等表中将该结果脱敏记录为 `{_sensitiveResult:'grant-token'}`，以同一 `requestId` 重试会返回 **HTTP 409**，须更换新 `requestId` 重新签发。删除邀请后令牌失效。 |
 | `POST /projects/:id/workspaces` | `{instanceId,workspaceRef,allowAgentAccess,agentPermission?}` 配置执行实例。运行权限可选 `read`（默认）、`append`、`manage`，只用于绑定项目，最长 24 小时。关闭授权、改权限、解除绑定或运行进入终态均会撤销现有运行令牌。解绑使用 `DELETE /projects/:id/workspaces` 并传入 `instanceId`。 |
 | `POST /attachments` | 传 `{name,contentType,data,projectId?}`，其中 `data` 为 base64，原件最多 16 MiB。用 `GET /attachments/:id?download=1` 下载原件，`?meta=1` 读取元数据。省略参数继续返回兼容的 JSON 数据。 |
 | `POST /submissions` | 个人投递省略项目。留在节点的原件可用 `source.localRef = {nodeId,workspaceRef,path}` 标记，服务仅保存定位描述。 |
@@ -93,6 +95,15 @@ $restored = Write-Maoqiu "/spaces/$($space.id)/restore" @{ expectedRevision = $a
 所有者通过 `GET /tasks/:id/communication` 查询任务关系。可向对应工作话题提交 `{text,replyTo}` 记录直接回应。针对待核对运行，向 `POST /runs/:id/recovery` 提交 `{action:"inspect"}` 请求原节点核对，或用 `{action:"abandon",acknowledge:true,reason}` 停止工作台等待。后者可能留下仍在原生端执行的任务。
 
 本机所有者可以读取 `GET /instances/:id/sessions?projectId=<id>&cursor=<cursor>`。实例须宣告可核对的会话目录。用 `POST /instances/:id/sessions` 提交 `{sessionId,projectId?,title?}`，查询返回的话题等待原生绑定回执。会话已绑定时返回既有话题。工作台继续使用原生线程，历史保留在原客户端。
+
+### 工作台监控与主聊控制端点（本机所有者）
+
+除会话与任务端点外，本机所有者界面还使用以下 `/api/v1` 控制端点：
+
+- `GET /agent-monitor?days=30`：汇总工作 Bot 运行状态、活跃/待核对/最近异常计数及指定天数内已记录的用量（`1..365` 天）。非所有者令牌访问返回 HTTP 403。
+- `GET /chat/persona`、`POST /chat/persona`：读取或保存 `persona.md`（或传 `{ reset: true }` 恢复默认人格）。
+- `GET /chat/policy`、`POST /chat/policy`：读取或保存主聊外部历史/项目/记忆/附件共享策略、工具预算软硬上限及读写授权目录。
+- `POST /chat/cancel`：取消主聊中排队或正在运行的 `{ messageId }` 任务。
 
 ### 对话与事件
 

@@ -2,7 +2,7 @@ import {
   $, api, at, btn, copyText, el, icon, iconBtn,
   phase, resolveActiveContext, state, url
 } from './lib.js';
-import { desktopSettings, hasDesktopSettings } from './desktop-settings.js';
+import { hasDesktopSettings } from './desktop-settings.js';
 import { daily, mainModels, mainPermissions, memories } from './main-settings.js';
 import { extensions } from './extensions.js';
 
@@ -259,7 +259,7 @@ export function createInspector(actions) {
       el('div', 'actions',
         agent ? btn('Bot 设置', () => actions.botSettings(agent), 'secondary btn-xs', 'sliders') : null,
         caps.sessionList ? btn('原生目录', () => actions.nativeCatalog(agent), 'secondary btn-xs', 'folderOpen') : null,
-        hasDesktopSettings() ? btn('Agent 设置', () => desktopSettings(actions.onSettingsChanged), 'ghost btn-xs', 'terminal') : null
+        btn(hasDesktopSettings() ? 'Agent 设置' : 'Bot 监控', () => actions.openDesktopSettings(), 'ghost btn-xs', 'terminal')
       )
     );
 

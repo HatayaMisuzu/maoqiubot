@@ -59,8 +59,8 @@ export async function mainModels(refresh, load, back) {
           const bot = await api('/instances/api', { modelId: model.id });
           await load?.();
           await refresh?.();
-          notice('已注册工作 Bot · ' + bot.name);
           await mainModels(refresh, load, back);
+          notice('已注册工作 Bot · ' + bot.name);
         }, 'secondary btn-xs', 'bot') : null,
         external && !model.disabled ? btn('测试连接', async () => {
           const result = await api('/chat/models/test', { id: model.id });
@@ -98,10 +98,7 @@ export async function mainModels(refresh, load, back) {
             confirmLabel: '删除配置',
             destructive: true
           });
-          if (!ok) {
-            await mainModels(refresh, load, back);
-            return;
-          }
+          if (!ok) return;
           await api('/chat/models', { action: 'delete', id: model.id });
           await refresh?.();
           await mainModels(refresh, load, back);
@@ -194,17 +191,38 @@ export async function memories(threadId, back) {
   { back });
 }
 
+function toDatetimeLocal(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value).slice(0, 16);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function withLocalTimezone(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return undefined;
+  if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMin);
+  const pad = n => String(n).padStart(2, '0');
+  return `${raw.length === 16 ? raw + ':00' : raw}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
 export async function daily(threadId, back) {
   const path = '/chat/daily';
   const result = await api(path + '?threadId=' + encodeURIComponent(threadId));
   const editItem = (item = {}) => form(item.id ? '修改事项' : '添加事项或提醒', [
     ...(!item.id ? [{ key: 'kind', label: '类型', options: [{ id: 'todo', name: '待办' }, { id: 'reminder', name: '提醒' }] }] : []),
     { key: 'body', label: '内容', value: item.body, required: true },
-    { key: 'dueAt', label: '到期时间（含时区）', value: item.dueAt, placeholder: '2026-12-01T09:00:00+08:00' }
+    { key: 'dueAt', label: '到期时间', type: 'datetime-local', value: toDatetimeLocal(item.dueAt) }
   ], '保存', async values => {
     await api(path, {
       ...values, threadId, action: item.id ? 'update' : 'create',
-      id: item.id, expectedRevision: item.revision, dueAt: values.dueAt || undefined
+      id: item.id, expectedRevision: item.revision, dueAt: withLocalTimezone(values.dueAt)
     });
     await daily(threadId, back);
   }, { back: () => daily(threadId, back) });
@@ -234,7 +252,6 @@ export async function daily(threadId, back) {
               destructive: true
             });
             if (ok) await set('delete');
-            else await daily(threadId, back);
           }, 'destructive-ghost btn-xs')
         )
       );

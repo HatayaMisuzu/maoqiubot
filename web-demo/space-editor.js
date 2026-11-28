@@ -15,7 +15,7 @@ const path = (space, action) => '/spaces/' + url(space.id) + '/' + action;
 const toValue = (field, raw) => raw === '' ? null : field.type === 'number' ? Number(raw) : field.type === 'attachment' ? raw.split(/\s+/) : raw;
 
 export function spaceEditor(actions, display) {
-  function preview(titleText, previewData, apply, description) {
+  function preview(titleText, previewData, apply, description, back) {
     display(titleText,
       description,
       ...previewData.structure.pages.map(page => el('div', 'record',
@@ -28,48 +28,52 @@ export function spaceEditor(actions, display) {
         const saved = await apply();
         $('dialog').close();
         await actions.openHome(state.project, saved.pageId || state.page);
-      }, 'primary'))
+      }, 'primary')),
+      ...(back ? [{ back }] : [])
     );
   }
 
-  async function change(space, operations) {
+  async function change(space, operations, back) {
     const body = { expectedRevision: space.revision, operations };
     const endpoint = path(space, 'changes');
     const result = await api(endpoint, { ...body, mode: 'preview' });
-    preview('预览空间变更', result, () => api(endpoint, { ...body, mode: 'apply' }));
+    preview('预览空间变更', result, () => api(endpoint, { ...body, mode: 'apply' }), null, back);
   }
 
-  function page(space, active) {
+  function page(space, active, back) {
+    const reopen = () => page(space, active, back);
     const ui = form(active ? '编辑页面' : '新建页面', [
       { key: 'title', label: '页面标题', value: active?.title, required: true },
       { key: 'columns', label: '分栏', options: columns, value: active?.columns }
-    ], '预览', d => change(space, [{ op: active ? 'updatePage' : 'createPage', pageId: active?.id, title: d.title, columns: Number(d.columns) }]));
+    ], '预览', d => change(space, [{ op: active ? 'updatePage' : 'createPage', pageId: active?.id, title: d.title, columns: Number(d.columns) }], reopen), { back });
     if (!active) return;
     const index = space.structure.pages.indexOf(active);
-    const configuration = el('div', 'actions', btn('管理页面块', () => blocks(space, active), 'secondary btn-sm'));
-    if (index > 0) configuration.append(btn('页面前移', () => change(space, [{ op: 'movePage', pageId: active.id, index: index - 1 }]), 'ghost btn-sm'));
-    if (index < space.structure.pages.length - 1) configuration.append(btn('页面后移', () => change(space, [{ op: 'movePage', pageId: active.id, index: index + 1 }]), 'ghost btn-sm'));
-    if (space.structure.pages.length > 1) configuration.append(btn('移除页面', () => change(space, [{ op: 'removePage', pageId: active.id }]), 'destructive-ghost btn-sm'));
+    const configuration = el('div', 'actions', btn('管理页面块', () => blocks(space, active, reopen), 'secondary btn-sm'));
+    if (index > 0) configuration.append(btn('页面前移', () => change(space, [{ op: 'movePage', pageId: active.id, index: index - 1 }], reopen), 'ghost btn-sm'));
+    if (index < space.structure.pages.length - 1) configuration.append(btn('页面后移', () => change(space, [{ op: 'movePage', pageId: active.id, index: index + 1 }], reopen), 'ghost btn-sm'));
+    if (space.structure.pages.length > 1) configuration.append(btn('移除页面', () => change(space, [{ op: 'removePage', pageId: active.id }], reopen), 'destructive-ghost btn-sm'));
     ui.body.prepend(configuration);
   }
 
-  function blocks(space, pageObj) {
+  function blocks(space, pageObj, back) {
+    const reopen = () => blocks(space, pageObj, back);
     const act = (op, index) => ({ op, pageId: pageObj.id, blockId: pageObj.blocks[index].id });
     display('页面块 · ' + pageObj.title,
-      btn('添加块', () => block(space, pageObj), 'secondary btn-sm', 'plus'),
+      btn('添加块', () => block(space, pageObj, null, reopen), 'secondary btn-sm', 'plus'),
       ...pageObj.blocks.map((b, index) => el('div', 'record',
         el('strong', '', title(b)),
         el('div', 'actions',
-          btn('编辑', () => block(space, pageObj, b), 'ghost btn-xs'),
-          index > 0 ? btn('上移', () => change(space, [{ ...act('moveBlock', index), index: index - 1 }]), 'ghost btn-xs') : null,
-          index < pageObj.blocks.length - 1 ? btn('下移', () => change(space, [{ ...act('moveBlock', index), index: index + 1 }]), 'ghost btn-xs') : null,
-          btn('移除', () => change(space, [act('removeBlock', index)]), 'destructive-ghost btn-xs')
+          btn('编辑', () => block(space, pageObj, b, reopen), 'ghost btn-xs'),
+          index > 0 ? btn('上移', () => change(space, [{ ...act('moveBlock', index), index: index - 1 }], reopen), 'ghost btn-xs') : null,
+          index < pageObj.blocks.length - 1 ? btn('下移', () => change(space, [{ ...act('moveBlock', index), index: index + 1 }], reopen), 'ghost btn-xs') : null,
+          btn('移除', () => change(space, [act('removeBlock', index)], reopen), 'destructive-ghost btn-xs')
         )
-      ))
+      )),
+      ...(back ? [{ back }] : [])
     );
   }
 
-  async function block(space, pageObj, existing) {
+  async function block(space, pageObj, existing, back) {
     const config = existing?.config || {};
     const collections = space.structure.collections;
     const params = new URLSearchParams({ kind: 'source', limit: '100' });
@@ -110,8 +114,8 @@ export function spaceEditor(actions, display) {
           ...(f ? { filter: { fieldId: f.id, value: toValue(f, values.filterValue) } } : {})
         };
       }
-      return change(space, [{ op: existing ? 'updateBlock' : 'addBlock', pageId: pageObj.id, blockId: existing?.id, block: b }]);
-    });
+      return change(space, [{ op: existing ? 'updateBlock' : 'addBlock', pageId: pageObj.id, blockId: existing?.id, block: b }], () => block(space, pageObj, existing, back));
+    }, { back });
 
     const controls = ui.controls;
     const show = (keys, enabled) => keys.forEach(key => { controls[key].parentElement.hidden = !enabled; });
@@ -142,34 +146,38 @@ export function spaceEditor(actions, display) {
     toggle();
   }
 
-  function collections(space) {
+  function collections(space, back) {
+    const reopen = () => collections(space, back);
     display('管理集合',
-      btn('新建集合', () => collection(space), 'secondary btn-sm', 'plus'),
+      btn('新建集合', () => collection(space, null, reopen), 'secondary btn-sm', 'plus'),
       ...space.structure.collections.map(c => el('div', 'record',
         el('strong', '', c.name),
         el('div', 'actions',
-          btn('改名', () => collection(space, c), 'ghost btn-xs'),
-          btn('添加字段', () => field(space, c), 'ghost btn-xs')
+          btn('改名', () => collection(space, c, reopen), 'ghost btn-xs'),
+          btn('添加字段', () => field(space, c, null, reopen), 'ghost btn-xs')
         ),
         ...c.fields.map(f => el('div', 'inline',
           el('small', '', f.name + ' · ' + fieldTypes.find(x => x.id === f.type)?.name),
-          btn('编辑字段', () => field(space, c, f), 'ghost btn-xs')
+          btn('编辑字段', () => field(space, c, f, reopen), 'ghost btn-xs')
         ))
-      ))
+      )),
+      ...(back ? [{ back }] : [])
     );
   }
 
-  function collection(space, existing) {
+  function collection(space, existing, back) {
+    const reopen = () => collection(space, existing, back);
     form(existing ? '集合改名' : '新建集合', [
       { key: 'name', label: '集合名称', value: existing?.name, required: true }
     ], '预览', d => change(space, [
       existing
         ? { op: 'updateCollection', collectionId: existing.id, name: d.name }
         : { op: 'createCollection', name: d.name, fields: [{ id: 'title', type: 'text', name: '名称' }] }
-    ]));
+    ], reopen), { back });
   }
 
-  function field(space, c, existing) {
+  function field(space, c, existing, back) {
+    const reopen = () => field(space, c, existing, back);
     const ui = form(existing ? '编辑集合字段' : '添加集合字段', [
       { key: 'name', label: '字段名称', value: existing?.name, required: true },
       { key: 'type', label: '字段类型', options: fieldTypes, value: existing?.type },
@@ -181,15 +189,15 @@ export function spaceEditor(actions, display) {
         options: d.type === 'select' ? d.options.split('\n').map(x => x.trim()).filter(Boolean) : null
       };
       if (d.type === 'select' && !replacement.options.length) throw Error('请至少填写一个选项。');
-      if (!existing) return change(space, [{ op: 'addField', collectionId: c.id, field: replacement }]);
+      if (!existing) return change(space, [{ op: 'addField', collectionId: c.id, field: replacement }], reopen);
       const op = { op: 'updateField', collectionId: c.id, fieldId: existing.id, field: replacement };
       const sameType = existing.type === replacement.type;
       if (sameType && (replacement.type !== 'select' || JSON.stringify(existing.options) === JSON.stringify(replacement.options))) {
-        return change(space, [op]);
+        return change(space, [op], reopen);
       }
       const entries = items(await api('/collections/' + url(c.id) + '/entries'));
       const affected = entries.filter(e => e.values[existing.id] != null && (!sameType || !replacement.options.includes(e.values[existing.id])));
-      if (!affected.length) return change(space, [op]);
+      if (!affected.length) return change(space, [op], reopen);
       const fields = affected.map((e, i) => ({
         key: e.id,
         label: '条目 ' + (e.values.title ?? i + 1) + ' · 原值 ' + String(e.values[existing.id]).slice(0, 80),
@@ -200,22 +208,23 @@ export function spaceEditor(actions, display) {
         ...op,
         migration: Object.fromEntries(Object.entries(values).map(([id, value]) => [id, toValue(replacement, value)])),
         entryRevisions: Object.fromEntries(affected.map(e => [e.id, e.revision]))
-      }]));
+      }], reopen), { back: reopen });
       convert.body.prepend(el('p', 'muted', '留空会清除对应值。附件引用可填写一个或多个附件 ID。'));
-    });
+    }, { back });
     const toggle = () => { ui.controls.options.parentElement.hidden = ui.controls.type.value !== 'select'; };
     ui.controls.type.onchange = toggle;
     toggle();
   }
 
-  async function modules(space) {
+  async function modules(space, back) {
+    const reopen = () => modules(space, back);
     const choices = items(await api('/modules'));
     const ui = form('管理模块', [], '预览', () => {
       const operations = Array.from(list.querySelectorAll('input'), input => ({ op: 'toggleModule', type: input.value, enabled: input.checked }))
         .filter(op => op.enabled === space.structure.disabledModules.includes(op.type));
       if (!operations.length) throw Error('模块状态没有变动。');
-      return change(space, operations);
-    });
+      return change(space, operations, reopen);
+    }, { back });
     const list = el('fieldset', 'handoff-files', el('legend', '', '已启用的模块'));
     for (const choice of choices) {
       const input = el('input');
@@ -227,9 +236,10 @@ export function spaceEditor(actions, display) {
     ui.body.prepend(list);
   }
 
-  function restore(space) {
+  function restore(space, back) {
+    const reopen = () => restore(space, back);
     form('恢复空间', [
-      { key: 'revision', label: '历史版本（当前为 ' + space.revision + '）', type: 'number', value: space.revision - 1, required: true },
+      { key: 'revision', label: '历史版本（当前为 ' + space.revision + '）', type: 'number', value: space.revision - 1, min: 1, max: Math.max(1, space.revision - 1), required: true },
       {
         key: 'scope',
         label: '恢复范围',
@@ -238,15 +248,15 @@ export function spaceEditor(actions, display) {
           { id: 'structure', name: '页面布局和历史集合字段' }
         ]
       }
-    ], '预览', d => previewRestore(space, { expectedRevision: space.revision, targetRevision: Number(d.revision), scope: d.scope }));
+    ], '预览', d => previewRestore(space, { expectedRevision: space.revision, targetRevision: Number(d.revision), scope: d.scope }, reopen), { back });
   }
 
-  async function previewRestore(space, body) {
+  async function previewRestore(space, body, back) {
     const endpoint = path(space, 'restore');
     const result = await api(endpoint, { ...body, mode: 'preview' });
     if (!result.conflicts.length) {
       preview('预览恢复', result, () => api(endpoint, { ...body, mode: 'apply' }),
-        el('p', 'muted', body.scope === 'layout' ? '集合字段和条目将保留。' : '将启用历史集合字段，现有条目将保留。'));
+        el('p', 'muted', body.scope === 'layout' ? '集合字段和条目将保留。' : '将启用历史集合字段，现有条目将保留。'), back);
       return;
     }
     const edits = result.conflicts.map((conflict, index) => {
@@ -268,8 +278,8 @@ export function spaceEditor(actions, display) {
         (migrations[conflict.entryId] ??= {})[f.id] = toValue(f, values[key]);
         entryRevisions[conflict.entryId] = conflict.entryRevision;
       }
-      return previewRestore(space, { ...body, migrations, entryRevisions });
-    });
+      return previewRestore(space, { ...body, migrations, entryRevisions }, back);
+    }, { back });
     ui.body.prepend(el('p', 'muted', '留空会清除对应值。完成转换后可预览并应用。'));
   }
 

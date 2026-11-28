@@ -2,7 +2,7 @@
 
 ## 升级
 
-Windows 打包产物位于 `dist/Xiaomaoqiu-win32-x64`。退出使用同一数据目录的旧工作台后再打开新版本，SQLite 会在首次打开时迁移到 v6。迁移保留项目、线程、原生会话与资料。升级前可用 `npm run backup -- save <数据目录> <新备份目录> --without-access` 创建快照。恢复到新的数据目录，请勿混用 v5 和 v6 程序。恢复后的外部插件需要重新审查，未发出的确认和在途命令须重新核对。
+Windows 打包产物位于 `dist/Xiaomaoqiu-win32-x64`。退出使用同一数据目录的旧工作台后再打开新版本，SQLite 会在首次打开时自动升级迁移（第三阶段最初迁移至 v6，当前工作台主库已演进至 v10）。迁移保留项目、线程、原生会话与资料。升级前可用 `npm run backup -- save <数据目录> <新备份目录> --without-access` 创建快照。恢复到新的数据目录，请勿用旧版本直接打开高版本数据库。恢复后的外部插件需要重新审查，未发出的确认和在途命令须重新核对。
 
 ## 接入模型
 
@@ -31,13 +31,17 @@ Windows 打包产物位于 `dist/Xiaomaoqiu-win32-x64`。退出使用同一数�
 | 请求 | 字段或返回 |
 | --- | --- |
 | `GET /threads/{id}` | `mainChat.pending` 含待确认的工具、参数、确认 ID 和到期时间 |
-| `POST /chat/approve` | `messageId`、`approvalId`、布尔 `approved` |
+| `POST /chat/approve` | `messageId`、`approvalId`、布尔 `approved`；启用或回滚外部插件时附 `pluginAuthorization: { digest, trustCode, allowNetwork }` |
+| `POST /chat/cancel` | `messageId`；取消主聊正在排队或生成中的对话任务 |
+| `GET/POST /chat/persona` | 读取或写入 `persona.md`（传 `{ reset: true }` 恢复默认人格） |
+| `GET/POST /chat/policy` | 读取或保存外部模型分享开关（历史、项目、记忆、附件）、工具预算上限及本机授权目录 |
 | `GET/POST /chat/models` | 列表／保存、选择、启停或删除配置。连接、能力测试和发现使用 `/chat/models/test`、`/chat/models/capability`、`/chat/models/discover` |
-| `GET/POST /chat/plugins` | 列表／`stage`、`stageManifest`、`review`、`validate`、`configure`、`test`、`activate`、`disable`、`export`、`rollback`、`uninstall` |
+| `GET/POST /chat/plugins` | 列表／`stage`、`stageManifest`、`revise`、`review`（`version` 取 `current`/`candidate`/`previous`）、`validate`、`configure`、`test`、`activate`、`disable`、`export`、`rollback`、`uninstall`，其中代码与网络确认传 `trustCode`/`allowNetwork` |
+| `GET /agent-monitor` | 本机所有者读取工作 Bot 在线状态、在途/待核对统计及用量（支持 `?days=30`） |
 | `POST /tasks/{id}/coordination` | `coordination` 为 `off`、`notify`、`assist`、`handoff`，另可传 `handoffTargets`、`paused` |
 | `POST /runs/{id}/communication` | 使用本运行令牌，提交 `kind`、`text`、稳定 `requestId`。可带 `replyTo`、`refs`、`recipientInstanceId`。交付可附 `version`、`paths`、`completed`、`remaining`、`checks` 和 `risks` |
 | `GET/POST /chat/daily` | GET 查询带 `threadId`。POST 写入带 `threadId`、`action` 及所需字段，修改时附 `expectedRevision`。提醒时间用带时区的 ISO 时间 |
-| `GET/POST /chat/memory-candidates` | GET 查询带 `threadId`。POST 用 `threadId`、`id` 和 `accept` 或 `reject`，接受前可修改内容和事实键 |
+| `GET/POST /chat/memory-candidates` | GET 查询带 `threadId`。POST 用 `{ threadId, id, action: "accept" | "reject", body?, factKey? }`，接受前可修改内容和事实键 |
 
 ## A–K 落地与范围
 
@@ -48,12 +52,12 @@ Windows 打包产物位于 `dist/Xiaomaoqiu-win32-x64`。退出使用同一数�
 | C 网页工具 | 独立 Web 插件，Brave 与 SearXNG、有限批次读取、正文与来源、实际资料归档。支持静态 HTML、纯文本和 JSON。 |
 | D 自主协同 | 重要事件持久入队，非项目工作可只持通信令牌。限定当前任务、确认事实和指定转派对象，限制协调动作及层数。 |
 | E 意图与授权 | 移除自然语言关键词门控。模型按意图和上下文提出操作，宿主依据真实主体、工具参数、权限和所有者确认执行。结果以实际工具回执为据。 |
-| F Bot 与工作区管理 | 保留官方连接器，复用健康检查、配置、模型选择和工作区授权。Codex 可查目录、导入与续接。DSH 可续接已绑定会话，其 ACP 当前没有可核对的外部会话目录。 |
+| F Bot 与工作区管理 | 保留官方连接器，复用健康检查、配置、模型选择和工作区授权。Codex 与经 ACP 声明目录能力的 DSH、Hermes 均可按配置工作区分页查看并导入原生会话与续接；缺少原生目录能力的适配器仅保留工作台缓存。 |
 | G 记忆与人格 | 复用 Home 记录、版本、检索和遗忘。新增长期记忆候选核对和事实键归一化。候选由用户亲自接受。 |
 | H 在途撤权 | 将配置、共享、资料范围和插件版本变化纳入在途检查，阻止模型用旧权限继续发起请求。 |
 | I 日常与桌面工具 | 精确基础四则运算、事项和提醒、授权文本与目录操作、工作话题定位、归档。提醒由进程运行时触发，重新启动后补记。 |
 | J 交付 | 重要报告、转达和交付可追溯到主体及运行。汇总展示 Bot 自报证据，用户仍可逐条验收。 |
-| K 可靠性 | SQLite v6 迁移、备份与恢复测试，保留先前的断线、迟到回执、冻结文本和原生审批行为。备份覆盖插件清单、包和 Skill。外部插件的任意运行数据目录及模型密钥不随备份复制。 |
+| K 可靠性 | SQLite 迁移（现已演进至 v10）、备份与恢复测试，保留先前的断线、迟到回执、冻结文本和原生审批行为。备份覆盖插件清单、包和 Skill，并脱敏保存可选 `desktop-connector.json`。外部插件的任意运行数据目录及模型/插件密钥不随备份复制。 |
 
 ## 选型与验证
 

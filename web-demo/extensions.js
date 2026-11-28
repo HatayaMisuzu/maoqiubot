@@ -224,7 +224,7 @@ function configure(p, back) {
         body: '允许此插件访问填写的局域网搜索端点？',
         confirmLabel: '允许'
       });
-      if (!ok) { configure(p, back); return; }
+      if (!ok) return;
       config.privateLan = true;
     }
     const network = p.enabled && p.current.manifest.capabilities.some(cap => cap.startsWith('network.'));
@@ -234,7 +234,7 @@ function configure(p, back) {
         body: '应用此插件的网络配置？',
         confirmLabel: '确认应用'
       });
-      if (!ok) { configure(p, back); return; }
+      if (!ok) return;
     }
     await plug({ action: 'configure', id: p.id, config, allowNetwork: network });
     await extensions(back);
@@ -242,10 +242,15 @@ function configure(p, back) {
 }
 
 function testPlugin(p, back) {
-  form('测试 ' + p.id, [
+  const web = p.id === 'web';
+  const fields = web ? [
     { key: 'kind', label: '测试内容', options: [{ id: 'search', name: '搜索' }, { id: 'read', name: '读取网页' }], value: 'read' },
     { key: 'value', label: '公开搜索词或网页 URL', required: true }
-  ], '发送测试请求', async input => {
+  ] : [
+    { key: 'json', label: '测试输入 JSON', type: 'textarea', value: '{}' }
+  ];
+  form('测试 ' + p.id, fields, '发送测试请求', async values => {
+    const input = web ? values : JSON.parse(values.json || '{}');
     const result = await plug({ action: 'test', id: p.id, input });
     displayDialog('测试结果', [el('pre', 'text', JSON.stringify(result, null, 2))], [
       btn('返回插件列表', () => extensions(back), 'secondary')
