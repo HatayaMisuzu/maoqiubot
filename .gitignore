@@ -3,6 +3,7 @@ data/
 *.local.json
 .env
 backups/
+build/
 dist/
 test-results/
 playwright-report/

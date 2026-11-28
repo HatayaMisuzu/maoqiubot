@@ -64,6 +64,20 @@ function connectorSettings({ root, workspace, dataDir }) {
     config.stateDir = join(dataDir, 'node-local')
     for (const instance of config.instances) if (instance.adapterKey === 'dsh')
       instance.command = detectedCommand('dsh','dsh') ?? (process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
+    if (!config.instances.some(instance => instance.adapterKey === 'hermes')) {
+      const hermesCommand = detectedCommand('hermes', 'hermes')
+      if (hermesCommand) {
+        config.instances.push({
+          id: 'hermes-local',
+          name: 'Hermes',
+          adapterKey: 'hermes',
+          profileId: 'default',
+          workspaceRef: '.',
+          command: hermesCommand,
+          args: ['acp']
+        })
+      }
+    }
     write(file, config)
   }
   return { file, editable, workspace }
@@ -83,6 +97,42 @@ function write(file, config) {
     writeFileSync(stage, JSON.stringify(config, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
     renameSync(stage, file)
   } finally { rmSync(stage, { force: true }) }
+}
+
+function readCodexLocalSummary(codexHome) {
+  if (!codexHome || typeof codexHome !== 'string') return { modelProvider: null, model: null }
+  const configFile = join(codexHome, 'config.toml')
+  try {
+    const meta = statSync(configFile, { throwIfNoEntry: false })
+    if (!meta?.isFile() || meta.size > 2 * 1024 * 1024) return { modelProvider: null, model: null }
+    const text = readFileSync(configFile, 'utf8').replace(/^\uFEFF/, '')
+    let modelProvider = null
+    let model = null
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim()
+      if (!line || line.startsWith('#')) continue
+      // Only inspect top-level keys before the first TOML section header.
+      if (line.startsWith('[')) break
+      const pair = line.match(/^(model_provider|model)\s*=\s*(.+)$/)
+      if (!pair) continue
+      const key = pair[1]
+      const valueText = pair[2].trim()
+      let parsed = null
+      const dq = valueText.match(/^"((?:[^"\\]|\\.)*)"(?:\s*(?:#.*)?)?$/)
+      if (dq) {
+        parsed = dq[1].replace(/\\(.)/g, '$1')
+      } else {
+        const sq = valueText.match(/^'([^']*)'(?:\s*(?:#.*)?)?$/)
+        if (sq) parsed = sq[1]
+      }
+      if (!parsed) continue
+      if (key === 'model_provider') modelProvider = parsed
+      else if (key === 'model') model = parsed
+    }
+    return { modelProvider, model }
+  } catch {
+    return { modelProvider: null, model: null }
+  }
 }
 
 function settingsView(settings) {
@@ -105,7 +155,10 @@ function settingsView(settings) {
     }
     return { id, name, adapterKey, profileId: profileId ?? 'default', workspaceRef, command, worktree, configurationHome,
       configuredHome: env?.[agentHomeVariable(adapterKey)] || '',
-      ...(adapterKey === 'codex' ? { codexProviderMode: instance.codexProviderMode ?? 'official' } : {}),
+      ...(adapterKey === 'codex' ? {
+        codexProviderMode: instance.codexProviderMode ?? 'official',
+        codexLocal: readCodexLocalSummary(home)
+      } : {}),
       ...dsh, detectedCommand: detectedCommand(adapterKey,command,home) }
   })
   return { file: settings.file, editable: settings.editable, workspace: settings.workspace, instances }
@@ -234,10 +287,96 @@ async function createWorktree(settings, db, sourceId, instanceId, parent) {
   }
 }
 
+function boundCodexThreads(db, instanceId) {
+  const row = db.prepare(`SELECT COUNT(*) AS count FROM threads
+    WHERE instanceId=?
+      AND sessionId IS NOT NULL
+      AND COALESCE(nativeReleased,0)=0
+      AND nativeInvalid IS NULL
+      AND state IN ('active','archived','deleted')`).get(instanceId)
+  return Number(row?.count ?? 0)
+}
+
+function previewCodexProviderSwitch(settings, db, input) {
+  if (!settings.editable) throw Error('当前使用独立 JSON 配置，请在原文件中修改')
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('实例配置无效')
+  const instanceId = typeof input.instanceId === 'string' ? input.instanceId.trim() : ''
+  const config = configFrom(settings.file)
+  const existing = config.instances.find(item => item.id === instanceId && item.adapterKey === 'codex')
+  if (!existing) throw Error('找不到指定的本机 Codex 实例')
+  const codexProviderMode = input.codexProviderMode
+  if (!['official', 'native'].includes(codexProviderMode)) throw Error('请选择有效的 Codex 供应商模式')
+  return {
+    instanceId,
+    codexProviderMode,
+    previousMode: existing.codexProviderMode ?? 'official',
+    boundThreads: boundCodexThreads(db, instanceId)
+  }
+}
+
+function switchCodexProviderMode(settings, db, input) {
+  const { instanceId, codexProviderMode, boundThreads } = previewCodexProviderSwitch(settings, db, input)
+  if (boundThreads > 0 && input?.confirmRebind !== true) {
+    return { applied: false, requiresConfirmation: true, boundThreads }
+  }
+  const config = configFrom(settings.file)
+  config.instances = config.instances.map(item => {
+    if (item.id !== instanceId) return item
+    const next = { ...item }
+    if (codexProviderMode === 'native') next.codexProviderMode = 'native'
+    else delete next.codexProviderMode
+    return next
+  })
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    if (boundThreads > 0) {
+      db.prepare(`UPDATE threads
+        SET nativeInvalid=?,
+            state=CASE WHEN state='active' THEN 'archived' ELSE state END
+        WHERE instanceId=?
+          AND sessionId IS NOT NULL
+          AND COALESCE(nativeReleased,0)=0
+          AND nativeInvalid IS NULL
+          AND state IN ('active','archived','deleted')`)
+        .run('Codex 供应商配置已切换，请新建话题或创建替代话题继续', instanceId)
+    }
+    db.prepare("UPDATE instances SET runtimeScopeId=NULL,online=0 WHERE id=? AND nodeId='local' AND adapterKey='codex'")
+      .run(instanceId)
+    write(settings.file, config)
+    db.exec('COMMIT')
+  } catch (error) {
+    try { db.exec('ROLLBACK') } catch {}
+    throw error
+  }
+  return {
+    applied: true,
+    requiresConfirmation: false,
+    boundThreads,
+    invalidatedThreads: boundThreads,
+    settings: settingsView(settings)
+  }
+}
+
+function clearUnboundNativeCodexScopes(settings, db) {
+  const config = configFrom(settings.file)
+  const cleared = []
+  for (const instance of config.instances) {
+    if (instance.adapterKey !== 'codex' || instance.codexProviderMode !== 'native') continue
+    if (boundCodexThreads(db, instance.id) !== 0) continue
+    const result = db.prepare("UPDATE instances SET runtimeScopeId=NULL WHERE id=? AND nodeId='local' AND adapterKey='codex' AND runtimeScopeId IS NOT NULL")
+      .run(instance.id)
+    if (result.changes > 0) cleared.push(instance.id)
+  }
+  return cleared
+}
+
 function worktreeSource(settings, instance) {
   if (!settings.editable) return undefined
   return configFrom(settings.file).instances.find(i => i.id === instance.id && i.workspaceRef === instance.workspaceRef &&
     i.adapterKey === instance.adapterKey)?.worktree?.sourceId
 }
 
-module.exports = { connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath }
+module.exports = {
+  connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath,
+  readCodexLocalSummary, boundCodexThreads, previewCodexProviderSwitch, switchCodexProviderMode, clearUnboundNativeCodexScopes
+}

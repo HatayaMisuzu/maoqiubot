@@ -46,7 +46,7 @@
                                                                 +-------------------------------+
 ```
 
-- **桌面宿主 (`desktop/`)**：Electron 主进程托管内嵌服务端与本机连接器；打包分发时附带 `agent-manager.exe` 供「Agent 设置 → 外接 Agent 管理」调用。直接通过浏览器访问 `npm.cmd run local` / `npm.cmd start` 时，无 Electron IPC，UI 自动降级为「Bot 监控」对话视图。
+- **桌面宿主 (`desktop/`)**：Electron 主进程托管内嵌服务端与本机连接器；打包分发时附带 `agent-manager.exe` 供「Agent 设置 → 外接 Agent 管理」调用。`dist/` 目录仅保留最新完整包 `dist/Xiaomaoqiu-win32-x64/`，旧发行包归档至 `backups/desktop-packages/`，预编译与编译缓存位于 `build/`。直接通过浏览器访问 `npm.cmd run local` / `npm.cmd start` 时，无 Electron IPC，UI 自动降级为「Bot 监控」对话视图。
 - **数据与状态**：主库为 `<data>/workbench.sqlite`（当前 `PRAGMA user_version = 10`），连接器状态与本地命令映射保存在 `<data>/node-local`（当前 `PRAGMA user_version = 2`），桌面连接器配置保存在 `<data>/desktop-connector.json`（含经 `MAOQIU_CONNECTOR_CONFIG` 指定的自定义文件）。
 
 ## 常用环境变量速查
@@ -60,6 +60,7 @@
 | `MAOQIU_CHAT_CODEX` | 覆盖内置 Codex 主聊可执行程序路径（默认 `codex`） |
 | `MAOQIU_SAFE_PLUGINS` | 设为 `1` 时暂停加载全部外部扩展代码 |
 | `MAOQIU_PACKAGE_OUT` | 覆盖 `npm run package:desktop` 输出目录（默认 `dist/`） |
+| `MAOQIU_PACKAGE_ARCHIVE` | 覆盖 `npm run package:desktop` 归档旧包的目录（默认 `backups/desktop-packages/`） |
 | `MAOQIU_MODEL_KEY_*` | 在启动环境中为自定义主聊模型提供密钥（不会随连接器传入子 Agent 环境） |
 | `MAOQIU_PLUGIN_KEY_*` | 为插件 / 声明式业务 API 提供密钥（从 Codex 主聊与连接器子进程环境中剥离） |
 | `OWNER_TOKEN` / `NODE_TOKEN` | 本机脚本调用 HTTP API 或连接器鉴权令牌（默认由 `<data>/access.local.json` 读取） |

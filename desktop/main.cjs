@@ -5,7 +5,10 @@ const { delimiter, dirname, join, resolve } = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { createAgentManager } = require('./agent-manager.cjs')
 const { agentHome } = require('../contracts/agent-runtime.ts')
-const { connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath } = require('./connector-settings.cjs')
+const {
+  connectorSettings, settingsView, saveInstance, createWorktree, validateWorktreeRequest, worktreeSource, normalizeStablePath,
+  previewCodexProviderSwitch, switchCodexProviderMode, clearUnboundNativeCodexScopes
+} = require('./connector-settings.cjs')
 
 app.setName('小毛球 Bot 工作台')
 app.setAppUserModelId('local.xiaomaoqiu.workbench')
@@ -141,10 +144,37 @@ async function start() {
   await once(workbench.server, 'listening')
   const { port } = workbench.server.address()
   origin = 'http://127.0.0.1:' + port
+  function resolveInstanceHomes(instanceId, instanceList = view().instances) {
+    const variables = { codex: 'CODEX_HOME', dsh: 'DSH_HOME', hermes: 'HERMES_HOME' }
+    const instances = instanceList.filter(instance => instance.configurationHome)
+    const selected = instances.find(instance => instance.id === instanceId)
+    if (instanceId != null && !selected) throw Error('找不到指定的本机 Agent 实例')
+    const env = {}
+    for (const [adapter, key] of Object.entries(variables)) {
+      const homes = new Set(instances.filter(instance => instance.adapterKey === adapter)
+        .map(instance => instance.configurationHome))
+      const home = homes.size === 1 ? [...homes][0] :
+        selected?.adapterKey === adapter ? selected.configurationHome : agentHome(adapter, undefined, paths.workspace)
+      env[key] = normalizeStablePath(home)
+    }
+    return env
+  }
   function view() {
     const s = settings()
-    try { return { ...settingsView(s), connectorRunning: !!connector, lastError: connectorExit } }
-    catch { return { ...s, instances: [], connectorRunning: false, lastError: '无法读取连接器配置，请核对路径和 JSON 内容。' } }
+    try {
+      const base = settingsView(s)
+      const instances = base.instances.map(instance => {
+        if (instance.adapterKey !== 'codex' || !agentManager) return instance
+        let codexManagerProviders = []
+        try {
+          codexManagerProviders = agentManager.codexProviders(resolveInstanceHomes(instance.id, base.instances))
+        } catch {}
+        return { ...instance, codexManagerProviders }
+      })
+      return { ...base, instances, connectorRunning: !!connector, lastError: connectorExit }
+    } catch {
+      return { ...s, instances: [], connectorRunning: false, lastError: '无法读取连接器配置，请核对路径和 JSON 内容。' }
+    }
   }
   function assertConnectorIdle({ allowPurgedReleaseUncertain = false } = {}) {
     const uncertainFilter = allowPurgedReleaseUncertain
@@ -167,24 +197,17 @@ async function start() {
     settingsView(config)
     launchConnector(paths, config.file, port)
   }
+  function resumeConnectorAfterManager() {
+    if (closing || connector) return
+    const config = settings()
+    settingsView(config)
+    try { clearUnboundNativeCodexScopes(config, workbench.db) } catch {}
+    launchConnector(paths, config.file, port)
+  }
   agentManager = createAgentManager({
     root: paths.root, resourcesPath: process.resourcesPath, packaged: app.isPackaged,
-    userData: app.getPath('userData'), stopConnector, resumeConnector,
-    instanceHomes: instanceId => {
-      const variables = { codex: 'CODEX_HOME', dsh: 'DSH_HOME', hermes: 'HERMES_HOME' }
-      const instances = view().instances.filter(instance => instance.configurationHome)
-      const selected = instances.find(instance => instance.id === instanceId)
-      if (instanceId != null && !selected) throw Error('找不到指定的本机 Agent 实例')
-      const env = {}
-      for (const [adapter, key] of Object.entries(variables)) {
-        const homes = new Set(instances.filter(instance => instance.adapterKey === adapter)
-          .map(instance => instance.configurationHome))
-        const home = homes.size === 1 ? [...homes][0] :
-          selected?.adapterKey === adapter ? selected.configurationHome : agentHome(adapter, undefined, paths.workspace)
-        env[key] = normalizeStablePath(home)
-      }
-      return env
-    },
+    userData: app.getPath('userData'), stopConnector, resumeConnector: resumeConnectorAfterManager,
+    instanceHomes: instanceId => resolveInstanceHomes(instanceId),
     assertIdle: () => {
       if (restarting) throw Error('连接器正在重启，请稍后打开外接 Agent 管理')
       assertConnectorIdle({ allowPurgedReleaseUncertain: false })
@@ -203,6 +226,32 @@ async function start() {
     })().finally(() => { restarting = undefined })
     return restarting
   }
+  function setCodexProvider(value) {
+    if (closing) return Promise.reject(Error('工作台正在退出'))
+    if (restarting) return Promise.reject(Error('连接器正在重启，请稍后再试'))
+    if (agentManager.status().active) return Promise.reject(Error('请先关闭外接 Agent 管理窗口，再调整 Codex 供应商'))
+    let preview
+    try {
+      assertConnectorIdle({ allowPurgedReleaseUncertain: false })
+      preview = previewCodexProviderSwitch(settings(), workbench.db, value)
+    } catch (error) {
+      return Promise.reject(error)
+    }
+    if (preview.boundThreads > 0 && value?.confirmRebind !== true) {
+      return Promise.resolve({ applied: false, requiresConfirmation: true, boundThreads: preview.boundThreads, view: view() })
+    }
+    restarting = (async () => {
+      await stopConnector()
+      const result = switchCodexProviderMode(settings(), workbench.db, {
+        instanceId: preview.instanceId,
+        codexProviderMode: preview.codexProviderMode,
+        confirmRebind: value?.confirmRebind === true
+      })
+      resumeConnector()
+      return { ...result, view: view() }
+    })().finally(() => { restarting = undefined })
+    return restarting
+  }
   function handle(channel, callback) {
     ipcMain.handle(channel, (event, value) => {
       if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame ||
@@ -212,6 +261,7 @@ async function start() {
   }
   handle('connector:settings', view)
   handle('connector:save', value => saveInstance(settings(), workbench.db, value))
+  handle('connector:codex-provider', setCodexProvider)
   handle('connector:restart', restartConnector)
   handle('agent-manager:status', agentManager.status)
   handle('agent-manager:open', agentManager.open)

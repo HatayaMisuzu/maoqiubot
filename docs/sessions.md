@@ -34,7 +34,7 @@
 | 独立 API 工作 Bot | 工作台本地话题与消息 | 本地分页；当前请求和获准的近期历史送到选定模型 | 复用模型配置，强制非流式单次请求收集完整 token 用量并支持取消；底层模型停用或缺失时动态标记离线；没有原生工作目录、会话 ID 或内部工具 |
 | 旧连接器 | 沿用原有绑定 | 未声明的新能力视为不可用 | 保留既有派发与回执协议 |
 
-Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。在「执行实例与工作区」中可选择 Codex 供应商模式（`official` 官方 ChatGPT 登录 / `native` 跟随本机供应商）。原生目录支持不等于外部客户端已经释放写入占用。ACP 的 list 与 delete 由协议握手字段声明，fork 属于需要单独协商的扩展。[ACP 目录](https://agentclientprotocol.com/protocol/v1/session-list) · [ACP 删除语义](https://agentclientprotocol.com/protocol/v1/session-delete) · [ACP fork 草案](https://agentclientprotocol.com/rfds/session-fork)
+Codex 的本地能力探测与绑定读取通过官方 stdio 接口完成。在桌面端「Agent 设置」顶层「Codex 供应商」面板即可直接调节同一个 Codex 实例的供应商模式（`official` 官方 ChatGPT 登录 / `native` 跟随本机供应商）并查看只读 `config.toml` 摘要与外接管理已配置的供应商名称（新建/复制实例也可在「执行实例与工作区」中预设该模式）。若已有绑定原生会话，切换会先要求确认，确认后将旧绑定话题标记 `nativeInvalid` 并归档（保留本地记录，可用「建立替代话题」继续）；无绑定原生会话时，`native` 模式 Codex 在关闭「外接 Agent 管理」窗口后也会自动按新供应商重连。原生目录支持不等于外部客户端已经释放写入占用。ACP 的 list 与 delete 由协议握手字段声明，fork 属于需要单独协商的扩展。[ACP 目录](https://agentclientprotocol.com/protocol/v1/session-list) · [ACP 删除语义](https://agentclientprotocol.com/protocol/v1/session-delete) · [ACP fork 草案](https://agentclientprotocol.com/rfds/session-fork)
 
 工作台联系人下可搜索会话和查看原生目录。原生目录按实例、工作区、账号/profile 读取，已绑定或待导入的会话只在原项目及实例显示。原生历史保留本次页面会话中已读取的分页内容和读取时间，掉线时显示为缓存。Codex 可按需从 App Server 查询额度窗口，DSH/Hermes 提示在原生客户端查看官方订阅额度并在工作台「Agent 设置」（浏览器为「Bot 监控」）统一查看运行状态与任务用量。[Codex App Server](https://learn.chatgpt.com/docs/app-server)
 

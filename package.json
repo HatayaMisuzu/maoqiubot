@@ -16,7 +16,7 @@
     "start": "node server/index.ts",
     "connector": "node connector/index.ts",
     "backup": "node scripts/backup.ts",
-    "test": "node --test",
+    "test": "node --test \"test/*.test.mjs\"",
     "test:e2e": "playwright test"
   },
   "dependencies": {

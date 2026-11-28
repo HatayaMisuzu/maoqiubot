@@ -35,7 +35,7 @@ test('内置 Agent 管理器只继承运行所需环境，不接收工作台访�
 test('Windows 桌面管理器可打开随包可执行文件并正常退出', { skip: process.platform !== 'win32' }, async t => {
   const root = mkdtempSync(join(tmpdir(), 'maoqiu-agent-manager-'))
   t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
-  const directory = join(root, 'dist', 'agent-manager')
+  const directory = join(root, 'build', 'agent-manager')
   mkdirSync(directory, { recursive: true })
   copyFileSync(process.execPath, join(directory, 'agent-manager.exe'))
   let stopped = 0

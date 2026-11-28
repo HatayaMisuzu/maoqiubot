@@ -1,8 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { createServer } from 'node:http'
 import { once } from 'node:events'
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -12,12 +13,16 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { codexEnvironment } from '../contracts/codex-local.ts'
 import { agentEnvironment } from '../connector/rpc.ts'
 import { sanitizeConnectorConfig, transfer } from '../scripts/backup.ts'
+import { archiveExistingDist, resolveAgentManagerDir } from '../scripts/package-desktop.mjs'
 import { startServer } from '../server/index.ts'
 import { agentMonitor } from '../server/tasks/agent-monitor.ts'
 import { dshSessionUsage } from '../server/tasks/dsh-monitor.ts'
 
 const require = createRequire(import.meta.url)
-const { normalizeStablePath, connectorSettings, validateWorktreeRequest } = require('../desktop/connector-settings.cjs')
+const {
+  normalizeStablePath, connectorSettings, settingsView, validateWorktreeRequest,
+  readCodexLocalSummary, switchCodexProviderMode, clearUnboundNativeCodexScopes
+} = require('../desktop/connector-settings.cjs')
 const { createAgentManager } = require('../desktop/agent-manager.cjs')
 
 test('环境隔离同时剥离 MAOQIU_PLUGIN_KEY_* 与 MAOQIU_MODEL_KEY_*', () => {
@@ -359,7 +364,7 @@ test('桌面端 normalizeStablePath 支持未创建尾级子目录，validateWor
   assert.equal(validSource.id, 'codex-local')
 
   if (process.platform === 'win32') {
-    const binDir = join(root, 'dist', 'agent-manager')
+    const binDir = join(root, 'build', 'agent-manager')
     mkdirSync(binDir, { recursive: true })
     copyFileSync(process.execPath, join(binDir, 'agent-manager.exe'))
     const manager = createAgentManager({
@@ -378,4 +383,236 @@ test('桌面端 normalizeStablePath 支持未创建尾级子目录，validateWor
     assert.equal(manager.status().active, false)
     assert.equal(manager.status().instanceId, undefined)
   }
+})
+
+test('resolveAgentManagerDir 与 archiveExistingDist 确保 dist 仅留新包并将旧包归档留档', t => {
+  const root = mkdtempSync(join(tmpdir(), 'maoqiu-dist-policy-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+
+  const legacyDir = join(root, 'dist', 'agent-manager')
+  mkdirSync(legacyDir, { recursive: true })
+  writeFileSync(join(legacyDir, 'agent-manager.exe'), 'legacy')
+  assert.equal(resolveAgentManagerDir(root), legacyDir)
+
+  const preferredDir = join(root, 'build', 'agent-manager')
+  mkdirSync(preferredDir, { recursive: true })
+  writeFileSync(join(preferredDir, 'agent-manager.exe'), 'preferred')
+  assert.equal(resolveAgentManagerDir(root), preferredDir)
+
+  const distDir = join(root, 'dist-stage-test')
+  const archiveDir = join(root, 'backups', 'desktop-packages')
+  mkdirSync(join(distDir, 'Xiaomaoqiu-win32-x64'), { recursive: true })
+  mkdirSync(join(distDir, 'stability-20261126'), { recursive: true })
+  writeFileSync(join(distDir, 'Xiaomaoqiu-win32-x64', 'marker.txt'), 'old-latest')
+  writeFileSync(join(distDir, 'stability-20261126', 'marker.txt'), 'old-stability')
+  mkdirSync(join(archiveDir, 'Xiaomaoqiu-win32-x64-20261128-110000'), { recursive: true })
+
+  const moved = archiveExistingDist({ distDir, archiveDir, keepName: 'Xiaomaoqiu-win32-x64', stamp: '20261128-110000' })
+  assert.equal(moved.length, 2)
+  assert.deepEqual(readdirSync(distDir), [])
+  assert.equal(readFileSync(join(archiveDir, 'Xiaomaoqiu-win32-x64-20261128-110000-2', 'marker.txt'), 'utf8'), 'old-latest')
+  assert.equal(readFileSync(join(archiveDir, 'stability-20261126', 'marker.txt'), 'utf8'), 'old-stability')
+})
+
+test('connectorSettings 首次初始化时自动检测本机 Hermes，未安装时不生成无效实例', t => {
+  const root = mkdtempSync(join(tmpdir(), 'maoqiu-hermes-init-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+
+  const saved = {
+    HERMES_HOME: process.env.HERMES_HOME,
+    Path: process.env.Path,
+    PATH: process.env.PATH,
+    MAOQIU_CONNECTOR_CONFIG: process.env.MAOQIU_CONNECTOR_CONFIG
+  }
+  const restoreEnv = () => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+  t.after(restoreEnv)
+
+  delete process.env.MAOQIU_CONNECTOR_CONFIG
+
+  const fakeHermesHome = join(root, 'fake-hermes-home')
+  const binDir = join(fakeHermesHome, 'bin')
+  mkdirSync(binDir, { recursive: true })
+  const fakeHermesBin = join(binDir, process.platform === 'win32' ? 'hermes.exe' : 'hermes')
+  writeFileSync(fakeHermesBin, '')
+  process.env.HERMES_HOME = fakeHermesHome
+
+  const dataWithHermes = join(root, 'data-with')
+  mkdirSync(dataWithHermes, { recursive: true })
+  const s1 = connectorSettings({ root: process.cwd(), workspace: root, dataDir: dataWithHermes })
+  const cfg1 = JSON.parse(readFileSync(s1.file, 'utf8'))
+  const hermes1 = cfg1.instances.find(i => i.adapterKey === 'hermes')
+  assert.ok(hermes1)
+  assert.equal(hermes1.id, 'hermes-local')
+  assert.equal(hermes1.command, fakeHermesBin)
+  assert.deepEqual(hermes1.args, ['acp'])
+
+  process.env.HERMES_HOME = join(root, 'missing-hermes-home')
+  if ('Path' in process.env) process.env.Path = ''
+  if ('PATH' in process.env) process.env.PATH = ''
+  const dataWithoutHermes = join(root, 'data-without')
+  mkdirSync(dataWithoutHermes, { recursive: true })
+  const s2 = connectorSettings({ root: process.cwd(), workspace: root, dataDir: dataWithoutHermes })
+  const cfg2 = JSON.parse(readFileSync(s2.file, 'utf8'))
+  assert.equal(cfg2.instances.some(i => i.adapterKey === 'hermes'), false)
+})
+
+test('readCodexLocalSummary 只读解析顶层供应商字段并在首个 section 前停止', t => {
+  const root = mkdtempSync(join(tmpdir(), 'maoqiu-codex-toml-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+
+  assert.deepEqual(readCodexLocalSummary(root), { modelProvider: null, model: null })
+  writeFileSync(join(root, 'config.toml'), [
+    '# 注释行',
+    'model = "gpt-6.1-sol" # 行尾注释',
+    "model_provider = 'custom' # 单引号",
+    '[model_providers.custom]',
+    'model = "must-not-read"',
+    'model_provider = "other"',
+    'api_key = "TOP-SECRET"'
+  ].join('\n'))
+  assert.deepEqual(readCodexLocalSummary(root), { modelProvider: 'custom', model: 'gpt-6.1-sol' })
+})
+
+test('单一 Codex 实例可安全切换供应商模式并在无绑定话题时自动解除旧范围', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'maoqiu-codex-switch-'))
+  const dataDir = join(root, 'data')
+  mkdirSync(dataDir, { recursive: true })
+  const savedOverride = process.env.MAOQIU_CONNECTOR_CONFIG
+  delete process.env.MAOQIU_CONNECTOR_CONFIG
+  let app
+  t.after(async () => {
+    if (savedOverride === undefined) delete process.env.MAOQIU_CONNECTOR_CONFIG
+    else process.env.MAOQIU_CONNECTOR_CONFIG = savedOverride
+    if (app) {
+      const close = app.close()
+      app.server.closeAllConnections()
+      await close
+    }
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  })
+
+  app = startServer({ port: 0, dataDir, chat: false })
+  await once(app.server, 'listening')
+  const settings = connectorSettings({ root: process.cwd(), workspace: root, dataDir })
+
+  const codexScope1 = '1'.repeat(64)
+  const dshScope = '2'.repeat(64)
+  app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run('codex-local', 'local', 'Codex', 'codex', root, '["run"]', new Date().toISOString(), 1, '{}', 'default', codexScope1)
+  app.db.prepare(`INSERT INTO instances(id,nodeId,name,adapterKey,workspaceRef,availableActions,lastSeen,online,capabilities,profileId,runtimeScopeId)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+    .run('dsh-local', 'local', 'DSH', 'dsh', root, '["run"]', new Date().toISOString(), 1, '{}', 'default', dshScope)
+
+  // 无绑定原生会话时，同一实例可直接切换并清旧 scope。
+  const firstSwitch = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' })
+  assert.equal(firstSwitch.applied, true)
+  assert.equal(firstSwitch.requiresConfirmation, false)
+  assert.equal(firstSwitch.boundThreads, 0)
+  assert.equal(settingsView(settings).instances.find(i => i.id === 'codex-local').codexProviderMode, 'native')
+  const afterFirst = app.db.prepare('SELECT online, runtimeScopeId FROM instances WHERE id=?').get('codex-local')
+  assert.equal(afterFirst.online, 0)
+  assert.equal(afterFirst.runtimeScopeId, null)
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('dsh-local').runtimeScopeId, dshScope)
+
+  // 存在已绑定原生话题时，未确认前不改文件也不改数据库；确认后标记失效并归档旧话题。
+  const codexScope2 = '3'.repeat(64)
+  app.db.prepare("UPDATE instances SET runtimeScopeId=?, online=1 WHERE id='codex-local'").run(codexScope2)
+  const createdAt = new Date().toISOString()
+  app.db.prepare(`INSERT INTO threads(id,kind,title,instanceId,state,sessionId,createdAt,nativeReleased)
+    VALUES(?,?,?,?,?,?,?,0)`)
+    .run('thread-codex-bound', 'native', '旧 Codex 话题', 'codex-local', 'active', 'native-codex-sess-1', createdAt)
+
+  const needConfirm = switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'official' })
+  assert.deepEqual(needConfirm, { applied: false, requiresConfirmation: true, boundThreads: 1 })
+  assert.equal(settingsView(settings).instances.find(i => i.id === 'codex-local').codexProviderMode, 'native')
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, codexScope2)
+  assert.equal(app.db.prepare('SELECT nativeInvalid FROM threads WHERE id=?').get('thread-codex-bound').nativeInvalid, null)
+
+  const confirmed = switchCodexProviderMode(settings, app.db, {
+    instanceId: 'codex-local',
+    codexProviderMode: 'official',
+    confirmRebind: true
+  })
+  assert.equal(confirmed.applied, true)
+  assert.equal(confirmed.boundThreads, 1)
+  assert.equal(confirmed.invalidatedThreads, 1)
+  assert.equal(settingsView(settings).instances.find(i => i.id === 'codex-local').codexProviderMode, 'official')
+  const archived = app.db.prepare('SELECT state, nativeInvalid FROM threads WHERE id=?').get('thread-codex-bound')
+  assert.equal(archived.state, 'archived')
+  assert.match(archived.nativeInvalid, /Codex 供应商配置已切换/)
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, null)
+
+  // clearUnboundNativeCodexScopes 仅清无有效绑定话题的 native 模式 Codex 实例。
+  switchCodexProviderMode(settings, app.db, { instanceId: 'codex-local', codexProviderMode: 'native' })
+  const codexScope3 = '4'.repeat(64)
+  app.db.prepare("UPDATE instances SET runtimeScopeId=? WHERE id='codex-local'").run(codexScope3)
+  app.db.prepare(`INSERT INTO threads(id,kind,title,instanceId,state,sessionId,createdAt,nativeReleased)
+    VALUES(?,?,?,?,?,?,?,0)`)
+    .run('thread-codex-bound-2', 'native', '新 Codex 话题', 'codex-local', 'active', 'native-codex-sess-2', createdAt)
+  assert.deepEqual(clearUnboundNativeCodexScopes(settings, app.db), [])
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, codexScope3)
+
+  app.db.prepare("UPDATE threads SET nativeInvalid='已失效' WHERE id='thread-codex-bound-2'").run()
+  assert.deepEqual(clearUnboundNativeCodexScopes(settings, app.db), ['codex-local'])
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('codex-local').runtimeScopeId, null)
+  assert.equal(app.db.prepare('SELECT runtimeScopeId FROM instances WHERE id=?').get('dsh-local').runtimeScopeId, dshScope)
+})
+
+test('createAgentManager.codexProviders 仅读取非敏感供应商摘要且缺库时返回空数组', t => {
+  const root = mkdtempSync(join(tmpdir(), 'maoqiu-am-codex-'))
+  t.after(() => rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }))
+
+  const userData = join(root, 'userData')
+  const homes = {
+    CODEX_HOME: join(root, 'codex-home'),
+    DSH_HOME: join(root, 'dsh-home'),
+    HERMES_HOME: join(root, 'hermes-home')
+  }
+  const manager = createAgentManager({
+    root,
+    resourcesPath: '',
+    packaged: false,
+    userData,
+    stopConnector: async () => {},
+    resumeConnector: () => {},
+    assertIdle: () => {},
+    instanceHomes: () => homes
+  })
+
+  assert.deepEqual(manager.codexProviders(homes), [])
+
+  const scope = values => createHash('sha256')
+    .update(JSON.stringify(values.map(p => process.platform === 'win32' ? p.toLowerCase() : p)))
+    .digest('hex')
+  const dbDir = join(userData, 'agent-manager', scope([homes.DSH_HOME]), scope([homes.CODEX_HOME, homes.HERMES_HOME]))
+  mkdirSync(dbDir, { recursive: true })
+  const db = new DatabaseSync(join(dbDir, 'cc-switch.db'))
+  db.exec(`CREATE TABLE providers (
+    id TEXT PRIMARY KEY,
+    app_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    settings_config TEXT NOT NULL,
+    category TEXT,
+    is_current BOOLEAN NOT NULL DEFAULT 0
+  )`)
+  db.prepare('INSERT INTO providers VALUES(?,?,?,?,?,?)')
+    .run('codex-official', 'codex', 'OpenAI Official', '{"auth":{"token":"SECRET-TOKEN"}}', 'official', 0)
+  db.prepare('INSERT INTO providers VALUES(?,?,?,?,?,?)')
+    .run('default', 'codex', 'default', '{"env":{"OPENAI_API_KEY":"SECRET-KEY"}}', 'custom', 1)
+  db.prepare('INSERT INTO providers VALUES(?,?,?,?,?,?)')
+    .run('dsh-1', 'dsh', 'DSH Provider', '{"api_key":"SECRET-DSH"}', 'custom', 1)
+  db.close()
+
+  const listed = manager.codexProviders(homes)
+  assert.deepEqual(listed, [
+    { id: 'default', name: 'default', category: 'custom', isCurrent: true },
+    { id: 'codex-official', name: 'OpenAI Official', category: 'official', isCurrent: false }
+  ])
+  assert.equal(JSON.stringify(listed).includes('SECRET'), false)
 })

@@ -124,7 +124,18 @@ function instanceForm(settings, instance, copy = false, onUpdated, back) {
     await desktopSettings(onUpdated, back);
     notice('配置已保存。点「测试连接」应用并检查。');
   }, { back: () => desktopSettings(onUpdated, back) });
-  const syncCodexMode = () => { ui.controls.codexProviderMode.closest('label').hidden = ui.controls.adapterKey.value !== 'codex'; };
+  const editingExistingCodex = Boolean(instance && !copy && instance.adapterKey === 'codex');
+  const codexField = ui.controls.codexProviderMode.closest('label');
+  const codexHint = editingExistingCodex
+    ? el('small', 'muted', '切换已有 Codex 实例的供应商模式，请返回「Agent 设置 → Codex 供应商」应用并重连。')
+    : null;
+  if (codexHint) codexField.after(codexHint);
+  const syncCodexMode = () => {
+    const isCodex = ui.controls.adapterKey.value === 'codex';
+    codexField.hidden = !isCodex;
+    if (codexHint) codexHint.hidden = !isCodex;
+    ui.controls.codexProviderMode.disabled = editingExistingCodex;
+  };
   ui.controls.adapterKey.addEventListener('change', syncCodexMode);
   syncCodexMode();
   if (instance) ui.body.prepend(el('p', 'muted', '使用新实例 ID 可保留原有会话绑定。'));

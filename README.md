@@ -6,7 +6,7 @@
 
 ## Windows 桌面版
 
-在项目目录下使用 [Xiaomaoqiu.exe](dist/Xiaomaoqiu-win32-x64/Xiaomaoqiu.exe) 打开桌面窗口。复制分发包时须保留同目录内的运行库、资源与 `agent-manager` 组件。关闭窗口会收进系统托盘，正在运行的任务会继续执行。从托盘菜单可重新打开窗口、重启连接器或退出工作台。
+在项目目录下使用 [Xiaomaoqiu.exe](dist/Xiaomaoqiu-win32-x64/Xiaomaoqiu.exe) 打开桌面窗口。`dist/` 目录仅保留最新且最全的一份成品桌面包（`dist/Xiaomaoqiu-win32-x64`），复制分发包时须保留同目录内的运行库、资源与 `agent-manager` 组件；历史旧包统一归档在 `backups/desktop-packages/`。关闭窗口会收进系统托盘，正在运行的任务会继续执行。从托盘菜单可重新打开窗口、重启连接器或退出工作台。
 
 分发目录位于项目的 `dist/` 下时，桌面版沿用项目的 `data/` 文件夹和连接器配置；移至别处后，默认使用应用的用户数据目录。可通过 `MAOQIU_DATA` 显式指定数据目录，通过 `MAOQIU_CONNECTOR_CONFIG` 指定连接器 JSON，通过 `MAOQIU_DESKTOP_PROFILE` 隔离 Electron 用户配置目录。切换启动方式前应先退出使用同一数据目录的旧进程。
 
@@ -28,8 +28,8 @@ npm.cmd run package:desktop
 | `npm.cmd run local` | 启动本机 HTTP 服务与本地连接器（默认端口 `4317`，浏览器模式访问） |
 | `npm.cmd start` | 仅启动服务端（不启动默认本地连接器） |
 | `npm.cmd run connector` | 独立运行连接器进程（按传入配置或 `MAOQIU_NODE_URL` 连接服务端） |
-| `npm.cmd run build:agent-manager` | 拉取/应用 CC Switch 补丁并编译产出 `dist/agent-manager/`（含开源许可声明） |
-| `npm.cmd run package:desktop` | 校验并打包 Windows 免安装桌面目录至 `dist/`（可用 `MAOQIU_PACKAGE_OUT` 改目录） |
+| `npm.cmd run build:agent-manager` | 在 `build/.agent-manager-work` 拉取/应用 CC Switch 补丁并编译产出 `build/agent-manager/`（含开源许可声明） |
+| `npm.cmd run package:desktop` | 校验并打包最新完整桌面包到 `dist/Xiaomaoqiu-win32-x64`，并自动把 `dist/` 原有旧包归档至 `backups/desktop-packages/`（可用 `MAOQIU_PACKAGE_OUT`、`MAOQIU_PACKAGE_ARCHIVE` 覆盖路径） |
 | `npm.cmd run backup -- save/restore ...` | 创建或恢复数据库、附件及脱敏连接器配置快照 |
 | `npm.cmd run check` | 运行 TypeScript 类型检查（`tsc --noEmit`） |
 | `npm.cmd test` | 运行 Node 单元测试套件 |
@@ -52,7 +52,8 @@ npm.cmd run package:desktop
 
 - 配置窗口打开时，工作台会暂停空闲本机连接器；若有运行仍在进行，会提示等待或先停止。若同一种 Agent 配置了多份独立配置目录，可在「目标配置」切换对应实例。
 - 从仓库根目录配置的实例可在「执行实例与工作区 → 新建 Git 工作树」建立 `maoqiu/<实例 ID>` 独立工作分支及新实例，用于多 Bot 并行修改互不干扰。
-- Codex 工作 Bot 支持在实例配置中选择「Codex 供应商模式」（`official` 官方 ChatGPT 登录 / `native` 跟随本机供应商）。
+- Codex 工作 Bot 只需保留单一实例：在「Agent 设置」顶层面板即可直接查看本机 `config.toml` / 外接管理配置的当前供应商，并在 `official`（官方 ChatGPT 登录）与 `native`（跟随本机供应商）间一键切换重连；若已有绑定原生会话，会先提示确认归档旧绑定再保留全部本地历史。
+- 在「Agent 设置 → 打开管理窗口」切换过本机 Codex 供应商后，对无绑定会话的 `native` 模式 Codex 实例会在关闭管理窗口后自动解除旧绑定范围并按新供应商重连。
 
 快捷交互：工作台支持 `Ctrl+K` 打开快速切换与搜索面板（命令面板），`Ctrl+I` 切换右侧上下文面板；在窄屏设备下上下文面板与侧栏抽屉均支持遮罩点击与 `Esc` 收起。
 

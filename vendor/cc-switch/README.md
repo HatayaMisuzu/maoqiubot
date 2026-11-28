@@ -6,9 +6,10 @@ MCP、Skills、原生插件、提示词、会话读取及用量界面仍由上�
 开发机无需另外安装 CC Switch。
 
 在 Windows x64 的 MSVC Developer Prompt 中安装 Node.js、pnpm 和 Rust 后运行
-`node scripts/build-agent-manager.mjs`。脚本使用上游 Cargo 和 pnpm 锁文件（切换版本前会先回退已有补丁），
-把 `agent-manager.exe`、`LICENSE-CC-Switch.txt` 与完整依赖许可清单 `THIRD_PARTY_NOTICES-agent-manager.txt`
-一并输出到 `dist/agent-manager`，供 `npm run package:desktop` 打包校验与分发。
+`node scripts/build-agent-manager.mjs`。脚本在 `build/.agent-manager-work` 中使用上游 Cargo 和 pnpm 锁文件
+（切换版本前会先回退已有补丁），把 `agent-manager.exe`、`LICENSE-CC-Switch.txt` 与完整依赖许可清单
+`THIRD_PARTY_NOTICES-agent-manager.txt` 一并输出到 `build/agent-manager`，供 `npm run package:desktop`
+随最新桌面包校验并打包进 `dist/Xiaomaoqiu-win32-x64/resources/agent-manager/`。
 
 小毛球从桌面设置打开管理窗口。后台把自己的数据写到 Electron 提供的目录。
 打开某个已绑定工作 Bot 的配置时，进程收到该实例使用的原生配置目录。

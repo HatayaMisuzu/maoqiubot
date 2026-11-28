@@ -3,6 +3,7 @@ const { createHash } = require('node:crypto')
 const { once } = require('node:events')
 const { mkdirSync, readdirSync, statSync } = require('node:fs')
 const { join } = require('node:path')
+const { DatabaseSync } = require('node:sqlite')
 
 const inheritedEnvironment = new Set([
   'path', 'systemroot', 'windir', 'comspec', 'userprofile', 'homedrive', 'homepath', 'home',
@@ -17,8 +18,20 @@ function agentManagerEnvironment(source, homes, data) {
 }
 
 function createAgentManager({ root, resourcesPath, packaged, userData, stopConnector, resumeConnector, assertIdle, instanceHomes }) {
-  const directory = packaged ? join(resourcesPath, 'agent-manager') : join(root, 'dist', 'agent-manager')
-  const binary = join(directory, 'agent-manager.exe')
+  function resolveManagerPaths() {
+    if (packaged) {
+      const directory = join(resourcesPath, 'agent-manager')
+      return { directory, binary: join(directory, 'agent-manager.exe') }
+    }
+    const buildDir = join(root, 'build', 'agent-manager')
+    const legacyDir = join(root, 'dist', 'agent-manager')
+    const buildBin = join(buildDir, 'agent-manager.exe')
+    const legacyBin = join(legacyDir, 'agent-manager.exe')
+    if (statSync(buildBin, { throwIfNoEntry: false })?.isFile() || !statSync(legacyBin, { throwIfNoEntry: false })?.isFile()) {
+      return { directory: buildDir, binary: buildBin }
+    }
+    return { directory: legacyDir, binary: legacyBin }
+  }
   const stateDir = join(userData, 'agent-manager')
   let child, opening, stopping, failure, activeInstanceId = null
 
@@ -42,8 +55,33 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
     }
   }
 
+  function codexProviders(homes) {
+    if (!homes?.DSH_HOME || !homes?.CODEX_HOME || !homes?.HERMES_HOME) return []
+    const dbPath = join(dshScope(homes.DSH_HOME), scope([homes.CODEX_HOME, homes.HERMES_HOME]), 'cc-switch.db')
+    if (!statSync(dbPath, { throwIfNoEntry: false })?.isFile()) return []
+    let db
+    try {
+      db = new DatabaseSync(dbPath, { open: true, readOnly: true })
+      const rows = db.prepare(`SELECT id, name, category, is_current
+        FROM providers
+        WHERE app_type = 'codex'
+        ORDER BY is_current DESC, rowid ASC`).all()
+      return rows.map(row => ({
+        id: String(row.id),
+        name: String(row.name),
+        category: row.category == null ? null : String(row.category),
+        isCurrent: Boolean(row.is_current)
+      }))
+    } catch {
+      return []
+    } finally {
+      try { db?.close() } catch {}
+    }
+  }
+
   function status() {
     const active = Boolean(child || opening)
+    const { binary } = resolveManagerPaths()
     return {
       available: process.platform === 'win32' && Boolean(statSync(binary, { throwIfNoEntry: false })?.isFile()),
       active,
@@ -54,6 +92,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
 
   async function launch(instanceId) {
     assertIdle()
+    const { directory, binary } = resolveManagerPaths()
     const homes = instanceHomes(instanceId)
     // Native history and enabled-provider metadata must stay with the homes that produced them.
     const data = join(dshScope(homes.DSH_HOME), scope([homes.CODEX_HOME, homes.HERMES_HOME]))
@@ -127,7 +166,7 @@ function createAgentManager({ root, resourcesPath, packaged, userData, stopConne
     } finally { clearTimeout(timer) }
   }
 
-  return { status, open, stop, dshDatabases }
+  return { status, open, stop, dshDatabases, codexProviders }
 }
 
 module.exports = { agentManagerEnvironment, createAgentManager }

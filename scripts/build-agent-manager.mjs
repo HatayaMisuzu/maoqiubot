@@ -7,11 +7,11 @@ const root = fileURLToPath(new URL('../', import.meta.url))
 const vendor = join(root, 'vendor', 'cc-switch')
 const upstream = 'https://github.com/farion1231/cc-switch.git'
 const revision = '754fed72d428c66c1e6ed45f38601ac25ded90c6'
-const buildDir = join(root, 'dist', '.agent-manager-build')
+const buildDir = join(root, 'build', '.agent-manager-work')
 const source = join(buildDir, 'source')
 const patch = join(vendor, 'maoqiu.patch')
 const normalizedPatch = join(buildDir, 'maoqiu.patch')
-const artifact = join(root, 'dist', 'agent-manager', 'agent-manager.exe')
+const artifact = join(root, 'build', 'agent-manager', 'agent-manager.exe')
 const target = 'x86_64-pc-windows-msvc'
 
 function run(command, args, cwd, options = {}) {

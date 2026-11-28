@@ -135,3 +135,65 @@ test('桌面 Agent 设置关联本机 Bot 配置和监控', async ({ page, workb
   await expect(settings.getByLabel('目标配置')).toBeDisabled();
   expect(await page.evaluate(() => window.openedAgentHomes)).toEqual(['dsh-lab']);
 });
+
+test('桌面 Agent 设置可在顶层面板切换 Codex 供应商模式并处理绑定确认', async ({ page, workbench }) => {
+  await page.addInitScript(() => {
+    let mode = 'official';
+    const calls = [];
+    window.codexSwitchCalls = calls;
+    const currentSettings = () => ({
+      editable: true,
+      connectorRunning: false,
+      instances: [{
+        id: 'codex-local',
+        name: 'Codex',
+        adapterKey: 'codex',
+        configurationHome: 'C:/Users/fixture/.codex',
+        codexProviderMode: mode,
+        codexLocal: { modelProvider: 'custom', model: 'gpt-6.1-sol' },
+        codexManagerProviders: [
+          { id: 'default', name: 'default', category: 'custom', isCurrent: true },
+          { id: 'codex-official', name: 'OpenAI Official', category: 'official', isCurrent: false }
+        ]
+      }]
+    });
+    window.maoqiuDesktop = {
+      settings: async () => currentSettings(),
+      agentManagerStatus: async () => ({ available: true, active: false }),
+      setCodexProvider: async payload => {
+        calls.push(payload);
+        if (!payload.confirmRebind) {
+          return { applied: false, requiresConfirmation: true, boundThreads: 2 };
+        }
+        mode = payload.codexProviderMode;
+        return {
+          applied: true,
+          requiresConfirmation: false,
+          boundThreads: 2,
+          view: currentSettings()
+        };
+      },
+      agentMonitor: async () => ({ fetchedAt: new Date().toISOString(), usage: [], instances: [] })
+    };
+  });
+  await workbench.login();
+  await page.locator('#session').getByRole('button', { name: 'Agent 设置', exact: true }).click();
+  const settings = page.getByRole('dialog');
+  await expect(settings.getByRole('heading', { name: 'Codex 供应商' })).toBeVisible();
+  await expect(settings).toContainText('model_provider = custom · 默认模型 gpt-6.1-sol');
+  await expect(settings).toContainText('外接管理供应商：default（当前）、OpenAI Official');
+  await settings.getByLabel('Codex 供应商模式').selectOption('native');
+  await settings.getByRole('button', { name: '应用供应商设置' }).click();
+
+  const confirm = page.locator('#confirm-dialog');
+  await expect(confirm).toBeVisible();
+  await expect(confirm).toContainText('2 个已绑定原生会话的话题');
+  await confirm.getByRole('button', { name: '确认切换并重连' }).click();
+
+  await expect(settings.locator('.badge', { hasText: '跟随本机供应商' })).toBeVisible();
+  await expect(settings).toContainText('Codex 供应商配置已应用并重连。');
+  expect(await page.evaluate(() => window.codexSwitchCalls)).toEqual([
+    { instanceId: 'codex-local', codexProviderMode: 'native' },
+    { instanceId: 'codex-local', codexProviderMode: 'native', confirmRebind: true }
+  ]);
+});
